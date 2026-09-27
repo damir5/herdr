@@ -103,14 +103,44 @@ pub(super) fn classify_status(status: &str) -> RelayOutcome {
     }
 }
 
-/// The relay's `reason` (APNs reason) or `error` (relay error code). Both are
-/// fixed diagnostic strings, never tokens, capabilities or message text.
-fn reason_from_body(body: &str) -> Option<String> {
-    let value = serde_json::from_str::<serde_json::Value>(body).ok()?;
-    ["reason", "error"]
+/// Diagnostic codes that may be logged: APNs reasons the relay forwards and the
+/// relay's own error codes. The response body is remote input, so any other
+/// text is reported as `other` and never reaches the log.
+const LOGGABLE_REASONS: &[&str] = &[
+    "BadDeviceToken",
+    "Unregistered",
+    "DeviceTokenNotForTopic",
+    "TopicDisallowed",
+    "TooManyRequests",
+    "PayloadTooLarge",
+    "ExpiredProviderToken",
+    "InvalidProviderToken",
+    "InternalServerError",
+    "ServiceUnavailable",
+    "invalid_capability",
+    "invalid_request",
+    "payload_too_large",
+    "rate_limited",
+    "not_configured",
+];
+
+/// The allowlisted `reason` (APNs) or `error` (relay) code of a relay response,
+/// `other` for any unknown text, and `none` when the body carries neither.
+fn reason_code(body: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return "none";
+    };
+    let Some(reason) = ["reason", "error"]
         .iter()
         .find_map(|key| value.get(*key).and_then(serde_json::Value::as_str))
-        .map(str::to_string)
+    else {
+        return "none";
+    };
+    LOGGABLE_REASONS
+        .iter()
+        .find(|known| **known == reason)
+        .copied()
+        .unwrap_or("other")
 }
 
 /// Send one payload to one capability through the relay. Best-effort: failures
@@ -130,18 +160,20 @@ pub(super) fn send(
     };
     let (body, status) = apns::split_body_status(&stdout);
     let outcome = classify_status(status);
-    let reason = || reason_from_body(body).unwrap_or_else(|| "unknown".to_string());
+    let reason = reason_code(body);
+    // curl's `%{http_code}`; parsed so only a number is ever logged.
+    let http_status = status.parse::<u16>().unwrap_or(0);
     match outcome {
         RelayOutcome::Delivered | RelayOutcome::PruneToken => {}
         RelayOutcome::Transient => tracing::warn!(
-            status = %status,
-            reason = %reason(),
+            status = http_status,
+            reason = reason,
             push_type = push_type.wire_name(),
             "push relay delivery failed transiently"
         ),
         RelayOutcome::Rejected => tracing::warn!(
-            status = %status,
-            reason = %reason(),
+            status = http_status,
+            reason = reason,
             push_type = push_type.wire_name(),
             "push relay rejected delivery"
         ),
@@ -194,14 +226,37 @@ mod tests {
         let (body, status) =
             apns::split_body_status("{\"status\":410,\"reason\":\"Unregistered\"}\n410");
         assert_eq!(classify_status(status), RelayOutcome::PruneToken);
-        assert_eq!(reason_from_body(body).as_deref(), Some("Unregistered"));
+        assert_eq!(reason_code(body), "Unregistered");
 
         let (body, status) = apns::split_body_status("{\"error\":\"rate_limited\"}\n429");
         assert_eq!(classify_status(status), RelayOutcome::Transient);
-        assert_eq!(reason_from_body(body).as_deref(), Some("rate_limited"));
+        assert_eq!(reason_code(body), "rate_limited");
 
         let (_, status) = apns::split_body_status("{\"status\":200,\"apns_id\":\"x\"}\n200");
         assert_eq!(classify_status(status), RelayOutcome::Delivered);
+    }
+
+    #[test]
+    fn reason_code_never_returns_remote_text() {
+        assert_eq!(
+            reason_code("{\"status\":400,\"reason\":\"BadDeviceToken\"}"),
+            "BadDeviceToken"
+        );
+        assert_eq!(
+            reason_code("{\"error\":\"invalid_capability\"}"),
+            "invalid_capability"
+        );
+        // Unknown or hostile text (here echoing a capability) is reduced to `other`.
+        assert_eq!(reason_code("{\"reason\":\"hpr1.SeCrEt\"}"), "other");
+        assert_eq!(
+            reason_code("{\"error\":\"rate_limited\\nforged log line\"}"),
+            "other"
+        );
+        assert_eq!(reason_code("{\"reason\":\"unregistered\"}"), "other");
+        assert_eq!(reason_code("{\"reason\":\"a\"}"), "other");
+        assert_eq!(reason_code("{\"reason\":null}"), "none");
+        assert_eq!(reason_code("<html>bad gateway hpr1.SeCrEt</html>"), "none");
+        assert_eq!(reason_code(""), "none");
     }
 
     #[test]

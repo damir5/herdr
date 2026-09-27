@@ -67,7 +67,7 @@ fn device_url(sandbox: bool, device_token: &str) -> String {
 
 /// The non-sensitive curl argv. The JWT, headers, url, and payload are delivered
 /// out-of-band via the stdin config (`--config -`) so no secret lands on argv.
-fn build_curl_argv() -> Vec<String> {
+pub(super) fn build_curl_argv() -> Vec<String> {
     vec![
         "--http2".to_string(),
         "-s".to_string(),
@@ -86,7 +86,7 @@ fn build_curl_argv() -> Vec<String> {
 /// and `\"` inside quotes, so backslashes MUST be escaped before double-quotes
 /// (order matters — escaping quotes first would then double-escape the added
 /// backslashes). The JSON payload contains `"`, so this has to be exact.
-fn quote_config_value(value: &str) -> String {
+pub(super) fn quote_config_value(value: &str) -> String {
     let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
     format!("\"{escaped}\"")
 }
@@ -143,7 +143,7 @@ pub(super) fn live_activity_payload(content_state: &serde_json::Value, timestamp
 
 /// Split curl's combined stdout into `(body, status)`. `stdout` is
 /// `<body>\n<http_code>`.
-fn split_body_status(stdout: &str) -> (&str, &str) {
+pub(super) fn split_body_status(stdout: &str) -> (&str, &str) {
     let stdout = stdout.trim_end();
     match stdout.rsplit_once('\n') {
         Some((body, status)) => (body, status.trim()),
@@ -213,48 +213,9 @@ pub(super) fn deliver_one_typed(
     let url = device_url(sandbox, device_token);
     let config = build_curl_config_typed(&url, jwt, topic, push_type, priority, payload);
 
-    let mut child = match crate::noninteractive_process::curl_command()
-        .args(build_curl_argv())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(err) => {
-            tracing::warn!(error = %err, "apns curl failed to spawn");
-            return DeliveryOutcome::Failed;
-        }
+    let Some(stdout) = run_curl_with_stdin_config(&config) else {
+        return DeliveryOutcome::Failed;
     };
-
-    // Write the config to stdin and close it (EOF) before draining stdout. The
-    // config is tiny and curl reads it fully before issuing the request, so this
-    // cannot deadlock.
-    {
-        let Some(mut stdin) = child.stdin.take() else {
-            tracing::warn!("apns curl child stdin was unavailable");
-            let _ = child.kill();
-            let _ = child.wait();
-            return DeliveryOutcome::Failed;
-        };
-        if let Err(err) = stdin.write_all(config.as_bytes()) {
-            tracing::warn!(error = %err, "failed to write curl config to stdin");
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return DeliveryOutcome::Failed;
-        }
-    }
-
-    let output = match child.wait_with_output() {
-        Ok(output) => output,
-        Err(err) => {
-            tracing::warn!(error = %err, "failed to collect curl output");
-            return DeliveryOutcome::Failed;
-        }
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
     let (body, status) = split_body_status(&stdout);
     let outcome = classify_status(status);
     if matches!(
@@ -269,6 +230,52 @@ pub(super) fn deliver_one_typed(
         );
     }
     outcome
+}
+
+/// Spawn curl with the fixed [`build_curl_argv`] and feed `config` on stdin, so
+/// url, headers and body never reach argv. Returns curl's stdout
+/// (`<body>\n<http_code>`), or `None` after logging a spawn/IO failure.
+pub(super) fn run_curl_with_stdin_config(config: &str) -> Option<String> {
+    let mut child = match crate::noninteractive_process::curl_command()
+        .args(build_curl_argv())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(err) => {
+            tracing::warn!(error = %err, "push curl failed to spawn");
+            return None;
+        }
+    };
+
+    // Write the config to stdin and close it (EOF) before draining stdout. The
+    // config is tiny and curl reads it fully before issuing the request, so this
+    // cannot deadlock.
+    {
+        let Some(mut stdin) = child.stdin.take() else {
+            tracing::warn!("push curl child stdin was unavailable");
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        };
+        if let Err(err) = stdin.write_all(config.as_bytes()) {
+            tracing::warn!(error = %err, "failed to write curl config to stdin");
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+    }
+
+    match child.wait_with_output() {
+        Ok(output) => Some(String::from_utf8_lossy(&output.stdout).into_owned()),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to collect curl output");
+            None
+        }
+    }
 }
 
 #[cfg(test)]

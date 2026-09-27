@@ -1866,3 +1866,56 @@ fn pane_link_resolve_round_trips() {
         result
     );
 }
+
+#[test]
+fn notification_registrations_accept_legacy_and_relay_capability_payloads() {
+    let legacy: Request = serde_json::from_value(serde_json::json!({
+        "id": "reg",
+        "method": "notifications.register_device",
+        "params": {"device_token": "ab", "platform": "ios"}
+    }))
+    .expect("legacy register_device decodes");
+    let Method::NotificationsRegisterDevice(params) = legacy.method else {
+        panic!("expected register_device");
+    };
+    assert_eq!(params.relay_capability, None);
+
+    let relayed: Request = serde_json::from_value(serde_json::json!({
+        "id": "reg",
+        "method": "notifications.register_activity",
+        "params": {"activity_push_token": "ab", "relay_capability": "hpr1.AbC"}
+    }))
+    .expect("register_activity with capability decodes");
+    let Method::NotificationsRegisterActivity(params) = relayed.method else {
+        panic!("expected register_activity");
+    };
+    assert_eq!(params.relay_capability.as_deref(), Some("hpr1.AbC"));
+}
+
+#[test]
+fn notifications_status_response_wire_shape() {
+    let response = SuccessResponse {
+        id: "status".into(),
+        result: ResponseResult::NotificationsStatus {
+            state: NotificationsStatusState::RelayReady,
+            mode: crate::config::PushMode::Auto,
+            relay_url: "https://push.herdrup.themartian.app".into(),
+            devices: 2,
+            relay_devices: 1,
+        },
+    };
+    assert_eq!(
+        serde_json::to_value(&response).unwrap(),
+        serde_json::json!({
+            "id": "status",
+            "result": {
+                "type": "notifications_status",
+                "state": "relay_ready",
+                "mode": "auto",
+                "relay_url": "https://push.herdrup.themartian.app",
+                "devices": 2,
+                "relay_devices": 1
+            }
+        })
+    );
+}

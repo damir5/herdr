@@ -3246,6 +3246,13 @@
           "properties": {
             "activity_push_token": {
               "type": "string"
+            },
+            "relay_capability": {
+              "description": "Sealed `hpr1.` capability from the HerdrUp push relay for this activity\ntoken. Ignored by `.unregister_activity`; absent on older clients.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -3285,6 +3292,13 @@
             },
             "platform": {
               "type": "string"
+            },
+            "relay_capability": {
+              "description": "Sealed `hpr1.` capability from the HerdrUp push relay, used when the\ndaemon delivers through the relay. Absent on older clients.",
+              "type": [
+                "string",
+                "null"
+              ]
             }
           },
           "required": [
@@ -6039,6 +6053,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/NotificationsRegisterActivityParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "notifications.status",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/EmptyParams"
             }
           },
           "required": [
@@ -10785,6 +10815,33 @@
           ],
           "type": "string"
         },
+        "NotificationsStatusState": {
+          "description": "Readiness of remote push on this daemon, reported by `notifications.status`.",
+          "oneOf": [
+            {
+              "enum": [
+                "direct_ready",
+                "relay_ready"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "unsupported",
+              "description": "This daemon cannot deliver push (no-session mode has no device registry).",
+              "type": "string"
+            },
+            {
+              "const": "off",
+              "description": "`push.mode = \"off\"`.",
+              "type": "string"
+            },
+            {
+              "const": "unconfigured",
+              "description": "Direct mode without a complete APNs key config, or relay/auto mode with no\ncapability-bearing device registered yet.",
+              "type": "string"
+            }
+          ]
+        },
         "PaneDirection": {
           "enum": [
             "left",
@@ -12283,6 +12340,16 @@
             }
           ]
         },
+        "PushMode": {
+          "description": "Delivery path for remote push. `Auto` prefers direct APNs when the key config\nis complete and otherwise uses the relay for capability-bearing devices.",
+          "enum": [
+            "auto",
+            "direct",
+            "relay",
+            "off"
+          ],
+          "type": "string"
+        },
         "Reachability": {
           "description": "Reachability of a federation peer, derived from consecutive poll outcomes.\n\nSerialized onto remote [`AgentInfo`]s so a client can tell a live peer from\none that has gone quiet. A C-like enum, so it derives `Eq`.",
           "oneOf": [
@@ -13466,6 +13533,45 @@
                 "type",
                 "shown",
                 "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Remote push readiness. Counts only; never tokens, capabilities, or key material.",
+              "properties": {
+                "devices": {
+                  "description": "Registered push devices.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "mode": {
+                  "$ref": "#/schemas/success_response/$defs/PushMode"
+                },
+                "relay_devices": {
+                  "description": "Registered devices that carry a relay capability.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "relay_url": {
+                  "type": "string"
+                },
+                "state": {
+                  "$ref": "#/schemas/success_response/$defs/NotificationsStatusState"
+                },
+                "type": {
+                  "const": "notifications_status",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "state",
+                "mode",
+                "relay_url",
+                "devices",
+                "relay_devices"
               ],
               "type": "object"
             },

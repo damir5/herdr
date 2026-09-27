@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use super::agents::{AgentInfo, AgentPromptDelivery};
-use super::common::{ClientWindowTitleReason, NotificationShowReason};
+use super::common::{ClientWindowTitleReason, NotificationShowReason, NotificationsStatusState};
 use super::events::EventEnvelope;
 use super::gram::GramMessageInfo;
 use super::integrations::{
@@ -271,6 +271,16 @@ pub enum ResponseResult {
     NotificationShow {
         shown: bool,
         reason: NotificationShowReason,
+    },
+    /// Remote push readiness. Counts only; never tokens, capabilities, or key material.
+    NotificationsStatus {
+        state: NotificationsStatusState,
+        mode: crate::config::PushMode,
+        relay_url: String,
+        /// Registered push devices.
+        devices: u64,
+        /// Registered devices that carry a relay capability.
+        relay_devices: u64,
     },
     ClientWindowTitle {
         changed: bool,

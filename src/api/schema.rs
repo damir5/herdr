@@ -85,6 +85,8 @@ pub enum Method {
     NotificationsRegisterActivity(NotificationsRegisterActivityParams),
     #[serde(rename = "notifications.unregister_activity")]
     NotificationsUnregisterActivity(NotificationsRegisterActivityParams),
+    #[serde(rename = "notifications.status")]
+    NotificationsStatus(EmptyParams),
     #[serde(rename = "gram.send")]
     GramSend(GramSendParams),
     #[serde(rename = "gram.post")]

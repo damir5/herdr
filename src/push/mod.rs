@@ -6,19 +6,28 @@
 //! by spawning `curl --http2` (see `apns`). Delivery is best-effort and always
 //! runs off the app loop: failures are logged via `tracing`, never propagated.
 //!
+//! Hosts without their own APNs key deliver through the HerdrUp push relay
+//! instead (see `relay`); `push.mode` and [`route`] pick the path per device.
+//!
 //! Secrets: the `.p8` key is read from `push.key_path` at send time only; its
-//! contents are never persisted or logged. Only device tokens and per-device
-//! preferences live in `devices.json`.
+//! contents are never persisted or logged. Only device tokens, per-device
+//! preferences and opaque relay capabilities live in `devices.json`.
 
 mod apns;
 mod jwt;
+mod relay;
 
 use std::collections::HashSet;
 
-use crate::config::PushConfig;
+use crate::api::schema::NotificationsStatusState;
+use crate::config::{PushConfig, PushMode};
+use crate::persist::activities::RegisteredActivity;
 use crate::persist::devices::RegisteredDevice;
 
 use self::apns::DeliveryOutcome;
+use self::relay::{RelayOutcome, RelayPushType};
+
+pub(crate) use self::relay::is_valid_capability as is_valid_relay_capability;
 
 /// Which agent transition triggered a push, used to match per-device prefs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +65,89 @@ pub(crate) fn enabled(cfg: &PushConfig) -> bool {
         && is_present(&cfg.topic)
 }
 
+/// Delivery path for one registered device or Live Activity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Route {
+    Direct,
+    Relay,
+    Skip,
+}
+
+/// Pick the delivery path for one registration under `push.mode`:
+/// `direct` needs the complete key config, `relay` needs a capability, `auto`
+/// prefers direct and falls back to the relay, and `off` sends nothing.
+pub(crate) fn route(cfg: &PushConfig, relay_capability: Option<&str>) -> Route {
+    let via_relay = || {
+        if relay_capability.is_some() && relay_configured(cfg) {
+            Route::Relay
+        } else {
+            Route::Skip
+        }
+    };
+    match cfg.mode {
+        PushMode::Off => Route::Skip,
+        PushMode::Direct if enabled(cfg) => Route::Direct,
+        PushMode::Direct => Route::Skip,
+        PushMode::Relay => via_relay(),
+        PushMode::Auto if enabled(cfg) => Route::Direct,
+        PushMode::Auto => via_relay(),
+    }
+}
+
+fn relay_configured(cfg: &PushConfig) -> bool {
+    !cfg.relay_url.trim().is_empty()
+}
+
+/// App-loop guard: true unless `cfg` routes every registration to [`Route::Skip`].
+/// The stores are read off-loop, so this only rules out configs that can never send.
+pub(crate) fn may_deliver(cfg: &PushConfig) -> bool {
+    match cfg.mode {
+        PushMode::Off => false,
+        PushMode::Direct => enabled(cfg),
+        PushMode::Relay => relay_configured(cfg),
+        PushMode::Auto => enabled(cfg) || relay_configured(cfg),
+    }
+}
+
+/// The `notifications.status` state. `relay_devices` counts registered devices
+/// carrying a relay capability; `no_session` daemons keep no device registry.
+pub(crate) fn status_state(
+    no_session: bool,
+    cfg: &PushConfig,
+    relay_devices: usize,
+) -> NotificationsStatusState {
+    if no_session {
+        return NotificationsStatusState::Unsupported;
+    }
+    let relay_ready = relay_configured(cfg) && relay_devices > 0;
+    match cfg.mode {
+        PushMode::Off => NotificationsStatusState::Off,
+        PushMode::Direct | PushMode::Auto if enabled(cfg) => NotificationsStatusState::DirectReady,
+        PushMode::Relay | PushMode::Auto if relay_ready => NotificationsStatusState::RelayReady,
+        PushMode::Direct | PushMode::Relay | PushMode::Auto => {
+            NotificationsStatusState::Unconfigured
+        }
+    }
+}
+
+/// Partition registrations into direct and relay sends, dropping skipped ones.
+fn split_by_route<'a, T>(
+    cfg: &PushConfig,
+    items: &'a [T],
+    relay_capability: impl Fn(&T) -> Option<&str>,
+) -> (Vec<&'a T>, Vec<&'a T>) {
+    let mut direct = Vec::new();
+    let mut relayed = Vec::new();
+    for item in items {
+        match route(cfg, relay_capability(item)) {
+            Route::Direct => direct.push(item),
+            Route::Relay => relayed.push(item),
+            Route::Skip => {}
+        }
+    }
+    (direct, relayed)
+}
+
 fn is_present(value: &Option<String>) -> bool {
     value
         .as_deref()
@@ -78,6 +170,11 @@ fn device_muted(device: &RegisteredDevice, pane_id: &str) -> bool {
     !pane_id.is_empty() && device.muted_panes.iter().any(|muted| muted == pane_id)
 }
 
+/// The device opted into this kind and has not muted its pane.
+fn device_accepts(device: &RegisteredDevice, notification: &PushNotification) -> bool {
+    device_wants(device, notification.kind) && !device_muted(device, &notification.pane_id)
+}
+
 fn unix_secs_now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -86,17 +183,36 @@ fn unix_secs_now() -> u64 {
 }
 
 /// Deliver a batch of agent transitions to every registered device that opted
-/// into the matching notification kind. Intended to be called on a detached
-/// thread: it reads the device store, mints/reuses one JWT, sends each alert via
-/// curl, and prunes any tokens APNs reports as permanently invalid.
+/// into the matching notification kind, each over the path [`route`] picks
+/// (direct APNs or the relay). Intended to be called on a detached thread: it
+/// reads the device store, sends each alert via curl, and prunes any tokens APNs
+/// or the relay reports as permanently invalid.
 ///
 /// Best-effort throughout: every failure is logged and swallowed so a slow or
 /// failing push never affects the app loop.
 pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
-    if notifications.is_empty() || !enabled(&cfg) {
+    if notifications.is_empty() || !may_deliver(&cfg) {
         return;
     }
-    // `enabled` guarantees these are all `Some`.
+    let devices = crate::persist::devices::load();
+    let (direct, relayed) =
+        split_by_route(&cfg, &devices, |device| device.relay_capability.as_deref());
+    if !direct.is_empty() {
+        deliver_direct(&cfg, &notifications, &direct);
+    }
+    if !relayed.is_empty() {
+        deliver_relay(&cfg.relay_url, &notifications, &relayed);
+    }
+}
+
+/// Direct APNs delivery: mint/reuse one JWT from the host's `.p8` key and send
+/// each alert straight to Apple.
+fn deliver_direct(
+    cfg: &PushConfig,
+    notifications: &[PushNotification],
+    devices: &[&RegisteredDevice],
+) {
+    // Direct routing implies `enabled`, which guarantees these are all `Some`.
     let (Some(key_path), Some(key_id), Some(team_id), Some(topic)) = (
         cfg.key_path.as_deref(),
         cfg.key_id.as_deref(),
@@ -105,11 +221,6 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
     ) else {
         return;
     };
-
-    let devices = crate::persist::devices::load();
-    if devices.is_empty() {
-        return;
-    }
 
     // `key_path` is host config, not a secret: expand `~` (the form the docs and
     // config example use) and log the resolved path on failure.
@@ -139,17 +250,14 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
     let mut reminted = false;
 
     let mut tokens_to_prune: HashSet<String> = HashSet::new();
-    'batch: for notification in &notifications {
+    'batch: for notification in notifications {
         let payload = apns::payload_body(notification);
-        for device in &devices {
+        for device in devices {
             // A token already flagged for pruning gets no further sends.
             if tokens_to_prune.contains(&device.device_token) {
                 continue;
             }
-            if !device_wants(device, notification.kind) {
-                continue;
-            }
-            if device_muted(device, &notification.pane_id) {
+            if !device_accepts(device, notification) {
                 continue;
             }
             let mut outcome =
@@ -195,29 +303,93 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
         }
     }
 
-    for token in tokens_to_prune {
-        match crate::persist::devices::remove_token(&token) {
-            Ok(true) => tracing::info!("pruned an unregistered APNs device token"),
-            Ok(false) => {}
-            Err(err) => tracing::warn!(error = %err, "failed to prune APNs device token"),
+    prune_device_tokens(tokens_to_prune);
+}
+
+/// Relay delivery of alerts to capability-bearing devices. The payload is the
+/// same JSON the direct path sends.
+fn deliver_relay(
+    relay_url: &str,
+    notifications: &[PushNotification],
+    devices: &[&RegisteredDevice],
+) {
+    let mut tokens_to_prune: HashSet<String> = HashSet::new();
+    for notification in notifications {
+        let payload = apns::payload_body(notification);
+        for device in devices {
+            if tokens_to_prune.contains(&device.device_token)
+                || !device_accepts(device, notification)
+            {
+                continue;
+            }
+            let Some(capability) = device.relay_capability.as_deref() else {
+                continue;
+            };
+            if relay::send(relay_url, capability, RelayPushType::Alert, &payload)
+                == RelayOutcome::PruneToken
+            {
+                tokens_to_prune.insert(device.device_token.clone());
+            }
         }
     }
+    prune_device_tokens(tokens_to_prune);
 }
 
 /// Deliver ONE Live Activity content-state update to every registered activity push token,
 /// so the lock-screen / Dynamic Island widget refreshes while the app is closed. Mirrors
-/// [`deliver`]: read the activity store, mint/reuse one JWT, POST to each token with
-/// `apns-push-type: liveactivity` on the widget sub-topic, and prune any token APNs reports
-/// as gone (410). Best-effort; intended to run on a detached thread.
+/// [`deliver`]: read the activity store, route each token (direct APNs with
+/// `apns-push-type: liveactivity` on the widget sub-topic, or the relay), and prune any
+/// token reported gone (410). Best-effort; intended to run on a detached thread.
 pub(crate) fn deliver_live_activity(
     cfg: PushConfig,
     content_state: serde_json::Value,
     timestamp: u64,
 ) {
-    if !enabled(&cfg) {
+    if !may_deliver(&cfg) {
         return;
     }
-    // `enabled` guarantees these are all `Some`.
+    let activities = crate::persist::activities::load();
+    let (direct, relayed) = split_by_route(&cfg, &activities, |activity| {
+        activity.relay_capability.as_deref()
+    });
+    if direct.is_empty() && relayed.is_empty() {
+        return;
+    }
+    // The whole session shares ONE content-state, so build the payload once. The timestamp
+    // is assigned by the caller in SOURCE ORDER (see emit_live_activity_updates), not here
+    // per-thread, so out-of-order sender threads can't let a stale snapshot win.
+    let payload = apns::live_activity_payload(&content_state, timestamp);
+    if !direct.is_empty() {
+        deliver_live_activity_direct(&cfg, &payload, &direct);
+    }
+    if !relayed.is_empty() {
+        let mut tokens_to_prune: HashSet<String> = HashSet::new();
+        for activity in relayed {
+            let Some(capability) = activity.relay_capability.as_deref() else {
+                continue;
+            };
+            if relay::send(
+                &cfg.relay_url,
+                capability,
+                RelayPushType::LiveActivity,
+                &payload,
+            ) == RelayOutcome::PruneToken
+            {
+                tokens_to_prune.insert(activity.activity_push_token.clone());
+            }
+        }
+        prune_activity_tokens(tokens_to_prune);
+    }
+}
+
+/// Direct APNs delivery of one Live Activity payload: mint/reuse one JWT and POST to each
+/// token on the widget sub-topic.
+fn deliver_live_activity_direct(
+    cfg: &PushConfig,
+    payload: &str,
+    activities: &[&RegisteredActivity],
+) {
+    // Direct routing implies `enabled`, which guarantees these are all `Some`.
     let (Some(key_path), Some(key_id), Some(team_id), Some(topic)) = (
         cfg.key_path.as_deref(),
         cfg.key_id.as_deref(),
@@ -226,11 +398,6 @@ pub(crate) fn deliver_live_activity(
     ) else {
         return;
     };
-
-    let activities = crate::persist::activities::load();
-    if activities.is_empty() {
-        return;
-    }
 
     let resolved_key_path = crate::worktree::expand_tilde_path(key_path);
     let pem = match std::fs::read_to_string(&resolved_key_path) {
@@ -254,15 +421,11 @@ pub(crate) fn deliver_live_activity(
     };
     let mut reminted = false;
 
-    // The Live Activity topic is a distinct sub-topic of the app bundle id, and the whole
-    // session shares ONE content-state, so build the payload once.
+    // The Live Activity topic is a distinct sub-topic of the app bundle id.
     let la_topic = format!("{topic}.push-type.liveactivity");
-    // The timestamp is assigned by the caller in SOURCE ORDER (see emit_live_activity_updates),
-    // not here per-thread, so out-of-order sender threads can't let a stale snapshot win.
-    let payload = apns::live_activity_payload(&content_state, timestamp);
 
     let mut tokens_to_prune: HashSet<String> = HashSet::new();
-    for activity in &activities {
+    for activity in activities {
         if tokens_to_prune.contains(&activity.activity_push_token) {
             continue;
         }
@@ -273,7 +436,7 @@ pub(crate) fn deliver_live_activity(
             cfg.sandbox,
             "liveactivity",
             "5",
-            &payload,
+            payload,
         );
         if outcome == DeliveryOutcome::AuthExpired && !reminted {
             reminted = true;
@@ -288,7 +451,7 @@ pub(crate) fn deliver_live_activity(
                         cfg.sandbox,
                         "liveactivity",
                         "5",
-                        &payload,
+                        payload,
                     );
                 }
                 Err(err) => {
@@ -312,7 +475,21 @@ pub(crate) fn deliver_live_activity(
         }
     }
 
-    for token in tokens_to_prune {
+    prune_activity_tokens(tokens_to_prune);
+}
+
+fn prune_device_tokens(tokens: HashSet<String>) {
+    for token in tokens {
+        match crate::persist::devices::remove_token(&token) {
+            Ok(true) => tracing::info!("pruned an unregistered APNs device token"),
+            Ok(false) => {}
+            Err(err) => tracing::warn!(error = %err, "failed to prune APNs device token"),
+        }
+    }
+}
+
+fn prune_activity_tokens(tokens: HashSet<String>) {
+    for token in tokens {
         match crate::persist::activities::remove_token(&token) {
             Ok(true) => tracing::info!("pruned an unregistered live-activity token"),
             Ok(false) => {}
@@ -332,7 +509,7 @@ mod tests {
             key_id: fill.then(|| "ABC123DEFG".to_string()),
             team_id: fill.then(|| "TEAM123456".to_string()),
             topic: fill.then(|| "com.example.herdr".to_string()),
-            sandbox: false,
+            ..PushConfig::default()
         }
     }
 
@@ -346,7 +523,148 @@ mod tests {
             notify_gram: false,
             muted_panes: Vec::new(),
             registered_unix_ms: 0,
+            relay_capability: None,
         }
+    }
+
+    fn with_mode(mut cfg: PushConfig, mode: PushMode) -> PushConfig {
+        cfg.mode = mode;
+        cfg
+    }
+
+    const CAP: Option<&str> = Some("hpr1.AbC");
+
+    #[test]
+    fn route_per_mode_with_and_without_key_and_capability() {
+        let keyed = cfg(true, true);
+        let keyless = cfg(false, false);
+        let cases = [
+            // (mode, key config complete, capability, expected)
+            (PushMode::Auto, &keyed, CAP, Route::Direct),
+            (PushMode::Auto, &keyed, None, Route::Direct),
+            (PushMode::Auto, &keyless, CAP, Route::Relay),
+            (PushMode::Auto, &keyless, None, Route::Skip),
+            (PushMode::Direct, &keyed, CAP, Route::Direct),
+            (PushMode::Direct, &keyed, None, Route::Direct),
+            (PushMode::Direct, &keyless, CAP, Route::Skip),
+            (PushMode::Direct, &keyless, None, Route::Skip),
+            (PushMode::Relay, &keyed, CAP, Route::Relay),
+            (PushMode::Relay, &keyed, None, Route::Skip),
+            (PushMode::Relay, &keyless, CAP, Route::Relay),
+            (PushMode::Relay, &keyless, None, Route::Skip),
+            (PushMode::Off, &keyed, CAP, Route::Skip),
+            (PushMode::Off, &keyless, CAP, Route::Skip),
+        ];
+        for (mode, base, capability, expected) in cases {
+            let cfg = with_mode(base.clone(), mode);
+            assert_eq!(
+                route(&cfg, capability),
+                expected,
+                "{mode:?} key={} cap={}",
+                enabled(&cfg),
+                capability.is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn relay_route_needs_a_relay_url() {
+        let mut cfg = with_mode(cfg(false, false), PushMode::Relay);
+        cfg.relay_url = "  ".to_string();
+        assert_eq!(route(&cfg, CAP), Route::Skip);
+        assert!(!may_deliver(&cfg));
+        cfg.mode = PushMode::Auto;
+        assert_eq!(route(&cfg, CAP), Route::Skip);
+        assert!(!may_deliver(&cfg));
+    }
+
+    #[test]
+    fn may_deliver_is_false_only_when_every_route_skips() {
+        for base in [cfg(true, true), cfg(false, false)] {
+            for mode in [
+                PushMode::Auto,
+                PushMode::Direct,
+                PushMode::Relay,
+                PushMode::Off,
+            ] {
+                let cfg = with_mode(base.clone(), mode);
+                let any_route = route(&cfg, CAP) != Route::Skip || route(&cfg, None) != Route::Skip;
+                assert_eq!(
+                    may_deliver(&cfg),
+                    any_route,
+                    "{mode:?} key={}",
+                    enabled(&cfg)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn split_by_route_partitions_devices_per_capability() {
+        let mut plain = device(true, true, true);
+        plain.device_token = "plain".to_string();
+        let mut relayed = device(true, true, true);
+        relayed.device_token = "relayed".to_string();
+        relayed.relay_capability = CAP.map(str::to_string);
+        let devices = [plain, relayed];
+        fn tokens(items: Vec<&RegisteredDevice>) -> Vec<&str> {
+            items
+                .into_iter()
+                .map(|device| device.device_token.as_str())
+                .collect()
+        }
+        fn capability(device: &RegisteredDevice) -> Option<&str> {
+            device.relay_capability.as_deref()
+        }
+
+        let (direct, relay) = split_by_route(&cfg(true, true), &devices, capability);
+        assert_eq!(
+            (tokens(direct), tokens(relay)),
+            (vec!["plain", "relayed"], vec![])
+        );
+
+        let (direct, relay) = split_by_route(&cfg(false, false), &devices, capability);
+        assert_eq!((tokens(direct), tokens(relay)), (vec![], vec!["relayed"]));
+
+        let off = with_mode(cfg(true, true), PushMode::Off);
+        let (direct, relay) = split_by_route(&off, &devices, capability);
+        assert!(direct.is_empty() && relay.is_empty());
+    }
+
+    #[test]
+    fn status_state_machine() {
+        use NotificationsStatusState::*;
+        let keyed = cfg(true, true);
+        let keyless = cfg(false, false);
+        let cases = [
+            // (mode, key config, relay devices, expected)
+            (PushMode::Auto, &keyed, 0, DirectReady),
+            (PushMode::Auto, &keyed, 2, DirectReady),
+            (PushMode::Auto, &keyless, 1, RelayReady),
+            (PushMode::Auto, &keyless, 0, Unconfigured),
+            (PushMode::Direct, &keyed, 0, DirectReady),
+            (PushMode::Direct, &keyless, 3, Unconfigured),
+            (PushMode::Relay, &keyed, 0, Unconfigured),
+            (PushMode::Relay, &keyed, 1, RelayReady),
+            (PushMode::Relay, &keyless, 1, RelayReady),
+            (PushMode::Off, &keyed, 1, Off),
+            (PushMode::Off, &keyless, 0, Off),
+        ];
+        for (mode, base, relay_devices, expected) in cases {
+            let cfg = with_mode(base.clone(), mode);
+            assert_eq!(
+                status_state(false, &cfg, relay_devices),
+                expected,
+                "{mode:?} key={} relay_devices={relay_devices}",
+                enabled(&cfg)
+            );
+            // No-session daemons keep no registry, whatever the config says.
+            assert_eq!(status_state(true, &cfg, relay_devices), Unsupported);
+        }
+
+        let mut no_url = with_mode(keyless, PushMode::Relay);
+        no_url.relay_url = String::new();
+        assert_eq!(status_state(false, &no_url, 1), Unconfigured);
     }
 
     #[test]

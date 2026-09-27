@@ -25,6 +25,10 @@ pub struct RegisteredActivity {
     pub activity_push_token: String,
     /// Registration time in Unix milliseconds.
     pub registered_unix_ms: u64,
+    /// Opaque sealed capability from the HerdrUp push relay (`hpr1.…`). Sent back
+    /// verbatim to the relay; never parsed or logged. Absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_capability: Option<String>,
 }
 
 fn registry_path() -> PathBuf {
@@ -127,5 +131,56 @@ pub fn load() -> Vec<RegisteredActivity> {
             warn!(path = %registry_path().display(), err = %err, "failed to load activity registry");
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "herdr-activities-{label}-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    #[test]
+    fn save_and_load_roundtrip_with_and_without_capability() {
+        let path = temp_path("roundtrip");
+        let activities = [
+            RegisteredActivity {
+                activity_push_token: "aaaa".to_string(),
+                registered_unix_ms: 1,
+                relay_capability: None,
+            },
+            RegisteredActivity {
+                activity_push_token: "bbbb".to_string(),
+                registered_unix_ms: 2,
+                relay_capability: Some("hpr1.c2VhbGVk".to_string()),
+            },
+        ];
+        save_to_path(&path, &activities).unwrap();
+        assert_eq!(load_from_path_strict(&path).unwrap(), activities);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn legacy_file_without_capability_still_loads() {
+        let path = temp_path("legacy");
+        std::fs::write(
+            &path,
+            r#"[{"activity_push_token":"abcd","registered_unix_ms":1700000000000}]"#,
+        )
+        .unwrap();
+        let loaded = load_from_path_strict(&path).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].activity_push_token, "abcd");
+        assert_eq!(loaded[0].relay_capability, None);
+        let _ = std::fs::remove_file(&path);
     }
 }

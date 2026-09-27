@@ -1559,10 +1559,28 @@
       "title": "Push notifications",
       "keys": [
         {
+          "key": "push.mode",
+          "type": "enum",
+          "default": "\"auto\"",
+          "description": "How remote push reaches registered mobile devices. auto sends directly to APNs when push.enabled and the key settings are complete, and otherwise through the HerdrUp push relay for devices the app enrolled with it. direct uses only this host's APNs key, relay uses only the relay (no key needed), and off sends nothing. The relay sees the notification text in transit but does not store it.",
+          "values": [
+            "auto",
+            "direct",
+            "relay",
+            "off"
+          ]
+        },
+        {
+          "key": "push.relay_url",
+          "type": "string",
+          "default": "\"https://push.herdrup.themartian.app\"",
+          "description": "Base URL of the HerdrUp push relay used by relay mode, and by auto mode when no APNs key is configured."
+        },
+        {
           "key": "push.enabled",
           "type": "boolean",
           "default": "false",
-          "description": "Master switch for remote APNs push delivery to registered mobile devices. Requires key_path, key_id, team_id, and topic to also be set."
+          "description": "Master switch for direct APNs push delivery from this host. Requires key_path, key_id, team_id, and topic to also be set. Relay delivery does not need it."
         },
         {
           "key": "push.key_path",

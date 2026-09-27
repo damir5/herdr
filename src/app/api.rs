@@ -1017,7 +1017,7 @@ impl App {
     /// Deliver agent-state transitions to registered remote devices via APNs.
     ///
     /// A sibling of `emit_terminal_or_system_agent_notifications`, but with its
-    /// own guard (`crate::push::enabled`), independent of `local_terminal_
+    /// own guard (`crate::push::may_deliver`), independent of `local_terminal_
     /// notifications` and `ToastDelivery`: a remote device wants push even when
     /// local toasts are Off/Herdr and even on the focused active tab (so
     /// active-tab suppression is intentionally not applied here). Delivery is
@@ -1029,7 +1029,7 @@ impl App {
         pane_updates: &[crate::app::actions::PaneStateUpdate],
         from_pane_death: bool,
     ) {
-        if self.no_session || !crate::push::enabled(&self.state.push_config) {
+        if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
 
@@ -1130,7 +1130,7 @@ impl App {
     fn emit_live_activity_updates(&self) {
         use std::sync::atomic::Ordering;
 
-        if self.no_session || !crate::push::enabled(&self.state.push_config) {
+        if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
 
@@ -1529,6 +1529,7 @@ impl App {
             Method::NotificationsUnregisterActivity(params) => {
                 return self.handle_notifications_unregister_activity(request.id, params);
             }
+            Method::NotificationsStatus(_) => return self.handle_notifications_status(request.id),
             Method::GramSend(params) => return self.handle_gram_send(request.id, params),
             Method::GramPost(params) => return self.handle_gram_post(request.id, params),
             Method::GramList(params) => return self.handle_gram_list(request.id, params),
@@ -1994,6 +1995,10 @@ impl App {
         if platform.is_empty() {
             return responses::encode_error(id, "invalid_params", "platform is empty");
         }
+        let relay_capability = match normalize_relay_capability(params.relay_capability) {
+            Ok(capability) => capability,
+            Err(message) => return responses::encode_error(id, "invalid_params", message),
+        };
 
         // No-session/monolithic mode has no shared device registry to persist
         // to; acknowledge without touching disk, mirroring the plugin handlers.
@@ -2015,6 +2020,7 @@ impl App {
             notify_gram: params.notify_gram,
             muted_panes,
             registered_unix_ms: unix_millis_now(),
+            relay_capability,
         };
 
         match crate::persist::devices::upsert(device) {
@@ -2038,6 +2044,10 @@ impl App {
                 "activity_push_token must be 32-512 hexadecimal characters",
             );
         }
+        let relay_capability = match normalize_relay_capability(params.relay_capability) {
+            Ok(capability) => capability,
+            Err(message) => return responses::encode_error(id, "invalid_params", message),
+        };
 
         // No-session/monolithic mode has no shared registry to persist to; ack without disk,
         // mirroring handle_notifications_register_device.
@@ -2048,6 +2058,7 @@ impl App {
         let activity = crate::persist::activities::RegisteredActivity {
             activity_push_token: token.to_string(),
             registered_unix_ms: unix_millis_now(),
+            relay_capability,
         };
         match crate::persist::activities::upsert(activity) {
             Ok(_) => {
@@ -2081,6 +2092,33 @@ impl App {
                 responses::encode_error(id, "activity_registry_save_failed", err.to_string())
             }
         }
+    }
+
+    /// Report remote push readiness for the app's settings screen. Counts only:
+    /// never tokens, capabilities, or key material.
+    fn handle_notifications_status(&self, id: String) -> String {
+        let cfg = &self.state.push_config;
+        // No-session mode keeps no device registry, so there is nothing to count.
+        let (devices, relay_devices) = if self.no_session {
+            (0, 0)
+        } else {
+            let devices = crate::persist::devices::load();
+            let relay_devices = devices
+                .iter()
+                .filter(|device| device.relay_capability.is_some())
+                .count();
+            (devices.len(), relay_devices)
+        };
+        responses::encode_success(
+            id,
+            crate::api::schema::ResponseResult::NotificationsStatus {
+                state: crate::push::status_state(self.no_session, cfg, relay_devices),
+                mode: cfg.mode,
+                relay_url: cfg.relay_url.clone(),
+                devices: devices as u64,
+                relay_devices: relay_devices as u64,
+            },
+        )
     }
 
     pub(crate) fn api_notification_rate_limited(&self, now: Instant) -> bool {
@@ -2131,6 +2169,24 @@ fn unix_millis_now() -> u64 {
 /// registration cannot bloat the store.
 fn is_valid_apns_device_token(token: &str) -> bool {
     (32..=200).contains(&token.len()) && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Trim a registration's relay capability; blank means none. A non-blank value
+/// must be a sealed `hpr1.` capability.
+fn normalize_relay_capability(capability: Option<String>) -> Result<Option<String>, &'static str> {
+    let Some(capability) = capability else {
+        return Ok(None);
+    };
+    let capability = capability.trim();
+    if capability.is_empty() {
+        return Ok(None);
+    }
+    if !crate::push::is_valid_relay_capability(capability) {
+        return Err(
+            "relay_capability must be an hpr1. base64url capability of at most 512 characters",
+        );
+    }
+    Ok(Some(capability.to_string()))
 }
 
 /// Live Activity push tokens are hex like device tokens but LONGER, so allow a wider range.
@@ -2544,6 +2600,19 @@ mod tests {
         assert!(!is_valid_apns_device_token(&"a".repeat(201))); // too long
         assert!(!is_valid_apns_device_token(&"g".repeat(64))); // non-hex
         assert!(!is_valid_apns_device_token(&format!("{} ", "a".repeat(63)))); // whitespace
+    }
+
+    #[test]
+    fn relay_capability_normalization() {
+        assert_eq!(normalize_relay_capability(None), Ok(None));
+        // Blank means "no capability", so a failed enrollment still registers.
+        assert_eq!(normalize_relay_capability(Some("  ".into())), Ok(None));
+        assert_eq!(
+            normalize_relay_capability(Some(" hpr1.AbC-_ \n".into())),
+            Ok(Some("hpr1.AbC-_".to_string()))
+        );
+        assert!(normalize_relay_capability(Some("hpr1.a+b".into())).is_err());
+        assert!(normalize_relay_capability(Some("token".into())).is_err());
     }
 
     #[cfg(unix)]

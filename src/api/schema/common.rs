@@ -133,6 +133,10 @@ pub struct NotificationsRegisterDeviceParams {
     /// full list on each change; absent on older clients.
     #[serde(default)]
     pub muted_panes: Vec<String>,
+    /// Sealed `hpr1.` capability from the HerdrUp push relay, used when the
+    /// daemon delivers through the relay. Absent on older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_capability: Option<String>,
 }
 
 /// Register / unregister an iOS Live Activity push token for BACKGROUND widget updates.
@@ -141,6 +145,10 @@ pub struct NotificationsRegisterDeviceParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct NotificationsRegisterActivityParams {
     pub activity_push_token: String,
+    /// Sealed `hpr1.` capability from the HerdrUp push relay for this activity
+    /// token. Ignored by `.unregister_activity`; absent on older clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_capability: Option<String>,
 }
 
 #[derive(
@@ -168,6 +176,21 @@ pub enum NotificationShowReason {
     RateLimited,
     NoForegroundClient,
     Busy,
+}
+
+/// Readiness of remote push on this daemon, reported by `notifications.status`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum NotificationsStatusState {
+    /// This daemon cannot deliver push (no-session mode has no device registry).
+    Unsupported,
+    /// `push.mode = "off"`.
+    Off,
+    /// Direct mode without a complete APNs key config, or relay/auto mode with no
+    /// capability-bearing device registered yet.
+    Unconfigured,
+    DirectReady,
+    RelayReady,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

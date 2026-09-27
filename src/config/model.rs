@@ -1250,10 +1250,15 @@ impl Default for RemoteConfig {
 /// contents are never persisted to Herdr state and never logged. `key_id`,
 /// `team_id`, and `topic` are Apple developer identifiers (not secrets) but are
 /// still host configuration rather than repository constants.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct PushConfig {
-    /// Master switch for remote push delivery. Default: false.
+    /// How pushes reach devices: `auto` (direct APNs when the key config is
+    /// complete, else the HerdrUp relay), `direct`, `relay`, or `off`. Default: auto.
+    pub mode: PushMode,
+    /// Base URL of the HerdrUp push relay used by `relay` (and `auto` without a key).
+    pub relay_url: String,
+    /// Master switch for direct APNs delivery. Relay delivery needs no key. Default: false.
     pub enabled: bool,
     /// Filesystem path to the APNs auth key (`.p8`, PKCS#8 PEM). Read at send time only.
     pub key_path: Option<String>,
@@ -1265,6 +1270,37 @@ pub struct PushConfig {
     pub topic: Option<String>,
     /// Deliver through the APNs sandbox host instead of production. Default: false.
     pub sandbox: bool,
+}
+
+pub const DEFAULT_PUSH_RELAY_URL: &str = "https://push.herdrup.themartian.app";
+
+impl Default for PushConfig {
+    fn default() -> Self {
+        Self {
+            mode: PushMode::default(),
+            relay_url: DEFAULT_PUSH_RELAY_URL.to_string(),
+            enabled: false,
+            key_path: None,
+            key_id: None,
+            team_id: None,
+            topic: None,
+            sandbox: false,
+        }
+    }
+}
+
+/// Delivery path for remote push. `Auto` prefers direct APNs when the key config
+/// is complete and otherwise uses the relay for capability-bearing devices.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, schemars::JsonSchema, Default,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PushMode {
+    #[default]
+    Auto,
+    Direct,
+    Relay,
+    Off,
 }
 
 /// Capability tier granted to a federation peer's shared token.
@@ -2061,6 +2097,20 @@ manifest_check = false
         assert!(!default_config.push.enabled);
         assert!(default_config.push.key_path.is_none());
         assert!(!default_config.push.sandbox);
+        assert_eq!(default_config.push.mode, PushMode::Auto);
+        assert_eq!(default_config.push.relay_url, DEFAULT_PUSH_RELAY_URL);
+
+        // A partial [push] table keeps the relay defaults rather than blanking them.
+        let partial: Config = toml::from_str("[push]\nenabled = true\n").unwrap();
+        assert_eq!(partial.push.mode, PushMode::Auto);
+        assert_eq!(partial.push.relay_url, DEFAULT_PUSH_RELAY_URL);
+
+        let relay: Config =
+            toml::from_str("[push]\nmode = \"relay\"\nrelay_url = \"https://relay.test\"\n")
+                .unwrap();
+        assert_eq!(relay.push.mode, PushMode::Relay);
+        assert_eq!(relay.push.relay_url, "https://relay.test");
+        assert!(toml::from_str::<Config>("[push]\nmode = \"sometimes\"\n").is_err());
 
         let toml = r#"
 [push]

@@ -895,10 +895,10 @@ impl App {
 
     /// Deliver one gram alert to registered devices that opted into gram push.
     /// A sibling of `emit_apns_agent_notifications`: detached, best-effort, guarded
-    /// by `crate::push::enabled`. The alert deep-links to the app's Gram page, so
+    /// by `crate::push::may_deliver`. The alert deep-links to the app's Gram page, so
     /// it carries no pane/workspace id (the payload's `gram` marker signals this).
     fn emit_apns_gram_message(&self, from: &str, text: &str, file: Option<&GramFile>) {
-        if self.no_session || !crate::push::enabled(&self.state.push_config) {
+        if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
         let title =

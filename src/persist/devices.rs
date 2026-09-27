@@ -38,6 +38,10 @@ pub struct RegisteredDevice {
     pub muted_panes: Vec<String>,
     /// Registration time in Unix milliseconds.
     pub registered_unix_ms: u64,
+    /// Opaque sealed capability from the HerdrUp push relay (`hpr1.…`). Sent back
+    /// verbatim to the relay; never parsed or logged. Absent on legacy records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay_capability: Option<String>,
 }
 
 fn registry_path() -> PathBuf {
@@ -172,6 +176,7 @@ mod tests {
             notify_gram: false,
             muted_panes: Vec::new(),
             registered_unix_ms: 1_700_000_000_000,
+            relay_capability: None,
         }
     }
 
@@ -185,9 +190,15 @@ mod tests {
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        save_to_path(&path, &[sample_device("aaa"), sample_device("bbb")]).unwrap();
-        let loaded = load_from_path(&path);
-        assert_eq!(loaded.len(), 2);
+        let mut relayed = sample_device("bbb");
+        relayed.relay_capability = Some("hpr1.c2VhbGVk".to_string());
+        let devices = [sample_device("aaa"), relayed];
+        save_to_path(&path, &devices).unwrap();
+        assert_eq!(load_from_path_strict(&path).unwrap(), devices);
+        // A device without a capability writes no key, so the file stays in the
+        // shape older daemons already read.
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.matches("relay_capability").count(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
@@ -212,6 +223,8 @@ mod tests {
         assert!(devices[0].muted_panes.is_empty());
         // notify_gram (also #[serde(default)]) likewise defaults.
         assert!(!devices[0].notify_gram);
+        // Records written before the push relay carry no capability.
+        assert_eq!(devices[0].relay_capability, None);
     }
 
     #[test]

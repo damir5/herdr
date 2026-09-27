@@ -2,9 +2,6 @@
 
 ## Unreleased
 
-### Added
-- HerdrUp push notifications work without an APNs key on this machine. The new `push.mode` (default `auto`) sends through the HerdrUp push relay at `push.relay_url` for devices the app enrolled with it, and uses this host's key directly when one is configured. `notifications.status` reports whether push is ready, without exposing tokens or keys.
-
 ### Fixed
 - HerdrUp updates use only this fork's preview releases. The stable channel refuses with installer guidance because this fork has no stable release stream; remote setup and package-manager guidance no longer offer upstream binaries as fork updates. (#208)
 - Agent prompt CLI reports a written but unconfirmed submission as a non-failure result instead of a delivery error. `server agent-manifests` now shows which active manifests declare submission verification; unsupported agents are identified explicitly. (#210)

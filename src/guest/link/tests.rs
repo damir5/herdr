@@ -316,17 +316,28 @@ impl Guest {
         }
     }
 
-    fn recv(&mut self, relay: &mut HostSocket) -> String {
-        let Frame::Data(id, message) = relay.frame() else {
-            panic!("expected data for session {}", self.session);
-        };
-        assert_eq!(id, self.session);
+    /// Reads DATA messages until a full line arrives; returns it and how many
+    /// Noise messages carried it.
+    fn recv_line(&mut self, relay: &mut HostSocket) -> (String, usize) {
+        let (mut line, mut messages) = (Vec::new(), 0);
         let mut plaintext = vec![0; MAX_MESSAGE];
-        let len = self
-            .transport
-            .read_message(&message, &mut plaintext)
-            .unwrap();
-        String::from_utf8(plaintext[..len].to_vec()).unwrap()
+        while line.last() != Some(&b'\n') {
+            let Frame::Data(id, message) = relay.frame() else {
+                panic!("expected data for session {}", self.session);
+            };
+            assert_eq!(id, self.session);
+            let len = self
+                .transport
+                .read_message(&message, &mut plaintext)
+                .unwrap();
+            line.extend_from_slice(&plaintext[..len]);
+            messages += 1;
+        }
+        (String::from_utf8(line).unwrap(), messages)
+    }
+
+    fn recv(&mut self, relay: &mut HostSocket) -> String {
+        self.recv_line(relay).0
     }
 }
 
@@ -422,11 +433,9 @@ fn guest_round_trip_through_the_relay() {
     // A response bigger than one Noise message arrives in order, in chunks.
     let big = "x".repeat(200_000);
     guest.send(&mut relay, &format!("{big}\n"));
-    let mut echoed = String::new();
-    while !echoed.ends_with('\n') {
-        echoed += &guest.recv(&mut relay);
-    }
+    let (echoed, messages) = guest.recv_line(&mut relay);
     assert_eq!(echoed, format!("plotarmordev: {big}\n"));
+    assert!(messages >= 4, "200 kB needs at least 4 Noise messages");
 
     guest.send(&mut relay, "bye\n");
     assert_eq!(guest.recv(&mut relay), "bye plotarmordev\n");

@@ -26,7 +26,7 @@ use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -166,10 +166,14 @@ impl Signals {
     }
 }
 
-/// The running relay link. Dropping it stops the link: the socket closes, live
-/// guest sessions end, and the status turns `off`.
+/// How often the change listener re-checks for a stopped link.
+const LISTENER_TICK: Duration = Duration::from_millis(100);
+
+/// The running relay link. Dropping it stops the link and returns once the
+/// relay socket is closed: live guest sessions end and the status turns `off`.
 pub(crate) struct GuestLink {
     signals: Arc<Signals>,
+    threads: Vec<thread::JoinHandle<()>>,
 }
 
 impl GuestLink {
@@ -193,25 +197,27 @@ impl GuestLink {
             waker,
         });
 
-        let changes = host.subscribe_changes();
-        let listener = Arc::clone(&signals);
-        thread::Builder::new()
-            .name("herdr-guest-link-changes".into())
-            .spawn(move || {
-                for () in changes {
-                    if listener.stopped() {
-                        break;
-                    }
-                    listener.changed.store(true, Ordering::Relaxed);
-                    listener.waker.wake();
-                }
-            })?;
+        // Dropping `link` on a failed spawn stops and joins what did start.
+        let mut link = Self {
+            signals,
+            threads: Vec::with_capacity(2),
+        };
 
-        let link = Arc::clone(&signals);
-        thread::Builder::new()
-            .name("herdr-guest-link".into())
-            .spawn(move || supervise(&host, &link, &wake, timing))?;
-        Ok(Self { signals })
+        let changes = host.subscribe_changes();
+        let listener = Arc::clone(&link.signals);
+        link.threads.push(
+            thread::Builder::new()
+                .name("herdr-guest-link-changes".into())
+                .spawn(move || listen(&changes, &listener))?,
+        );
+
+        let signals = Arc::clone(&link.signals);
+        link.threads.push(
+            thread::Builder::new()
+                .name("herdr-guest-link".into())
+                .spawn(move || supervise(&host, &signals, &wake, timing))?,
+        );
+        Ok(link)
     }
 }
 
@@ -219,6 +225,24 @@ impl Drop for GuestLink {
     fn drop(&mut self) {
         self.signals.stop.store(true, Ordering::Relaxed);
         self.signals.waker.wake();
+        for thread in self.threads.drain(..) {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// Forwards guest/invite changes to the link thread until the link stops; the
+/// receiver drops with this thread.
+fn listen(changes: &mpsc::Receiver<()>, signals: &Signals) {
+    while !signals.stopped() {
+        match changes.recv_timeout(LISTENER_TICK) {
+            Ok(()) => {
+                signals.changed.store(true, Ordering::Relaxed);
+                signals.waker.wake();
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
     }
 }
 
@@ -233,7 +257,12 @@ enum Ended {
 }
 
 /// Keeps the link up while it is wanted: dial, serve, back off, repeat.
-fn supervise<H: GuestHost>(host: &Arc<H>, signals: &Signals, wake: &WakeReceiver, timing: Timing) {
+fn supervise<H: GuestHost>(
+    host: &Arc<H>,
+    signals: &Arc<Signals>,
+    wake: &WakeReceiver,
+    timing: Timing,
+) {
     let mut backoff = Backoff::new(timing.backoff_base, timing.backoff_cap);
     let mut last_error: Option<String> = None;
     while !signals.stopped() {
@@ -247,7 +276,7 @@ fn supervise<H: GuestHost>(host: &Arc<H>, signals: &Signals, wake: &WakeReceiver
         }
 
         host.set_link_status(LinkState::Connecting, last_error.clone());
-        let ended = match relay::Connection::open(&**host, &timing) {
+        let ended = match relay::Connection::open(&**host, &timing, signals) {
             Ok(connection) => {
                 info!("guest link: connected to relay");
                 host.set_link_status(LinkState::Up, None);
@@ -258,7 +287,7 @@ fn supervise<H: GuestHost>(host: &Arc<H>, signals: &Signals, wake: &WakeReceiver
                 }
                 ended
             }
-            Err(error) => Ended::Failed(error),
+            Err(ended) => ended,
         };
         let error = match ended {
             Ended::Stopped => break,

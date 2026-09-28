@@ -27,8 +27,16 @@ const INBOUND_QUEUE: usize = 32;
 
 /// Session output for the connection thread to put on the socket.
 pub(super) enum Outbound {
-    Data { session: u32, frame: Vec<u8> },
-    Close { session: u32, reason: String },
+    Data {
+        session: u32,
+        frame: Vec<u8>,
+    },
+    Close {
+        session: u32,
+        reason: String,
+    },
+    /// A CLOSE for a session the host refused or dropped itself.
+    Refused(Vec<u8>),
 }
 
 /// The session's end of its API stream, once admitted.
@@ -108,13 +116,12 @@ impl<H: GuestHost> Sessions<H> {
         }
     }
 
-    /// Starts a session for a relay OPEN. Returns a CLOSE frame to send now
-    /// when the session cannot start.
-    pub(super) fn open(&mut self, id: u32) -> Option<Vec<u8>> {
+    /// Starts a session for a relay OPEN, or refuses it with a CLOSE.
+    pub(super) fn open(&mut self, id: u32) {
         // Ids are unique per host; a reused one replaces the stale session.
         self.live.remove(&id);
         if self.live.len() >= MAX_SESSIONS {
-            return Some(frame::close(id, "host_busy"));
+            return self.refuse(id, "host_busy");
         }
         let (inbound, receiver) = mpsc::sync_channel(INBOUND_QUEUE);
         let shared = Arc::new(Shared {
@@ -134,22 +141,34 @@ impl<H: GuestHost> Sessions<H> {
             .name(format!("herdr-guest-session-{id}"))
             .spawn(move || session.run());
         if spawned.is_err() {
-            return Some(frame::close(id, "internal"));
+            return self.refuse(id, "internal");
         }
         self.live.insert(id, Handle { inbound, shared });
-        None
     }
 
-    /// Hands a guest message to its session. Returns a CLOSE frame to send now
-    /// when the session is overloaded; messages for unknown sessions drop.
-    pub(super) fn data(&mut self, id: u32, payload: Bytes) -> Option<Vec<u8>> {
-        let handle = self.live.get(&id)?;
-        match handle.inbound.try_send(payload) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => None,
-            Err(TrySendError::Full(_)) => {
-                self.live.remove(&id);
-                Some(frame::close(id, "overloaded"))
-            }
+    /// Hands a guest message to its session, closing a session that is not
+    /// keeping up; messages for unknown sessions drop.
+    pub(super) fn data(&mut self, id: u32, payload: Bytes) {
+        let Some(handle) = self.live.get(&id) else {
+            return;
+        };
+        if let Err(TrySendError::Full(_)) = handle.inbound.try_send(payload) {
+            self.live.remove(&id);
+            self.refuse(id, "overloaded");
+        }
+    }
+
+    /// Queues a CLOSE for a session the host will not serve. A relay that
+    /// floods OPENs faster than the socket drains loses these CLOSEs rather
+    /// than growing memory; the relay closes such guests on its own timeouts.
+    fn refuse(&self, id: u32, reason: &str) {
+        match self
+            .outbound
+            .try_send(Outbound::Refused(frame::close(id, reason)))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => debug!("guest session {id}: queue full, CLOSE dropped"),
+            Err(TrySendError::Disconnected(_)) => {}
         }
     }
 
@@ -166,6 +185,7 @@ impl<H: GuestHost> Sessions<H> {
                 .live
                 .remove(&session)
                 .map(|_| frame::close(session, &reason)),
+            Outbound::Refused(frame) => Some(frame),
         }
     }
 }

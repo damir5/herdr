@@ -775,3 +775,176 @@ fn link_stops_when_the_last_invite_expires_unannounced() {
     host.wait_status(|(state, _)| *state == LinkState::Off);
     assert!(stub.tcp(Duration::from_millis(300)).is_none());
 }
+
+/// Reads what the link already sent, without waiting, skipping pings.
+fn already_sent(relay: &mut HostSocket) -> Option<Message> {
+    relay.ws.get_ref().set_nonblocking(true).unwrap();
+    loop {
+        match relay.ws.read() {
+            Ok(Message::Text(text)) if text.as_str() == "ping" => {}
+            Ok(message) => return Some(message),
+            Err(tungstenite::Error::Io(error)) if error.kind() == ErrorKind::WouldBlock => {
+                return None
+            }
+            Err(error) => panic!("relay read: {error}"),
+        }
+    }
+}
+
+#[test]
+fn stopping_the_link_closes_its_socket_before_returning() {
+    let stub = StubRelay::new();
+    let (link, host, _served) = start(&stub, timing());
+    let mut relay = stub.accept();
+    host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    // A live handoff relies on this: once the old link is dropped, its relay
+    // socket is closed and nothing redials, so the replacement's link can
+    // take the host slot without the two evicting each other.
+    drop(link);
+    assert!(
+        matches!(already_sent(&mut relay), Some(Message::Close(Some(frame))) if u16::from(frame.code) == 1001),
+        "the close frame was sent before drop returned"
+    );
+    assert_eq!(host.last_status(), Some((LinkState::Off, None)));
+    for subscriber in host.subscribers.lock().unwrap().iter() {
+        assert!(
+            subscriber.send(()).is_err(),
+            "the change listener dropped its receiver"
+        );
+    }
+    assert!(stub.tcp(Duration::from_millis(300)).is_none());
+}
+
+/// Shrinks the receive buffer of sockets `listener` accepts, so a stub that
+/// stops reading pushes back on the link after a few kilobytes.
+fn shrink_receive_buffer(listener: &TcpListener) {
+    use std::os::fd::AsRawFd;
+    let size: libc::c_int = 4096;
+    // SAFETY: a valid socket fd and a c_int option of the size passed.
+    let result = unsafe {
+        libc::setsockopt(
+            listener.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(size).cast(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(result, 0, "setsockopt SO_RCVBUF");
+}
+
+#[test]
+fn a_flood_of_opens_stays_bounded_and_the_link_still_stops() {
+    let stub = StubRelay::new();
+    shrink_receive_buffer(&stub.listener);
+    let (link, host, _served) = start(&stub, timing());
+    let relay = stub.accept();
+    host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    // The relay floods OPENs far past the session cap and never reads, so
+    // the host's CLOSE replies can only go as far as the socket takes them.
+    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let (sent, stop) = (Arc::clone(&sent), Arc::clone(&stop));
+        let mut relay = relay;
+        std::thread::spawn(move || {
+            let mut session = 1_u32;
+            while !stop.load(Ordering::Relaxed) {
+                for _ in 0..1000 {
+                    let open = Message::Binary(frame::open(session).into());
+                    if relay.ws.write(open).is_err() {
+                        return;
+                    }
+                    session += 1;
+                }
+                if relay.ws.flush().is_err() {
+                    return;
+                }
+                sent.fetch_add(1000, Ordering::Relaxed);
+            }
+        })
+    };
+    let deadline = Instant::now() + WAIT;
+    while sent.load(Ordering::Relaxed) < 100_000 {
+        assert!(Instant::now() < deadline, "the link stopped reading OPENs");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // Writes respect the bounded buffers: the link never hit its hard cap.
+    assert_eq!(host.last_status(), Some((LinkState::Up, None)));
+    let stopping = Instant::now();
+    drop(link);
+    assert!(
+        stopping.elapsed() < Duration::from_secs(2),
+        "stopping took {:?} while the relay kept sending",
+        stopping.elapsed()
+    );
+    stop.store(true, Ordering::Relaxed);
+    flood.join().unwrap();
+}
+
+#[test]
+fn slow_relay_handshake_times_out_and_stopping_cancels_the_dial() {
+    let stub = StubRelay::new();
+    let quick = Timing {
+        handshake_timeout: Duration::from_millis(400),
+        ..timing()
+    };
+    let (link, host, _served) = start(&stub, quick);
+
+    // Answers the upgrade one byte at a time and never finishes it.
+    let trickle = |tcp: TcpStream| {
+        std::thread::spawn(move || {
+            let mut tcp = tcp;
+            let _ = tcp.write_all(b"HTTP/1.1 101 Switching Protocols\r\nX-Pad: ");
+            while tcp.write_all(b"a").is_ok() {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        })
+    };
+    let first = trickle(stub.tcp(WAIT).expect("the link dials"));
+    let started = Instant::now();
+    let (_, error) = host.wait_status(|(state, _)| *state == LinkState::Retrying);
+    assert_eq!(error.as_deref(), Some("relay handshake timed out"));
+    assert!(started.elapsed() < Duration::from_secs(3));
+
+    let second = trickle(stub.tcp(WAIT).expect("the link redials"));
+    let stopping = Instant::now();
+    drop(link);
+    assert!(
+        stopping.elapsed() < Duration::from_secs(1),
+        "stopping mid-dial took {:?}",
+        stopping.elapsed()
+    );
+    drop(stub);
+    for thread in [first, second] {
+        thread.join().unwrap();
+    }
+}
+
+#[test]
+fn relay_close_reasons_are_sanitized_before_reporting() {
+    let stub = StubRelay::new();
+    let (_link, host, _served) = start(&stub, timing());
+    let mut relay = stub.accept();
+    host.wait_status(|(state, _)| *state == LinkState::Up);
+
+    let reason = format!("bad\nline\u{1b}[31m{}", "x".repeat(100));
+    relay
+        .ws
+        .close(Some(CloseFrame {
+            code: CloseCode::from(4001),
+            reason: reason.into(),
+        }))
+        .unwrap();
+    let (_, error) = host.wait_status(|(state, _)| *state == LinkState::Retrying);
+    let error = error.unwrap();
+    assert!(!error.chars().any(char::is_control), "{error:?}");
+    assert!(
+        error.starts_with("relay closed the connection (4001 bad line [31m"),
+        "{error:?}"
+    );
+    assert!(error.chars().count() < 120, "{error:?}");
+}

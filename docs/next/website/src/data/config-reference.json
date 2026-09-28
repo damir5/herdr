@@ -1493,14 +1493,14 @@
         {
           "key": "gram_relay.peers",
           "type": "array of strings",
-          "default": "[]",
-          "description": "Coordinator only. Saved-machine profile ids (32 lowercase hex characters, as shown by `herdr machine list`) whose identity-pinned saved SSH peer may relay Gram files through a restricted reverse gateway. Empty grants nothing. Replaces the deprecated `HERDR_GRAM_RELAY_PEERS` environment variable: when both are set and differ, the relay is disabled with a `conflict` error. Applied by `herdr server reload-config`; removing a peer tears down its gateway and rejects its next relayed request. Independent of `federation.reverse_coordinator_machine_id` and agent grants."
+          "default": "unset",
+          "description": "Coordinator only. Saved-machine profile ids (32 lowercase hex characters, as shown by `herdr machine list`) whose identity-pinned saved SSH peer may relay Gram files through a restricted reverse gateway. Unset grants nothing; `[]` explicitly grants nothing and never defers to the environment. Replaces the deprecated `HERDR_GRAM_RELAY_PEERS` environment variable, which is honoured only while this key is unset: when both are set and differ (an empty list or empty variable included), the relay is disabled with a `conflict` error. Applied by `herdr server reload-config`; removing a peer tears down its gateway and rejects its next relayed request. Independent of `federation.reverse_coordinator_machine_id` and agent grants."
         },
         {
           "key": "gram_relay.coordinator_machine_id",
           "type": "string",
           "default": "unset",
-          "description": "Remote only. Install id of the trusted coordinator (`machine_` plus 32 lowercase hex characters, from the coordinator's `machine.json`). Herdr forwards this daemon's `gram send`, `list`, file download, and delete to the reverse socket derived from this id and its own install id (`herdr gram relay-path <id>` prints it). Unset keeps Gram local. Replaces the deprecated `HERDR_GRAM_REVERSE_SOCKET`; a differing environment value disables the relay with a `conflict` error. Same-user processes on this machine can act as any of its panes."
+          "description": "Remote only. Install id of the trusted coordinator (`machine_` plus 32 lowercase hex characters, from the coordinator's `machine.json`). Herdr forwards this daemon's `gram send`, `list`, file download, and delete to the reverse socket derived from this id and its own install id (`herdr gram relay-path <id>` prints it). Unset keeps Gram local; `\"\"` explicitly disables the relay and never defers to the environment. Replaces the deprecated `HERDR_GRAM_REVERSE_SOCKET`, which is honoured only while this key is unset; a differing value (an empty one included) disables the relay with a `conflict` error. Same-user processes on this machine can act as any of its panes."
         }
       ]
     },

@@ -2140,6 +2140,28 @@ mod tests {
         }
 
         #[test]
+        fn explicit_empty_peers_revoke_a_peer_the_legacy_env_still_names() {
+            let (mut app, path) = app_with_config_file();
+            std::env::set_var(crate::api::gram_relay::PEERS_ENV, PEER);
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\npeers = [\"{PEER}\"]\n"),
+            );
+            assert_ne!(relay_list(&mut app)["error"]["code"], "forbidden");
+            assert_eq!(status(&app)["coordinator"]["source"], "config");
+
+            reload(&mut app, &path, "[gram_relay]\npeers = []\n");
+            assert_eq!(relay_list(&mut app)["error"]["code"], "forbidden");
+            let coordinator = status(&app)["coordinator"].clone();
+            assert_eq!(coordinator["configured"], serde_json::json!([]));
+            assert_eq!(coordinator["environment"], "present");
+            assert_eq!(coordinator["effective"], serde_json::Value::Null);
+            assert_eq!(coordinator["error"], "conflict");
+            std::env::remove_var(crate::api::gram_relay::PEERS_ENV);
+        }
+
+        #[test]
         fn invalid_reload_keeps_the_previous_effective_setting() {
             let (mut app, path) = app_with_config_file();
             reload(

@@ -47,23 +47,23 @@ impl RelayEnvironment {
         }
     }
 
-    /// Legacy parsing: comma-separated, trimmed, empty names ignored.
+    /// Legacy parsing: comma-separated, trimmed, empty names ignored. A set but
+    /// empty variable is present with no peers, never the same as unset.
     fn peer_set(&self) -> Option<BTreeSet<String>> {
-        let peers: BTreeSet<String> = self
-            .peers
-            .as_deref()?
-            .split(',')
-            .map(str::trim)
-            .filter(|name| !name.is_empty())
-            .map(str::to_owned)
-            .collect();
-        (!peers.is_empty()).then_some(peers)
+        Some(
+            self.peers
+                .as_deref()?
+                .split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect(),
+        )
     }
 
+    /// A set but empty variable is present and means "disabled".
     fn socket_path(&self) -> Option<PathBuf> {
-        self.socket
-            .clone()
-            .filter(|path| !path.as_os_str().is_empty())
+        self.socket.clone()
     }
 }
 
@@ -76,7 +76,11 @@ pub(crate) struct Resolved<T> {
 }
 
 /// Config wins when equal; environment alone is honoured (deprecated); a
-/// mismatch disables the role instead of choosing either side.
+/// mismatch disables the role instead of choosing either side. Presence is
+/// what counts: an explicitly empty value (`peers = []`,
+/// `coordinator_machine_id = ""`, or a set but empty variable) is a value that
+/// grants nothing, so it can only disable or conflict, never defer to the other
+/// source.
 pub(crate) fn resolve<T: PartialEq>(configured: Option<T>, environment: Option<T>) -> Resolved<T> {
     match (configured, environment) {
         (None, None) => Resolved {
@@ -158,6 +162,15 @@ impl<T: Clone + PartialEq> RoleState<T> {
     }
 }
 
+impl RoleState<PathBuf> {
+    /// The effective socket, unless it is the explicit "disabled" empty path.
+    fn enabled_socket(&self) -> Option<&PathBuf> {
+        self.effective
+            .as_ref()
+            .filter(|path| !path.as_os_str().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 struct RelayState {
     coordinator: RoleState<BTreeSet<String>>,
@@ -181,12 +194,18 @@ impl GramRelayPolicy {
         environment: &RelayEnvironment,
         own_machine_id: impl FnOnce() -> String,
     ) {
-        let configured_peers: Option<BTreeSet<String>> =
-            (!config.peers.is_empty()).then(|| config.peers.iter().cloned().collect());
-        let configured_socket = config
-            .coordinator_machine_id
-            .as_deref()
-            .map(|coordinator| reverse_socket_path(coordinator, &own_machine_id()));
+        let configured_peers: Option<BTreeSet<String>> = config
+            .peers
+            .as_ref()
+            .map(|peers| peers.iter().cloned().collect());
+        // An explicitly empty pin is the "disabled" value, an empty path.
+        let configured_socket = config.coordinator_machine_id.as_deref().map(|coordinator| {
+            if coordinator.is_empty() {
+                PathBuf::new()
+            } else {
+                reverse_socket_path(coordinator, &own_machine_id())
+            }
+        });
         let next = RelayState {
             coordinator: RoleState::resolved(
                 configured_peers,
@@ -231,6 +250,7 @@ impl GramRelayPolicy {
     }
 
     /// Coordinator consent for one saved peer routing alias.
+    #[cfg(unix)]
     pub(crate) fn allows(&self, alias: &str) -> bool {
         self.read()
             .coordinator
@@ -251,8 +271,9 @@ impl GramRelayPolicy {
     }
 
     /// Remote reverse socket Gram calls are forwarded to, if enabled.
+    #[cfg(unix)]
     pub(crate) fn remote_socket(&self) -> Option<PathBuf> {
-        self.read().remote.effective.clone()
+        self.read().remote.enabled_socket().cloned()
     }
 
     pub(crate) fn coordinator_status(
@@ -291,14 +312,11 @@ impl GramRelayPolicy {
                 .as_ref()
                 .map(|path| path.display().to_string()),
             environment: GramRelayEnvironment::from_present(role.environment),
-            effective_socket: role
-                .effective
-                .as_ref()
-                .map(|path| path.display().to_string()),
+            effective_socket: role.enabled_socket().map(|path| path.display().to_string()),
             source: role.source,
             error: role.error,
             message: role.message.clone(),
-            accepting: role.effective.as_deref().map(accepting),
+            accepting: role.enabled_socket().map(|path| accepting(path)),
         }
     }
 }
@@ -319,7 +337,8 @@ pub(crate) fn apply_config(config: &GramRelayConfig) {
     );
 }
 
-#[cfg(test)]
+// The consent accessors exist only on unix, where the relay runs.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -329,9 +348,11 @@ mod tests {
     const OTHER_COORDINATOR: &str = "machine_3417306ea71c7044dcbb76ad128e7c68";
     const OWN: &str = "machine_cf86dc42c063eac7b83162361990ae59";
 
+    /// An empty `peers` slice leaves the key unset.
     fn config(peers: &[&str], coordinator: Option<&str>) -> GramRelayConfig {
         GramRelayConfig {
-            peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
+            peers: (!peers.is_empty())
+                .then(|| peers.iter().map(|peer| (*peer).to_owned()).collect()),
             coordinator_machine_id: coordinator.map(str::to_owned),
         }
     }
@@ -366,6 +387,15 @@ mod tests {
 
         let default: crate::config::Config = toml::from_str("").unwrap();
         assert_eq!(default.gram_relay, GramRelayConfig::default());
+        assert_eq!(default.gram_relay.peers, None);
+
+        let explicit: crate::config::Config =
+            toml::from_str("[gram_relay]\npeers = []\ncoordinator_machine_id = \"\"\n").unwrap();
+        assert_eq!(explicit.gram_relay.peers, Some(Vec::new()));
+        assert_eq!(
+            explicit.gram_relay.coordinator_machine_id.as_deref(),
+            Some("")
+        );
 
         for bad in [
             "[gram_relay]\npeers = [\"jerrys-mac-studio\"]\n",
@@ -380,6 +410,83 @@ mod tests {
                 .is_ok_and(|config| config.gram_relay == GramRelayConfig::default());
             assert!(parsed.is_err() || unknown_key_ignored, "{bad}");
         }
+    }
+
+    #[test]
+    fn explicit_empty_peers_revoke_even_when_the_environment_names_the_peer() {
+        let environment = env(Some(PEER_A), None);
+        let policy = applied(&config(&[PEER_A], None), &environment);
+        assert!(policy.allows(PEER_A));
+
+        let explicit_none = GramRelayConfig {
+            peers: Some(Vec::new()),
+            coordinator_machine_id: None,
+        };
+        policy.apply(&explicit_none, &environment, || OWN.into());
+        assert!(
+            !policy.allows(PEER_A),
+            "peers = [] must not defer to the environment"
+        );
+        let status = policy.coordinator_status(Vec::new());
+        assert_eq!(status.configured, Some(Vec::new()));
+        assert_eq!(status.effective, None);
+        assert_eq!(status.error, Some(GramRelayErrorCode::Conflict));
+
+        let alone = applied(&explicit_none, &RelayEnvironment::default());
+        assert!(!alone.allows(PEER_A));
+        assert_eq!(
+            alone.coordinator_status(Vec::new()).source,
+            GramRelaySource::Config
+        );
+    }
+
+    #[test]
+    fn empty_environment_is_present_and_never_ignored() {
+        let policy = applied(&config(&[PEER_A], None), &env(Some(""), None));
+        assert!(!policy.allows(PEER_A));
+        let status = policy.coordinator_status(Vec::new());
+        assert_eq!(status.environment, GramRelayEnvironment::Present);
+        assert_eq!(status.error, Some(GramRelayErrorCode::Conflict));
+
+        let remote = applied(
+            &config(&[], Some(COORDINATOR)),
+            &env(None, Some(PathBuf::new())),
+        );
+        assert_eq!(remote.remote_socket(), None);
+        let status = remote.remote_status(|_| true);
+        assert_eq!(status.environment, GramRelayEnvironment::Present);
+        assert_eq!(status.error, Some(GramRelayErrorCode::Conflict));
+        assert_eq!(status.accepting, None);
+
+        let env_only = applied(
+            &GramRelayConfig::default(),
+            &env(Some(" , "), Some(PathBuf::new())),
+        );
+        assert!(!env_only.allows(PEER_A));
+        assert_eq!(env_only.remote_socket(), None);
+        assert_eq!(env_only.remote_status(|_| true).effective_socket, None);
+    }
+
+    #[test]
+    fn explicit_empty_coordinator_pin_disables_a_legacy_socket() {
+        let legacy = env(None, Some(socket_for(COORDINATOR)));
+        let policy = applied(&config(&[], Some(COORDINATOR)), &legacy);
+        assert_eq!(policy.remote_socket(), Some(socket_for(COORDINATOR)));
+
+        policy.apply(&config(&[], Some("")), &legacy, || {
+            unreachable!("an empty pin derives no socket")
+        });
+        assert_eq!(policy.remote_socket(), None);
+        let status = policy.remote_status(|_| true);
+        assert_eq!(status.error, Some(GramRelayErrorCode::Conflict));
+        assert_eq!(status.effective_socket, None);
+
+        let alone = applied(&config(&[], Some("")), &RelayEnvironment::default());
+        assert_eq!(alone.remote_socket(), None);
+        assert_eq!(
+            alone.remote_status(|_| true).source,
+            GramRelaySource::Config
+        );
     }
 
     #[test]

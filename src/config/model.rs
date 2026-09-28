@@ -1333,16 +1333,19 @@ pub enum CapabilityTier {
 #[serde(default)]
 pub struct GramRelayConfig {
     /// Coordinator: saved-machine profile ids whose pinned SSH peer may relay
-    /// Gram through a restricted reverse gateway. Empty grants nothing.
+    /// Gram through a restricted reverse gateway. Unset grants nothing; a
+    /// present empty list explicitly grants nothing and overrides the legacy
+    /// environment variable instead of deferring to it.
     #[serde(deserialize_with = "deserialize_gram_relay_peers")]
-    pub peers: Vec<String>,
+    pub peers: Option<Vec<String>>,
     /// Remote: install id of the trusted coordinator. The reverse socket path is
-    /// derived from it and this daemon's own install id. Unset grants nothing.
+    /// derived from it and this daemon's own install id. Unset grants nothing;
+    /// an empty string explicitly disables the relay, like an empty list above.
     #[serde(deserialize_with = "deserialize_gram_relay_coordinator")]
     pub coordinator_machine_id: Option<String>,
 }
 
-fn deserialize_gram_relay_peers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+fn deserialize_gram_relay_peers<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -1354,7 +1357,7 @@ where
             ))
         })?;
     }
-    Ok(peers)
+    Ok(Some(peers))
 }
 
 fn deserialize_gram_relay_coordinator<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
@@ -1363,9 +1366,9 @@ where
 {
     let machine_id = Option::<String>::deserialize(deserializer)?;
     if let Some(machine_id) = &machine_id {
-        if !is_install_machine_id(machine_id) {
+        if !machine_id.is_empty() && !is_install_machine_id(machine_id) {
             return Err(de::Error::custom(
-                "gram_relay.coordinator_machine_id must be \"machine_\" followed by 32 lowercase hex characters",
+                "gram_relay.coordinator_machine_id must be \"machine_\" followed by 32 lowercase hex characters, or \"\" to disable the relay explicitly",
             ));
         }
     }

@@ -1860,45 +1860,58 @@ mod tests {
 
         #[test]
         fn relay_config_changes_start_and_tear_down_gateways_on_reconcile() {
-            let policy = Arc::new(crate::api::gram_relay::GramRelayPolicy::default());
-            let consent_policy = Arc::clone(&policy);
-            let spawner = FakeSpawner::scripted([]);
-            let clock = ManualClock::new();
-            let manager = FederationPeerManager::with_gram_hooks(
-                Arc::new(Mutex::new(FederationStore::default())),
-                Arc::new(AtomicBool::new(true)),
-                Arc::clone(&spawner) as Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>,
-                Arc::clone(&clock) as Arc<dyn crate::api::gram_gateway::GatewayClock>,
-                Arc::new(move |alias: &str| consent_policy.allows(alias)),
-            );
-            let apply = |peers: &[&str]| {
-                policy.apply(
-                    &crate::config::GramRelayConfig {
-                        peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
-                        coordinator_machine_id: None,
-                    },
-                    &crate::api::gram_relay::RelayEnvironment::default(),
-                    || unreachable!("no coordinator pin configured"),
+            for legacy_env in [None, Some(ALIAS)] {
+                let policy = Arc::new(crate::api::gram_relay::GramRelayPolicy::default());
+                let consent_policy = Arc::clone(&policy);
+                let spawner = FakeSpawner::scripted([]);
+                let clock = ManualClock::new();
+                let manager = FederationPeerManager::with_gram_hooks(
+                    Arc::new(Mutex::new(FederationStore::default())),
+                    Arc::new(AtomicBool::new(true)),
+                    Arc::clone(&spawner) as Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>,
+                    Arc::clone(&clock) as Arc<dyn crate::api::gram_gateway::GatewayClock>,
+                    Arc::new(move |alias: &str| consent_policy.allows(alias)),
                 );
-            };
+                // Models a daemon still carrying the old HERDR_GRAM_RELAY_PEERS wrapper.
+                let environment = crate::api::gram_relay::RelayEnvironment {
+                    peers: legacy_env.map(str::to_owned),
+                    socket: None,
+                };
+                let apply = |peers: Option<&[&str]>| {
+                    policy.apply(
+                        &crate::config::GramRelayConfig {
+                            peers: peers
+                                .map(|peers| peers.iter().map(|peer| (*peer).to_owned()).collect()),
+                            coordinator_machine_id: None,
+                        },
+                        &environment,
+                        || unreachable!("no coordinator pin configured"),
+                    );
+                };
 
-            manager.reconcile(&[pinned_peer()]);
-            assert_eq!(state(&manager), None, "default config grants no gateway");
-            assert_eq!(spawner.calls(), 0);
+                if legacy_env.is_none() {
+                    apply(None);
+                    manager.reconcile(&[pinned_peer()]);
+                    assert_eq!(state(&manager), None, "default config grants no gateway");
+                    assert_eq!(spawner.calls(), 0);
+                }
 
-            apply(&[ALIAS]);
-            manager.reconcile(&[pinned_peer()]);
-            wait_until("gateway up", || {
-                state(&manager) == Some(GramGatewayState::Up)
-            });
-            let bridge = transport(&manager);
+                apply(Some(&[ALIAS]));
+                manager.reconcile(&[pinned_peer()]);
+                wait_until("gateway up", || {
+                    state(&manager) == Some(GramGatewayState::Up)
+                });
+                let bridge = transport(&manager);
 
-            apply(&[]);
-            manager.reconcile(&[pinned_peer()]);
-            assert_eq!(state(&manager), None);
-            assert_eq!(spawner.live(), 0, "revoked gateway is torn down");
-            assert_eq!(transport(&manager), bridge, "peer bridge untouched");
-            manager.join_all();
+                // `peers = []` revokes even while the legacy variable names the peer.
+                apply(Some(&[]));
+                manager.reconcile(&[pinned_peer()]);
+                assert!(!policy.allows(ALIAS), "env={legacy_env:?}");
+                assert_eq!(state(&manager), None, "env={legacy_env:?}");
+                assert_eq!(spawner.live(), 0, "revoked gateway is torn down");
+                assert_eq!(transport(&manager), bridge, "peer bridge untouched");
+                manager.join_all();
+            }
         }
 
         #[test]

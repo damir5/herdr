@@ -83,18 +83,27 @@ impl App {
             .unwrap_or_default()
             .to_string();
         let resolved = match (&params.terminal_id, &params.target) {
-            (Some(terminal_id), _) => self.agent_target_for_terminal_id(terminal_id),
+            (Some(terminal_id), _) => self.terminal_target_for_terminal_id(terminal_id),
             (None, Some(target)) => self.resolve_agent_target(target).ok(),
             (None, None) => None,
         };
         let Some(resolved) = resolved else {
             return agent_not_found(id, &label);
         };
-        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+        let Some(pane_id) = self.public_pane_id(resolved.ws_idx, resolved.pane_id) else {
             return agent_not_found(id, &label);
         };
-        let running = self.agent_pane_runs_agent(resolved.ws_idx, resolved.pane_id);
-        encode_success(id, ResponseResult::GuestAgentProbed { agent, running })
+        let agent = self.agent_info(resolved.ws_idx, resolved.pane_id);
+        let running =
+            agent.is_some() && self.agent_pane_runs_agent(resolved.ws_idx, resolved.pane_id);
+        encode_success(
+            id,
+            ResponseResult::GuestAgentProbed {
+                pane_id,
+                agent,
+                running,
+            },
+        )
     }
 
     #[cfg(unix)]

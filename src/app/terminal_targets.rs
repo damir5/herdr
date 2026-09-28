@@ -105,14 +105,16 @@ impl App {
         })
     }
 
-    /// The agent pane currently attached to `terminal_id`. Terminal ids are
-    /// never reused, so a guest grant can pin one.
+    /// The pane currently attached to `terminal_id`, agent or not. Terminal
+    /// ids are never reused, so a guest grant can pin one.
     #[cfg(unix)]
-    pub(crate) fn agent_target_for_terminal_id(&self, terminal_id: &str) -> Option<TerminalTarget> {
+    pub(crate) fn terminal_target_for_terminal_id(
+        &self,
+        terminal_id: &str,
+    ) -> Option<TerminalTarget> {
         self.terminal_targets()
             .into_iter()
             .find(|candidate| candidate.terminal_id == terminal_id)
-            .filter(|candidate| self.target_is_agent(candidate))
     }
 
     fn target_is_agent(&self, target: &TerminalTarget) -> bool {

@@ -70,13 +70,26 @@ pub struct GuestAgentProbeParams {
     pub target: Option<String>,
 }
 
-/// The one agent a guest may use. It lapses when the pane, name or harness
-/// session changes.
+/// The one agent a guest may use: the agent with this name and kind in this
+/// terminal. A restarted agent keeps the grant, and `agent_session` follows
+/// its latest harness session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GuestGrantInfo {
     pub terminal_id: String,
     pub agent_name: Option<String>,
+    /// Agent kind at invite time, for example `claude`. Grants from before
+    /// this field use `agent_session.agent`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
     pub agent_session: AgentSessionInfo,
+}
+
+impl GuestGrantInfo {
+    pub fn kind(&self) -> &str {
+        self.agent_kind
+            .as_deref()
+            .unwrap_or(&self.agent_session.agent)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -131,6 +144,8 @@ pub enum GuestAuditEvent {
     Denied,
     Paused,
     Revoked,
+    /// The granted agent came back under a new harness session.
+    Resumed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -299,7 +299,10 @@ pub enum ResponseResult {
     #[cfg(unix)]
     #[schemars(skip)]
     GuestAgentProbed {
-        agent: AgentInfo,
+        /// Public pane id currently showing the terminal.
+        pane_id: String,
+        /// `None` when the pane no longer hosts an agent.
+        agent: Option<AgentInfo>,
         running: bool,
     },
     /// Effective Gram relay policy for both roles. Never includes secrets.

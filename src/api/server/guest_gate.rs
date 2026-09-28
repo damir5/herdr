@@ -14,8 +14,9 @@ use super::{
     ConnectionPrincipal, EventHub,
 };
 use crate::api::schema::{
-    AgentInfo, GramPostParams, GramUploadChunkParams, GuestAgentProbeParams, GuestAuditEvent,
-    GuestAuditFile, GuestGrantInfo, Method, Request, ResponseResult, SuccessResponse,
+    AgentInfo, ErrorResponse, GramPostParams, GramUploadChunkParams, GuestAgentProbeParams,
+    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, Request, ResponseResult,
+    SuccessResponse,
 };
 use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
@@ -97,13 +98,21 @@ fn serve_guest_with(
     )
 }
 
-/// The agent a probe resolved plus the `agent.prompt` live-agent check, or
-/// the app's error line.
+/// What the app reports for one pane: its public id, the agent in it (if
+/// any), and the `agent.prompt` live-agent check.
+pub(super) struct Probe {
+    pub pane_id: String,
+    pub agent: Option<AgentInfo>,
+    pub running: bool,
+}
+
+/// Probe by terminal id (any pane) or by agent target (agent panes only).
+/// Errors return the app's error line.
 pub(super) fn probe_target(
     api_tx: &ApiRequestSender,
     terminal_id: Option<&str>,
     target: Option<&str>,
-) -> Result<(AgentInfo, bool), String> {
+) -> Result<Probe, String> {
     let response = dispatch_to_app_with_timeout(
         Request {
             id: "guest:probe".into(),
@@ -117,61 +126,109 @@ pub(super) fn probe_target(
     );
     match serde_json::from_str::<SuccessResponse>(&response) {
         Ok(SuccessResponse {
-            result: ResponseResult::GuestAgentProbed { agent, running },
+            result:
+                ResponseResult::GuestAgentProbed {
+                    pane_id,
+                    agent,
+                    running,
+                },
             ..
-        }) => Ok((agent, running)),
+        }) => Ok(Probe {
+            pane_id,
+            agent,
+            running,
+        }),
         _ => Err(response),
     }
 }
 
-/// Same rule as the reverse-agent grants: same pane, name and harness
-/// session, local, not archived and not transferring.
+fn same_kind(a: &str, b: &str) -> bool {
+    match (
+        crate::detect::parse_agent_label(a),
+        crate::detect::parse_agent_label(b),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The grant is the agent with this name and kind in this terminal, local,
+/// not archived and not being transferred. The harness session may change:
+/// a restarted agent keeps its guest.
 fn grant_matches(grant: &GuestGrantInfo, agent: &AgentInfo) -> bool {
     grant.terminal_id == agent.terminal_id
+        && grant.agent_name.is_some()
         && grant.agent_name == agent.name
-        && agent.agent_session.as_ref() == Some(&grant.agent_session)
+        && agent
+            .agent
+            .as_deref()
+            .is_some_and(|kind| same_kind(kind, grant.kind()))
         && agent.machine_id.is_none()
         && agent.archived.is_none()
         && agent.session_transfer.is_none()
 }
 
 enum GrantState {
-    Live(AgentInfo),
-    Paused(AgentInfo),
+    /// The granted agent is running.
+    Live(Box<AgentInfo>),
+    /// The granted terminal exists but does not run the granted agent now.
+    Paused { pane_id: String },
+    /// The granted terminal is gone.
     Gone,
 }
 
 impl GrantState {
-    /// The granted agent, if it still matches, and whether it is running.
-    fn into_parts(self) -> (Option<AgentInfo>, bool) {
+    fn is_live(&self) -> bool {
+        matches!(self, Self::Live(_))
+    }
+
+    /// The pane the granted terminal is shown in, while it exists.
+    fn pane_id(&self) -> Option<&str> {
         match self {
-            Self::Live(agent) => (Some(agent), true),
-            Self::Paused(agent) => (Some(agent), false),
-            Self::Gone => (None, false),
+            Self::Live(agent) => Some(&agent.pane_id),
+            Self::Paused { pane_id } => Some(pane_id),
+            Self::Gone => None,
         }
     }
 }
 
 fn grant_state(guest: &GuestPrincipal, api_tx: &ApiRequestSender) -> GrantState {
-    match probe_target(api_tx, Some(&guest.grant.terminal_id), None) {
-        Ok((agent, running)) if grant_matches(&guest.grant, &agent) => {
-            if running {
-                GrantState::Live(agent)
-            } else {
-                GrantState::Paused(agent)
+    let Ok(probe) = probe_target(api_tx, Some(&guest.grant.terminal_id), None) else {
+        return GrantState::Gone;
+    };
+    match probe.agent {
+        Some(agent) if probe.running && grant_matches(&guest.grant, &agent) => {
+            if let Some(session) = &agent.agent_session {
+                note_resumed_session(guest, session);
             }
+            GrantState::Live(Box::new(agent))
         }
-        _ => GrantState::Gone,
+        _ => GrantState::Paused {
+            pane_id: probe.pane_id,
+        },
+    }
+}
+
+/// Follow the granted agent onto a new harness session, auditing `resumed`
+/// once when the stored grant changes.
+fn note_resumed_session(guest: &GuestPrincipal, session: &crate::api::schema::AgentSessionInfo) {
+    if *session == guest.grant.agent_session {
+        return;
+    }
+    match crate::guest::store::update_grant_session(&guest.dir, &guest.guest_id, session) {
+        Ok(true) => guest.audit(GuestAuditEvent::Resumed, None, None, None),
+        Ok(false) => {}
+        Err(err) => tracing::warn!(err = %err, "guest grant session update failed"),
     }
 }
 
 /// A target names the grant only by its terminal id, agent name, or the
-/// pane id the agent currently occupies. Alias-qualified and other panes'
-/// ids never match.
-fn names_grant(target: &str, guest: &GuestPrincipal, agent: Option<&AgentInfo>) -> bool {
+/// pane id the granted terminal currently occupies. Alias-qualified and
+/// other panes' ids never match.
+fn names_grant(target: &str, guest: &GuestPrincipal, pane_id: Option<&str>) -> bool {
     target == guest.grant.terminal_id
         || guest.grant.agent_name.as_deref() == Some(target)
-        || agent.is_some_and(|agent| agent.pane_id == target)
+        || pane_id == Some(target)
 }
 
 /// The only agent fields a guest sees. Titles, cwd, ids of other scopes,
@@ -183,7 +240,7 @@ struct GuestAgentView<'a> {
     name: Option<&'a str>,
     agent: Option<&'a str>,
     display_agent: Option<&'a str>,
-    agent_status: &'a crate::api::schema::AgentStatus,
+    agent_status: crate::api::schema::AgentStatus,
     guest_running: bool,
 }
 
@@ -194,10 +251,33 @@ fn guest_view(agent: &AgentInfo, running: bool) -> serde_json::Value {
         name: agent.name.as_deref(),
         agent: agent.agent.as_deref(),
         display_agent: agent.display_agent.as_deref(),
-        agent_status: &agent.agent_status,
+        agent_status: agent.agent_status,
         guest_running: running,
     })
     .unwrap_or_default()
+}
+
+/// The granted agent while paused, described from the grant alone.
+fn paused_view(guest: &GuestPrincipal, pane_id: &str) -> serde_json::Value {
+    serde_json::to_value(GuestAgentView {
+        terminal_id: &guest.grant.terminal_id,
+        pane_id,
+        name: guest.grant.agent_name.as_deref(),
+        agent: Some(guest.grant.kind()),
+        display_agent: None,
+        agent_status: crate::api::schema::AgentStatus::Unknown,
+        guest_running: false,
+    })
+    .unwrap_or_default()
+}
+
+/// The guest view of the granted agent while its terminal exists.
+fn state_view(guest: &GuestPrincipal, state: &GrantState) -> Option<serde_json::Value> {
+    match state {
+        GrantState::Live(agent) => Some(guest_view(agent, true)),
+        GrantState::Paused { pane_id } => Some(paused_view(guest, pane_id)),
+        GrantState::Gone => None,
+    }
 }
 
 /// Revoked in this process (live registry) or in the store, which another
@@ -217,6 +297,76 @@ fn guest_error(id: &str, code: &str) -> String {
 
 fn success_value(id: &str, result: serde_json::Value) -> String {
     serde_json::json!({"id": id, "result": result}).to_string()
+}
+
+/// Rebuild an app reply for a guest. Errors keep only their code and
+/// message; a success is rebuilt by `project`, and any other shape is
+/// dropped rather than forwarded.
+fn guest_reply(
+    id: &str,
+    response: &str,
+    project: impl FnOnce(ResponseResult) -> Option<serde_json::Value>,
+) -> String {
+    if let Ok(success) = serde_json::from_str::<SuccessResponse>(response) {
+        if let Some(result) = project(success.result) {
+            return success_value(id, result);
+        }
+    } else if let Ok(error) = serde_json::from_str::<ErrorResponse>(response) {
+        return error_response_json(id.to_string(), &error.error.code, error.error.message);
+    }
+    error_response_json(
+        id.to_string(),
+        "internal_error",
+        "the host produced a reply guests cannot receive".into(),
+    )
+}
+
+fn project_pong(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::Pong {
+        version, protocol, ..
+    } = result
+    else {
+        return None;
+    };
+    Some(serde_json::json!({"type": "pong", "version": version, "protocol": protocol}))
+}
+
+fn project_prompted(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::AgentPrompted { agent, delivery } = result else {
+        return None;
+    };
+    let mut value =
+        serde_json::json!({"type": "agent_prompted", "agent": guest_view(&agent, true)});
+    if let Some(delivery) = delivery {
+        value["delivery"] = serde_json::to_value(delivery).ok()?;
+    }
+    Some(value)
+}
+
+fn project_ok(result: ResponseResult) -> Option<serde_json::Value> {
+    matches!(result, ResponseResult::Ok {}).then(|| serde_json::json!({"type": "ok"}))
+}
+
+fn project_gram_sent(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::GramSent { message, .. } = result else {
+        return None;
+    };
+    let mut view = serde_json::json!({
+        "id": message.id,
+        "from": message.from,
+        "to": message.to,
+        "text": message.text,
+        "created_unix_ms": message.created_unix_ms,
+    });
+    if let Some(file) = message.file {
+        view["file"] = serde_json::json!({
+            "name": file.name,
+            "size": file.size,
+            "mime": file.mime,
+            "sha256": file.sha256,
+        });
+    }
+    Some(serde_json::json!({"type": "gram_sent", "message": view}))
 }
 
 pub(super) fn serve_request(
@@ -245,7 +395,7 @@ pub(super) fn serve_request(
         Method::Ping(params) => {
             let response = handle_request(
                 Request {
-                    id,
+                    id: id.clone(),
                     method: Method::Ping(params),
                 },
                 api_tx,
@@ -253,35 +403,34 @@ pub(super) fn serve_request(
                 None,
                 None,
             );
-            write_text_line_allow_disconnect(&mut stream, &response)
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_pong),
+            )
         }
         Method::AgentList(_) => {
-            let (agent, running) = grant_state(guest, api_tx).into_parts();
-            let agents: Vec<_> = agent
-                .map(|agent| guest_view(&agent, running))
-                .into_iter()
-                .collect();
+            let state = grant_state(guest, api_tx);
+            let agents: Vec<_> = state_view(guest, &state).into_iter().collect();
             let result = serde_json::json!({"type": "agent_list", "agents": agents});
             write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
         }
         Method::AgentGet(target) => {
-            let (agent, running) = grant_state(guest, api_tx).into_parts();
-            if !names_grant(&target.target, guest, agent.as_ref()) {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&target.target, guest, state.pane_id()) {
                 return forbidden(&mut stream);
             }
-            let Some(agent) = agent else {
+            let Some(agent) = state_view(guest, &state) else {
                 return paused(&mut stream);
             };
-            let result =
-                serde_json::json!({"type": "agent_info", "agent": guest_view(&agent, running)});
+            let result = serde_json::json!({"type": "agent_info", "agent": agent});
             write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
         }
         Method::PaneStream(mut params) => {
-            let (agent, is_live) = grant_state(guest, api_tx).into_parts();
-            if !names_grant(&params.pane_id, guest, agent.as_ref()) {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&params.pane_id, guest, state.pane_id()) {
                 return forbidden(&mut stream);
             }
-            let Some(agent) = agent.filter(|_| is_live) else {
+            let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
             // View-only: no viewer id, so no width lease and no resize path.
@@ -298,7 +447,7 @@ pub(super) fn serve_request(
                 if live.revoked() || (store_due && is_revoked(guest, &live)) {
                     return Some(guest_error(&id, "guest_revoked"));
                 }
-                if closed || !matches!(grant_state(guest, api_tx), GrantState::Live(_)) {
+                if closed || !grant_state(guest, api_tx).is_live() {
                     guest.audit(GuestAuditEvent::Paused, Some(method), None, None);
                     return Some(guest_error(&id, "guest_paused"));
                 }
@@ -324,11 +473,11 @@ pub(super) fn serve_request(
                     ),
                 );
             }
-            let (agent, is_live) = grant_state(guest, api_tx).into_parts();
-            if !names_grant(&params.target, guest, agent.as_ref()) {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&params.target, guest, state.pane_id()) {
                 return forbidden(&mut stream);
             }
-            let Some(agent) = agent.filter(|_| is_live) else {
+            let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
             guest.audit(
@@ -340,7 +489,8 @@ pub(super) fn serve_request(
             params.target = agent.pane_id;
             params.text = format!("{}{}", guest.label(), params.text);
             let response =
-                prompt_agent(id.clone(), params, &mut stream, api_tx, event_hub, running)?;
+                prompt_agent(id.clone(), params, &mut stream, api_tx, event_hub, running)?
+                    .map(|response| guest_reply(&id, &response, project_prompted));
             finish_wait_response(&mut stream, response, &id, method, false)
         }
         Method::GramUploadChunk(params) => {
@@ -352,25 +502,24 @@ pub(super) fn serve_request(
                     &error_response_json(id, "invalid_params", "upload chunk is too large".into()),
                 );
             }
-            if !matches!(grant_state(guest, api_tx), GrantState::Live(_)) {
+            if !grant_state(guest, api_tx).is_live() {
                 return paused(&mut stream);
             }
             let request = Request {
-                id,
+                id: id.clone(),
                 method: Method::GramUploadChunk(GramUploadChunkParams {
                     upload_id: guest_upload_id(guest, &params.upload_id),
                     ..params
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
-            write_text_line_allow_disconnect(&mut stream, &response)
+            write_text_line_allow_disconnect(&mut stream, &guest_reply(&id, &response, project_ok))
         }
         Method::GramPost(params) => {
-            let (agent, is_live) = grant_state(guest, api_tx).into_parts();
-            let Some(agent_name) = agent.filter(|_| is_live).map(|agent| agent.name) else {
+            let GrantState::Live(agent) = grant_state(guest, api_tx) else {
                 return paused(&mut stream);
             };
-            if params.to.is_some() && params.to != agent_name {
+            if params.to.is_some() && params.to != agent.name {
                 return forbidden(&mut stream);
             }
             let text = params.text.clone();
@@ -382,14 +531,17 @@ pub(super) fn serve_request(
                 id: id.clone(),
                 method: Method::GramPost(GramPostParams {
                     text: params.text,
-                    to: agent_name,
+                    to: agent.name,
                     file,
                     from: Some(guest.label().trim_end_matches(": ").to_string()),
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
             audit_post(guest, method, text, &response);
-            write_text_line_allow_disconnect(&mut stream, &response)
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_gram_sent),
+            )
         }
         _ => forbidden(&mut stream),
     }
@@ -561,12 +713,17 @@ mod tests {
     impl Harness {
         /// An invite to agent `index`, created through the store.
         fn invite(&self, index: usize, name: &str) -> crate::guest::store::NewInvite {
-            let (agent, running) = probe_target(&self.api_tx, None, Some(&self.pane_ids[index]))
+            let probe = probe_target(&self.api_tx, None, Some(&self.pane_ids[index]))
                 .expect("probe the granted agent");
-            assert!(running, "the granted agent passes the live-agent check");
+            assert!(
+                probe.running,
+                "the granted agent passes the live-agent check"
+            );
+            let agent = probe.agent.expect("an agent");
             let grant = GuestGrantInfo {
                 terminal_id: agent.terminal_id,
                 agent_name: agent.name,
+                agent_kind: agent.agent,
                 agent_session: agent.agent_session.expect("session"),
             };
             crate::guest::store::create_invite(
@@ -643,6 +800,39 @@ mod tests {
             String::from_utf8_lossy(&text).into_owned()
         }
 
+        /// Change the granted terminal's agent on the app thread.
+        fn with_granted_terminal(
+            &self,
+            change: impl FnOnce(&mut crate::terminal::TerminalState) + Send + 'static,
+        ) {
+            let (done_tx, done_rx) = std_mpsc::channel();
+            self.control
+                .send(Box::new(move |app: &mut App| {
+                    let pane = app.state.workspaces[0].tabs[0].root_pane;
+                    let terminal_id = app.state.workspaces[0].tabs[0].panes[&pane]
+                        .attached_terminal_id
+                        .clone();
+                    change(app.state.terminals.get_mut(&terminal_id).unwrap());
+                    let _ = done_tx.send(());
+                }))
+                .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        /// The agent comes back in the same terminal under a new session.
+        fn agent_restarts(&self, kind: crate::detect::Agent, name: &str, session: &str) {
+            let (name, session) = (name.to_string(), session.to_string());
+            self.with_granted_terminal(move |terminal| {
+                terminal.set_agent_name(name);
+                terminal.set_detected_state(Some(kind), crate::detect::AgentState::Idle);
+                terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                    source: "herdr".into(),
+                    agent: kind_label(kind).into(),
+                    session_ref: crate::agent_resume::AgentSessionRef::id(session).unwrap(),
+                });
+            });
+        }
+
         fn agent_exits(&self) {
             self.control
                 .send(Box::new(|app: &mut App| {
@@ -659,6 +849,36 @@ mod tests {
                 .unwrap();
         }
     }
+
+    fn kind_label(kind: crate::detect::Agent) -> &'static str {
+        match kind {
+            crate::detect::Agent::Claude => "claude",
+            _ => "pi",
+        }
+    }
+
+    fn keys(value: &Value) -> std::collections::BTreeSet<&str> {
+        value
+            .as_object()
+            .unwrap_or_else(|| panic!("an object: {value}"))
+            .keys()
+            .map(String::as_str)
+            .collect()
+    }
+
+    fn set<'a>(names: &[&'a str]) -> std::collections::BTreeSet<&'a str> {
+        names.iter().copied().collect()
+    }
+
+    const AGENT_VIEW_KEYS: [&str; 7] = [
+        "terminal_id",
+        "pane_id",
+        "name",
+        "agent",
+        "display_agent",
+        "agent_status",
+        "guest_running",
+    ];
 
     fn code(lines: &[Value]) -> &str {
         lines
@@ -781,10 +1001,7 @@ mod tests {
             json!({"id": "l", "method": "agent.list", "params": {}}),
         );
         let agents = list[0]["result"]["agents"].as_array().unwrap();
-        assert!(
-            agents.is_empty() || agents[0]["guest_running"] == false,
-            "{list:?}"
-        );
+        assert_eq!(agents[0]["guest_running"], false, "{list:?}");
         let prompt = harness.call(
             &guest,
             json!({"id": "p", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "hi"}}),
@@ -1008,6 +1225,243 @@ mod tests {
             let lines = harness.call(&guest, request.clone());
             assert_eq!(code(&lines), "guest_revoked", "{request} -> {lines:?}");
         }
+    }
+
+    /// Points the Gram store at a scratch config dir for one test.
+    struct ConfigHome {
+        previous: Option<std::ffi::OsString>,
+        dir: std::path::PathBuf,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ConfigHome {
+        fn new(tag: &str) -> Self {
+            let lock = crate::config::test_config_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let dir = std::env::temp_dir().join(format!(
+                "herdr-guest-cfg-{tag}-{}-{}",
+                std::process::id(),
+                now_ms()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous = std::env::var_os("XDG_CONFIG_HOME");
+            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            Self {
+                previous,
+                dir,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ConfigHome {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var("XDG_CONFIG_HOME", value),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn every_guest_success_reply_carries_only_guest_fields() {
+        let _config = ConfigHome::new("replies");
+        let harness = start("replies");
+        let guest = harness.admit();
+        let agent_keys = set(&AGENT_VIEW_KEYS);
+        let error_keys = set(&["code", "message"]);
+
+        let pong = harness.call(&guest, json!({"id": "p", "method": "ping", "params": {}}));
+        assert_eq!(keys(&pong[0]), set(&["id", "result"]));
+        assert_eq!(
+            keys(&pong[0]["result"]),
+            set(&["type", "version", "protocol"])
+        );
+
+        let prompt = harness.call(
+            &guest,
+            json!({"id": "a", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "hi"}}),
+        );
+        assert_eq!(keys(&prompt[0]), set(&["id", "result"]), "{prompt:?}");
+        assert_eq!(
+            keys(&prompt[0]["result"]),
+            set(&["type", "agent", "delivery"])
+        );
+        assert_eq!(keys(&prompt[0]["result"]["agent"]), agent_keys);
+
+        // The waiting form ends in a projected success or a bare error.
+        let waited = harness.call(
+            &guest,
+            json!({"id": "w", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "again", "wait": {"until": ["idle", "working", "blocked", "done", "unknown"], "timeout_ms": 400}}}),
+        );
+        let reply = waited.last().unwrap();
+        match reply.get("result") {
+            Some(result) => {
+                assert_eq!(keys(result), set(&["type", "agent", "delivery"]), "{reply}");
+                assert_eq!(keys(&result["agent"]), agent_keys);
+            }
+            None => assert_eq!(keys(&reply["error"]), error_keys, "{reply}"),
+        }
+
+        let upload = harness.call(
+            &guest,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": "up-1", "offset": 0, "data_base64": "aGk="}}),
+        );
+        assert_eq!(upload[0], json!({"id": "u", "result": {"type": "ok"}}));
+
+        let post = harness.call(
+            &guest,
+            json!({"id": "g", "method": "gram.post", "params": {"text": "notes", "file": {"upload_id": "up-1", "name": "a.txt", "mime": "text/plain"}}}),
+        );
+        assert_eq!(keys(&post[0]), set(&["id", "result"]), "{post:?}");
+        assert_eq!(keys(&post[0]["result"]), set(&["type", "message"]));
+        let message = &post[0]["result"]["message"];
+        assert_eq!(
+            keys(message),
+            set(&["id", "from", "to", "text", "created_unix_ms", "file"])
+        );
+        assert_eq!(
+            keys(&message["file"]),
+            set(&["name", "size", "mime", "sha256"])
+        );
+        assert_eq!(message["from"], "plotarmordev (via HerdrUp)");
+        assert_eq!(message["to"], "llm-opt");
+
+        let (mut reader, handle) = open_stream(&harness, &guest);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let seed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            keys(&seed),
+            set(&["stream", "frame", "seq", "epoch", "cols", "rows", "data_b64"])
+        );
+        harness.agent_exits();
+        let end = stream_end(&mut reader);
+        assert_eq!(keys(&end), set(&["id", "error"]));
+        assert_eq!(keys(&end["error"]), error_keys);
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_paused_agent_is_still_listed_from_the_grant() {
+        let harness = start("paused-view");
+        let guest = harness.admit();
+        harness.agent_exits();
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let get = harness.call(
+            &guest,
+            json!({"id": "g", "method": "agent.get", "params": {"target": guest.grant.terminal_id}}),
+        );
+        let agents = list[0]["result"]["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1, "{list:?}");
+        for agent in [&agents[0], &get[0]["result"]["agent"]] {
+            assert_eq!(keys(agent), set(&AGENT_VIEW_KEYS), "{agent}");
+            assert_eq!(agent["guest_running"], false);
+            assert_eq!(agent["agent_status"], "unknown");
+            assert_eq!(agent["name"], "llm-opt");
+            assert_eq!(agent["terminal_id"], guest.grant.terminal_id.as_str());
+            assert_eq!(agent["pane_id"], harness.pane_ids[0].as_str());
+        }
+    }
+
+    #[test]
+    fn a_restarted_agent_regains_access_but_a_renamed_or_other_kind_does_not() {
+        let harness = start("restart");
+        let guest = harness.admit();
+        let prompt = |target: &str, text: &str| {
+            harness.call(
+                &guest,
+                json!({"id": "p", "method": "agent.prompt", "params": {"target": target, "text": text}}),
+            )
+        };
+        harness.agent_exits();
+        assert_eq!(code(&prompt("llm-opt", "while away")), "guest_paused");
+
+        harness.agent_restarts(crate::detect::Agent::Pi, "llm-opt", "session-restarted");
+        let lines = prompt("llm-opt", "welcome back");
+        assert_eq!(lines[0]["result"]["type"], "agent_prompted", "{lines:?}");
+        let written = harness.pty_text(0, Duration::from_millis(600));
+        assert!(
+            written.contains("plotarmordev (via HerdrUp): welcome back"),
+            "{written:?}"
+        );
+        let stored = crate::guest::store::load_store(&guest.dir).unwrap();
+        let record = stored
+            .guests
+            .iter()
+            .find(|record| record.guest_id == guest.guest_id)
+            .unwrap();
+        assert_eq!(record.grant.agent_session.value, "session-restarted");
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        assert_eq!(list[0]["result"]["agents"][0]["guest_running"], true);
+        let resumed = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 50)
+            .unwrap()
+            .iter()
+            .filter(|entry| entry.event == GuestAuditEvent::Resumed)
+            .count();
+        assert_eq!(resumed, 1, "resumed is audited once per new session");
+
+        harness.agent_restarts(crate::detect::Agent::Pi, "renamed", "session-renamed");
+        assert_eq!(code(&prompt("llm-opt", "x")), "guest_paused");
+        assert_eq!(code(&prompt(&guest.grant.terminal_id, "x")), "guest_paused");
+        assert_eq!(code(&prompt("renamed", "x")), "guest_forbidden");
+
+        harness.agent_restarts(crate::detect::Agent::Claude, "llm-opt", "session-claude");
+        assert_eq!(code(&prompt("llm-opt", "x")), "guest_paused");
+        assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
+    }
+
+    #[test]
+    fn grant_matching_follows_name_and_kind_not_the_session() {
+        let grant = crate::guest::store::tests::grant();
+        let agent: AgentInfo = serde_json::from_value(json!({
+            "terminal_id": grant.terminal_id, "name": "llm-opt", "agent": "pi",
+            "agent_status": "idle",
+            "agent_session": {"source": "herdr", "agent": "pi", "kind": "id", "value": "new"},
+            "workspace_id": "w", "tab_id": "t", "pane_id": "w1:p1",
+            "focused": false, "revision": 1
+        }))
+        .unwrap();
+        assert!(
+            grant_matches(&grant, &agent),
+            "a new session keeps the grant"
+        );
+        let mut other = agent.clone();
+        other.name = Some("renamed".into());
+        assert!(!grant_matches(&grant, &other));
+        let mut other = agent.clone();
+        other.agent = Some("claude".into());
+        assert!(!grant_matches(&grant, &other));
+        let mut other = agent.clone();
+        other.agent = None;
+        assert!(!grant_matches(&grant, &other));
+        let mut other = agent.clone();
+        other.terminal_id = "term_2".into();
+        assert!(!grant_matches(&grant, &other));
+        let mut other = agent.clone();
+        other.machine_id = Some("studio".into());
+        assert!(!grant_matches(&grant, &other));
+        let mut other = agent.clone();
+        other.archived = Some(crate::api::schema::AgentArchivedInfo {
+            at: "2026-09-28T00:00:00Z".into(),
+            by: "owner".into(),
+            reason: None,
+        });
+        assert!(!grant_matches(&grant, &other));
+        let mut kinded = grant.clone();
+        kinded.agent_kind = Some("claude".into());
+        assert!(
+            !grant_matches(&kinded, &agent),
+            "agent_kind wins over the session"
+        );
     }
 
     #[test]

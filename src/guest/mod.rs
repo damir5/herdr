@@ -349,6 +349,7 @@ fn invite_grant(agent: &AgentInfo, running: bool) -> Result<GuestGrantInfo, Owne
     Ok(GuestGrantInfo {
         terminal_id: agent.terminal_id.clone(),
         agent_name: Some(agent_name),
+        agent_kind: agent.agent.clone(),
         agent_session,
     })
 }
@@ -389,7 +390,7 @@ pub(crate) fn revoke_at(
     dir: PathBuf,
     target: RevokeTarget<'_>,
 ) -> Result<Option<usize>, OwnerError> {
-    let Some(revoked) = store::revoke_in(&dir, target).map_err(io_error)? else {
+    let Some(revoked) = store::revoke_in(&dir, target, store::now_ms()).map_err(io_error)? else {
         return Ok(None);
     };
     notify_changes();

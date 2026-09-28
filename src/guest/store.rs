@@ -26,6 +26,9 @@ const LAST_SEEN_RESOLUTION_MS: u64 = 60 * 1000;
 /// One `connected` audit entry per guest per this window: every guest request
 /// is its own Noise session.
 pub(crate) const CONNECTED_AUDIT_WINDOW_MS: u64 = 10 * 60 * 1000;
+/// The link stays up this long after the latest revoke, so a revoked guest
+/// hears `revoked` rather than `host_offline`.
+pub(crate) const REVOKED_LINK_GRACE_MS: u64 = 24 * 60 * 60 * 1000;
 
 pub(crate) fn guest_dir() -> PathBuf {
     crate::config::config_dir().join("guest")
@@ -217,8 +220,14 @@ pub(crate) struct GuestRecord {
     pub created_ms: u64,
     #[serde(default)]
     pub last_seen_ms: Option<u64>,
+    /// Last `connected` audit entry. Tracked apart from `last_seen_ms`, which
+    /// a polling client refreshes every minute.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_connected_ms: Option<u64>,
     #[serde(default)]
     pub revoked: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revoked_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,11 +326,39 @@ pub(crate) fn update_store<T>(
     })
 }
 
-/// At least one non-revoked guest or one unexpired, unused invite.
+/// At least one non-revoked guest, one unexpired unused invite, or a revoke
+/// within [`REVOKED_LINK_GRACE_MS`].
 pub(crate) fn link_wanted_in(dir: &Path, now: u64) -> bool {
     load_store(dir).is_ok_and(|store| {
-        store.guests.iter().any(|guest| !guest.revoked)
-            || store.invites.iter().any(|invite| invite.pending(now))
+        store.guests.iter().any(|guest| {
+            !guest.revoked
+                || guest
+                    .revoked_ms
+                    .is_some_and(|at| now < at.saturating_add(REVOKED_LINK_GRACE_MS))
+        }) || store.invites.iter().any(|invite| invite.pending(now))
+    })
+}
+
+/// Record a resumed agent's new harness session on an active guest's grant.
+/// Returns whether the stored grant changed.
+pub(crate) fn update_grant_session(
+    dir: &Path,
+    guest_id: &str,
+    session: &crate::api::schema::AgentSessionInfo,
+) -> io::Result<bool> {
+    update_store(dir, |store| {
+        let Some(guest) = store
+            .guests
+            .iter_mut()
+            .find(|guest| guest.guest_id == guest_id && !guest.revoked)
+        else {
+            return (false, false);
+        };
+        let changed = guest.grant.agent_session != *session;
+        if changed {
+            guest.grant.agent_session = session.clone();
+        }
+        (changed, changed)
     })
 }
 
@@ -488,6 +525,7 @@ pub(crate) fn admit_in(
             .filter(|guest| guest.device_pub == device && !guest.revoked)
         {
             existing.revoked = true;
+            existing.revoked_ms = Some(now);
             replaced.push(existing.guest_id.clone());
         }
         let guest = GuestRecord {
@@ -501,7 +539,9 @@ pub(crate) fn admit_in(
             machine_label: invite.machine_label.clone(),
             created_ms: now,
             last_seen_ms: Some(now),
+            last_connected_ms: None,
             revoked: false,
+            revoked_ms: None,
         };
         store.invites[index].used_by = Some(guest_id);
         store.guests.push(guest.clone());
@@ -519,12 +559,20 @@ fn admit_returning(dir: &Path, device: &str, now: u64) -> io::Result<AdmitOutcom
             let error = if known { "revoked" } else { "unknown" };
             return (AdmitOutcome::Refused(error), false);
         };
+        // The first returning request after acceptance is a connection, and
+        // then one per window however often the client polls.
+        let connected = guest
+            .last_connected_ms
+            .is_none_or(|at| now.saturating_sub(at) >= CONNECTED_AUDIT_WINDOW_MS);
+        if connected {
+            guest.last_connected_ms = Some(now);
+        }
         let previous = guest.last_seen_ms.unwrap_or_default();
-        let connected = now.saturating_sub(previous) >= CONNECTED_AUDIT_WINDOW_MS;
-        let changed = now.saturating_sub(previous) >= LAST_SEEN_RESOLUTION_MS;
-        if changed {
+        let seen = now.saturating_sub(previous) >= LAST_SEEN_RESOLUTION_MS;
+        if seen {
             guest.last_seen_ms = Some(now);
         }
+        let changed = connected || seen;
         (
             AdmitOutcome::Returning {
                 guest: guest.clone(),
@@ -545,6 +593,7 @@ pub(crate) enum RevokeTarget<'a> {
 pub(crate) fn revoke_in(
     dir: &Path,
     target: RevokeTarget<'_>,
+    now: u64,
 ) -> io::Result<Option<Option<GuestRecord>>> {
     update_store(dir, |store| match target {
         RevokeTarget::Guest(guest_id) => {
@@ -554,7 +603,10 @@ pub(crate) fn revoke_in(
                 .find(|guest| guest.guest_id == guest_id)
             {
                 Some(guest) => {
-                    guest.revoked = true;
+                    if !guest.revoked {
+                        guest.revoked = true;
+                        guest.revoked_ms = Some(now);
+                    }
                     (Some(Some(guest.clone())), true)
                 }
                 None => (None, false),
@@ -766,37 +818,97 @@ pub(crate) mod tests {
         else {
             panic!("accepts");
         };
-        let AdmitOutcome::Returning {
-            guest: back,
-            connected,
-        } = admit_in(&dir.0, &[9; 32], &hello, at(3_000)).unwrap()
+        let AdmitOutcome::Returning { guest: back, .. } =
+            admit_in(&dir.0, &[9; 32], &hello, at(3_000)).unwrap()
         else {
             panic!("returning guest admitted");
         };
         assert_eq!(back.guest_id, guest.guest_id);
-        assert!(!connected, "within the connected audit window");
-        assert!(matches!(
-            admit_in(
-                &dir.0,
-                &[9; 32],
-                &hello,
-                at(2_000) + CONNECTED_AUDIT_WINDOW_MS
-            )
-            .unwrap(),
-            AdmitOutcome::Returning {
-                connected: true,
-                ..
-            }
-        ));
-        assert!(revoke_in(&dir.0, RevokeTarget::Guest(&guest.guest_id))
-            .unwrap()
-            .is_some());
+        assert!(
+            revoke_in(&dir.0, RevokeTarget::Guest(&guest.guest_id), at(3_500))
+                .unwrap()
+                .is_some()
+        );
         assert_eq!(
             admit_in(&dir.0, &[9; 32], &hello, at(4_000)).unwrap(),
             AdmitOutcome::Refused("revoked")
         );
         assert!(is_revoked(&dir.0, &guest.guest_id));
-        assert!(!link_wanted_in(&dir.0, at(4_000)));
+    }
+
+    #[test]
+    fn a_polling_guest_is_audited_connected_once_per_window() {
+        let dir = TempDir::new("connected");
+        let invite = invite(&dir.0, at(0));
+        assert!(matches!(
+            accept(&invite, &[2; 32], at(0), &dir.0),
+            AdmitOutcome::Accepted { .. }
+        ));
+        let hello = json!({"v": 1});
+        // A client polling every 20 s for 25 minutes.
+        let connected: Vec<u64> = (1..=75)
+            .map(|tick| tick * 20_000)
+            .filter(|offset| {
+                matches!(
+                    admit_in(&dir.0, &[2; 32], &hello, at(*offset)).unwrap(),
+                    AdmitOutcome::Returning {
+                        connected: true,
+                        ..
+                    }
+                )
+            })
+            .collect();
+        let window = CONNECTED_AUDIT_WINDOW_MS;
+        assert_eq!(
+            connected,
+            vec![20_000, 20_000 + window, 20_000 + 2 * window]
+        );
+    }
+
+    #[test]
+    fn the_link_stays_wanted_for_a_day_after_the_latest_revoke() {
+        let dir = TempDir::new("grace");
+        let invite = invite(&dir.0, at(0));
+        let AdmitOutcome::Accepted { guest, .. } = accept(&invite, &[1; 32], at(0), &dir.0) else {
+            panic!("accepts");
+        };
+        let revoked_at = at(10_000);
+        revoke_in(&dir.0, RevokeTarget::Guest(&guest.guest_id), revoked_at).unwrap();
+        // A repeated revoke does not extend the grace period.
+        revoke_in(
+            &dir.0,
+            RevokeTarget::Guest(&guest.guest_id),
+            revoked_at + 5_000,
+        )
+        .unwrap();
+        assert!(link_wanted_in(
+            &dir.0,
+            revoked_at + REVOKED_LINK_GRACE_MS - 1
+        ));
+        assert!(!link_wanted_in(&dir.0, revoked_at + REVOKED_LINK_GRACE_MS));
+        assert_eq!(
+            admit_in(&dir.0, &[1; 32], &json!({"v": 1}), revoked_at + 1).unwrap(),
+            AdmitOutcome::Refused("revoked")
+        );
+    }
+
+    #[test]
+    fn a_resumed_session_updates_only_an_active_grant() {
+        let dir = TempDir::new("resume");
+        let invite = invite(&dir.0, at(0));
+        let AdmitOutcome::Accepted { guest, .. } = accept(&invite, &[1; 32], at(0), &dir.0) else {
+            panic!("accepts");
+        };
+        let mut session = grant().agent_session;
+        assert!(!update_grant_session(&dir.0, &guest.guest_id, &session).unwrap());
+        session.value = "s-2".into();
+        assert!(update_grant_session(&dir.0, &guest.guest_id, &session).unwrap());
+        assert!(!update_grant_session(&dir.0, &guest.guest_id, &session).unwrap());
+        let stored = load_store(&dir.0).unwrap();
+        assert_eq!(stored.guests[0].grant.agent_session.value, "s-2");
+        revoke_in(&dir.0, RevokeTarget::Guest(&guest.guest_id), at(1_000)).unwrap();
+        session.value = "s-3".into();
+        assert!(!update_grant_session(&dir.0, &guest.guest_id, &session).unwrap());
     }
 
     #[test]
@@ -825,7 +937,12 @@ pub(crate) mod tests {
         let dir = TempDir::new("revoke-invite");
         let invite = invite(&dir.0, at(1_000));
         assert_eq!(
-            revoke_in(&dir.0, RevokeTarget::Invite(&invite.record.invite_id)).unwrap(),
+            revoke_in(
+                &dir.0,
+                RevokeTarget::Invite(&invite.record.invite_id),
+                at(3_500)
+            )
+            .unwrap(),
             Some(None)
         );
         assert_eq!(
@@ -833,11 +950,11 @@ pub(crate) mod tests {
             AdmitOutcome::Refused("invite_invalid")
         );
         assert_eq!(
-            revoke_in(&dir.0, RevokeTarget::Guest("nope")).unwrap(),
+            revoke_in(&dir.0, RevokeTarget::Guest("nope"), at(3_500)).unwrap(),
             None
         );
         assert_eq!(
-            revoke_in(&dir.0, RevokeTarget::Invite("nope")).unwrap(),
+            revoke_in(&dir.0, RevokeTarget::Invite("nope"), at(3_500)).unwrap(),
             None
         );
     }

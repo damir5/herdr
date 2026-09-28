@@ -8,6 +8,7 @@
 //! `subscribe_changes`.
 
 pub(crate) mod audit;
+pub(crate) mod link;
 pub(crate) mod store;
 
 use std::collections::HashMap;

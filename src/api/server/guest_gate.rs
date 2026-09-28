@@ -438,6 +438,9 @@ mod tests {
 
     use crate::api::ApiRequestMessage;
     use crate::app::App;
+    use crate::guest::link::host::{Admission as LinkAdmission, GuestHost, HostInfo, LinkState};
+    use crate::guest::link::tests::{Device, StubRelay};
+    use crate::guest::link::GuestLink;
     use crate::guest::store::tests::TempDir;
     use crate::guest::store::{now_ms, RevokeTarget};
     use crate::guest::{admit_in, Admission};
@@ -556,14 +559,8 @@ mod tests {
     }
 
     impl Harness {
-        /// Invite through the store and accept it through `admit`, as the
-        /// relay link would.
-        fn admit(&self) -> GuestPrincipal {
-            self.admit_to(0)
-        }
-
-        /// Accept a new invite for agent `index` from the same device.
-        fn admit_to(&self, index: usize) -> GuestPrincipal {
+        /// An invite to agent `index`, created through the store.
+        fn invite(&self, index: usize, name: &str) -> crate::guest::store::NewInvite {
             let (agent, running) = probe_target(&self.api_tx, None, Some(&self.pane_ids[index]))
                 .expect("probe the granted agent");
             assert!(running, "the granted agent passes the live-agent check");
@@ -572,16 +569,27 @@ mod tests {
                 agent_name: agent.name,
                 agent_session: agent.agent_session.expect("session"),
             };
-            let invite = crate::guest::store::create_invite(
+            crate::guest::store::create_invite(
                 &self.dir.0,
-                "plotarmordev",
+                name,
                 grant,
                 "Jerry",
                 "Jerry's Mac Studio",
                 3600,
                 now_ms(),
             )
-            .unwrap();
+            .unwrap()
+        }
+
+        /// Invite through the store and accept it through `admit`, as the
+        /// relay link would.
+        fn admit(&self) -> GuestPrincipal {
+            self.admit_to(0)
+        }
+
+        /// Accept a new invite for agent `index` from the same device.
+        fn admit_to(&self, index: usize) -> GuestPrincipal {
+            let invite = self.invite(index, "plotarmordev");
             let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
             match admit_in(self.dir.0.clone(), [4; 32], &hello) {
                 Admission::Admitted { principal, .. } => principal,
@@ -1008,5 +1016,130 @@ mod tests {
         let guest = harness.admit();
         let lines = harness.call(&guest, json!({"id": "p", "method": "ping", "params": {}}));
         assert_eq!(lines[0]["result"]["type"], "pong", "{lines:?}");
+    }
+
+    /// The guest store in the harness's directory and its real `App`, behind
+    /// the real relay link. Only the directory and API context differ from
+    /// the daemon's `DaemonGuestHost`.
+    struct StoreHost {
+        dir: std::path::PathBuf,
+        relay_url: String,
+        api_tx: ApiRequestSender,
+        event_hub: EventHub,
+        running: Arc<AtomicBool>,
+    }
+
+    impl GuestHost for StoreHost {
+        type Principal = GuestPrincipal;
+
+        fn host_info(&self) -> std::io::Result<HostInfo> {
+            let (host, node_secret) = crate::guest::store::load_host(&self.dir)?;
+            Ok(HostInfo {
+                host_id: host.host_id,
+                relay_secret: host.relay_secret,
+                node_secret,
+                relay_url: self.relay_url.clone(),
+            })
+        }
+
+        fn link_wanted(&self) -> bool {
+            crate::guest::store::link_wanted_in(&self.dir, now_ms())
+        }
+
+        fn admit(&self, device_pub: [u8; 32], hello: &Value) -> LinkAdmission<GuestPrincipal> {
+            admit_in(self.dir.clone(), device_pub, hello).into()
+        }
+
+        fn serve(&self, principal: GuestPrincipal, stream: UnixStream) {
+            let _ = serve_guest_with(
+                &self.api_tx,
+                &self.event_hub,
+                &self.running,
+                principal,
+                stream,
+            );
+        }
+
+        fn set_link_status(&self, _: LinkState, _: Option<String>) {}
+
+        fn subscribe_changes(&self) -> std_mpsc::Receiver<()> {
+            crate::guest::subscribe_changes()
+        }
+    }
+
+    #[test]
+    fn guest_through_the_relay_link_prompts_the_agent_until_revoked() {
+        let harness = start("guest-link-e2e");
+        let dir = harness.dir.0.clone();
+        let (identity, node_secret) = crate::guest::store::load_host(&dir).unwrap();
+        let invite = harness.invite(0, "plotarmordev");
+        // Another pending invite keeps the link wanted after the revoke.
+        harness.invite(0, "second-guest");
+
+        let stub = StubRelay::new();
+        let host = Arc::new(StoreHost {
+            dir: dir.clone(),
+            relay_url: stub.url.clone(),
+            api_tx: harness.api_tx.clone(),
+            event_hub: harness.event_hub.clone(),
+            running: Arc::clone(&harness.running),
+        });
+        let _link = GuestLink::start(host).unwrap();
+        let mut relay = stub.accept_host(&identity.host_id, &identity.relay_secret);
+
+        let device = Device {
+            secret: [0x17; 32],
+            host_pub: crate::guest::store::x25519_public(&node_secret),
+            host_id: identity.host_id.clone(),
+        };
+        let accept = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
+        let (reply, guest) = device.connect(&mut relay, 41, &accept);
+        assert_eq!(reply["ok"], true, "{reply}");
+        assert_eq!(reply["name"], "plotarmordev");
+        assert_eq!(reply["agent"]["name"], "llm-opt");
+        let guest_id = reply["guest_id"].as_str().unwrap().to_owned();
+
+        // One request line in, the response line out, then CLOSE.
+        let mut guest = guest.unwrap();
+        let prompt = json!({"id": "p1", "method": "agent.prompt", "params": {"target": "llm-opt", "text": "ship it"}});
+        guest.send(&mut relay, &format!("{prompt}\n"));
+        let (line, _) = guest.recv_line(&mut relay);
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["result"]["type"], "agent_prompted", "{response}");
+        assert_eq!(relay.closed(41), "");
+        let written = harness.pty_text(0, Duration::from_secs(2));
+        assert!(
+            written.contains("plotarmordev (via HerdrUp): ship it"),
+            "the labeled prompt reached the agent's PTY: {written:?}"
+        );
+
+        // A returning guest streams the pane until revoked; the link then
+        // closes the session.
+        let (reply, guest) = device.connect(&mut relay, 42, &json!({"v": 1}));
+        assert_eq!(reply["guest_id"], guest_id.as_str(), "{reply}");
+        let mut guest = guest.unwrap();
+        let stream = json!({"id": "s", "method": "pane.stream", "params": {"pane_id": "llm-opt"}});
+        guest.send(&mut relay, &format!("{stream}\n"));
+        let (line, _) = guest.recv_line(&mut relay);
+        let started: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(started["result"]["type"], "stream_started", "{started}");
+
+        crate::guest::revoke_at(dir, RevokeTarget::Guest(&guest_id)).unwrap();
+        let end = loop {
+            let (line, _) = guest.recv_line(&mut relay);
+            let value: Value = serde_json::from_str(&line).unwrap();
+            if value.get("error").is_some() {
+                break value;
+            }
+        };
+        assert_eq!(end["error"]["code"], "guest_revoked", "{end}");
+        assert_eq!(relay.closed(42), "");
+
+        // The revoked device is refused at the handshake.
+        let (reply, guest) = device.connect(&mut relay, 43, &json!({"v": 1}));
+        assert_eq!(reply, json!({"ok": false, "error": "revoked"}));
+        assert!(guest.is_none());
+        assert_eq!(relay.closed(43), "revoked");
+        assert!(harness.pty_text(0, Duration::from_millis(200)).is_empty());
     }
 }

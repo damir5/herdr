@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+### Added
+- Share one running agent with someone outside your machines through the HerdrUp app, with no SSH and no open ports. `herdr guest invite` creates a one-time invite; the guest can prompt the agent (labeled `<name> (via HerdrUp): `), attach files, and watch its terminal, but not type into it. The server reaches guests through the HerdrUp guest relay over an end-to-end encrypted (Noise IK) connection that it keeps open only while guests or invites exist. Unix only.
+
 ## [0.9.1] - 2026-09-16
 
 ### Added

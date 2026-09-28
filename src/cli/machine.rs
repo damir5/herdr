@@ -428,8 +428,25 @@ fn status(args: &[String]) -> std::io::Result<i32> {
         if machine.stale {
             println!("  cached federation data is stale");
         }
+        if let Some(state) = &machine.gram_relay {
+            println!("  gram relay: {}", gram_gateway_summary(state));
+        }
     }
     Ok(0)
+}
+
+pub(crate) fn gram_gateway_summary(state: &crate::api::schema::GramGatewayState) -> String {
+    use crate::api::schema::GramGatewayState;
+    match state {
+        GramGatewayState::Off => "off".into(),
+        GramGatewayState::Starting => "starting".into(),
+        GramGatewayState::Up => "up".into(),
+        GramGatewayState::Retrying {
+            attempt,
+            next_in_secs,
+            last_error,
+        } => format!("retrying (attempt {attempt}, next in {next_in_secs}s): {last_error}"),
+    }
 }
 
 fn machine_list_rows<'a>(

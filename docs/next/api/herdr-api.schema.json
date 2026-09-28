@@ -9485,6 +9485,17 @@
                 }
               ]
             },
+            "gram_relay": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/GramGatewayState"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Supervised Gram reverse gateway state for this saved machine."
+            },
             "last_error_class": {
               "anyOf": [
                 {
@@ -10399,6 +10410,82 @@
             "sha256"
           ],
           "type": "object"
+        },
+        "GramGatewayState": {
+          "description": "Coordinator-side state of one saved peer's supervised Gram reverse gateway.",
+          "oneOf": [
+            {
+              "description": "No gateway: Gram relay consent is absent, or the peer is not a pinned saved SSH peer.",
+              "properties": {
+                "state": {
+                  "const": "off",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "An attempt (remote socket preflight and SSH reverse bind) is in progress.",
+              "properties": {
+                "state": {
+                  "const": "starting",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The reverse forward is established and the private local gateway is accepting.",
+              "properties": {
+                "state": {
+                  "const": "up",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The last attempt failed or its SSH forward exited; the next attempt is scheduled.",
+              "properties": {
+                "attempt": {
+                  "description": "Consecutive failed attempts.",
+                  "format": "uint32",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "last_error": {
+                  "description": "Bounded description of the most recent failure.",
+                  "type": "string"
+                },
+                "next_in_secs": {
+                  "description": "Whole seconds until the next attempt.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "state": {
+                  "const": "retrying",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "state",
+                "attempt",
+                "next_in_secs",
+                "last_error"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "GramMessageInfo": {
           "description": "A gram message as returned to clients.",

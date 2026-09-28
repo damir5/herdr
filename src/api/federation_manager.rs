@@ -108,7 +108,7 @@ struct PeerRouteState {
     identity_validation_required: bool,
 }
 impl PeerRoute {
-    fn new(
+    pub(crate) fn new(
         target: ConnectionTarget,
         generation_clock: Arc<AtomicU64>,
         requires_identity_validation: bool,
@@ -260,13 +260,24 @@ struct PeerHandle {
     /// Mutable label/profile presentation shared with the poll thread. Label-only
     /// changes update this cell without reconnecting the transport.
     presentation: Arc<RwLock<PeerPresentation>>,
+    /// Pinned saved-peer fields a Gram reverse gateway needs, if any.
     #[cfg(unix)]
-    _gram_reverse: Option<crate::api::reverse::ReverseGateway>,
+    gram_spec: Option<crate::api::gram_gateway::GramGatewaySpec>,
+    /// Retrying Gram reverse gateway, present while relay consent holds.
+    #[cfg(unix)]
+    gram_relay: Option<crate::api::gram_gateway::GramRelaySupervisor>,
     /// Keeps the saved peer's persistent SSH bridge supervised and alive.
     _ssh_bridge: Option<SavedBridgeSupervisor>,
     #[cfg(unix)]
     _reverse_gateway: Option<crate::api::reverse_agents::ReverseGateway>,
     reverse_grants: Vec<crate::config::FederationAgentGrant>,
+}
+
+#[cfg(unix)]
+struct GramGatewayHooks {
+    spawner: Option<Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>>,
+    clock: Arc<dyn crate::api::gram_gateway::GatewayClock>,
+    consent: crate::api::gram_gateway::GramConsent,
 }
 
 #[derive(Clone, Default)]
@@ -292,8 +303,13 @@ pub struct FederationPeerManager {
     reaper: Mutex<Vec<JoinHandle<()>>>,
     /// Shared cache the poll threads write and `agent.list` reads.
     store: Arc<Mutex<FederationStore>>,
+    /// Starts Gram reverse gateway attempts; set once the API sender exists.
     #[cfg(unix)]
-    gram_api_tx: Mutex<Option<crate::api::ApiRequestSender>>,
+    gram_spawner: Mutex<Option<Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>>>,
+    #[cfg(unix)]
+    gram_clock: Arc<dyn crate::api::gram_gateway::GatewayClock>,
+    #[cfg(unix)]
+    gram_consent: crate::api::gram_gateway::GramConsent,
     /// Global daemon-running flag; poll threads also observe it for shutdown.
     running: Arc<AtomicBool>,
     /// Monotonic source for transport and remote-boot generations.
@@ -311,6 +327,23 @@ impl FederationPeerManager {
     /// lightweight watcher observes saved-profile catalog changes; it is inert
     /// until coordinator mode is enabled by [`Self::reconcile_config`].
     pub fn new(store: Arc<Mutex<FederationStore>>, running: Arc<AtomicBool>) -> Arc<Self> {
+        Self::build(
+            store,
+            running,
+            #[cfg(unix)]
+            GramGatewayHooks {
+                spawner: None,
+                clock: Arc::new(crate::api::gram_gateway::SystemClock),
+                consent: Arc::new(crate::api::reverse::allowed_alias),
+            },
+        )
+    }
+
+    fn build(
+        store: Arc<Mutex<FederationStore>>,
+        running: Arc<AtomicBool>,
+        #[cfg(unix)] gram: GramGatewayHooks,
+    ) -> Arc<Self> {
         let catalog_stop = Arc::new(AtomicBool::new(false));
         let manager = Arc::new(Self {
             reconcile_lock: Mutex::new(()),
@@ -319,7 +352,11 @@ impl FederationPeerManager {
             reaper: Mutex::new(Vec::new()),
             store,
             #[cfg(unix)]
-            gram_api_tx: Mutex::new(None),
+            gram_spawner: Mutex::new(gram.spawner),
+            #[cfg(unix)]
+            gram_clock: gram.clock,
+            #[cfg(unix)]
+            gram_consent: gram.consent,
             running,
             generation_clock: Arc::new(AtomicU64::new(0)),
             coordinator: Mutex::new(CoordinatorSource::default()),
@@ -337,9 +374,108 @@ impl FederationPeerManager {
     #[cfg(unix)]
     pub(crate) fn set_gram_api_sender(&self, tx: crate::api::ApiRequestSender) {
         *self
-            .gram_api_tx
+            .gram_spawner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(tx);
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Arc::new(
+            crate::api::reverse::SshGramGatewaySpawner::new(tx, Arc::clone(&self.running)),
+        ));
+    }
+
+    fn gram_relay_consented(&self, alias: &str) -> bool {
+        #[cfg(unix)]
+        {
+            (self.gram_consent)(alias)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = alias;
+            false
+        }
+    }
+
+    /// Manager with injected Gram gateway spawner, clock, and consent.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_gram_hooks(
+        store: Arc<Mutex<FederationStore>>,
+        running: Arc<AtomicBool>,
+        spawner: Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>,
+        clock: Arc<dyn crate::api::gram_gateway::GatewayClock>,
+        consent: crate::api::gram_gateway::GramConsent,
+    ) -> Arc<Self> {
+        Self::build(
+            store,
+            running,
+            GramGatewayHooks {
+                spawner: Some(spawner),
+                clock,
+                consent,
+            },
+        )
+    }
+
+    /// Per-alias Gram reverse gateway state, snapshotted under the handle lock
+    /// alone so status never nests it inside the store lock.
+    fn gram_relay_states(&self) -> HashMap<String, crate::api::schema::GramGatewayState> {
+        #[cfg(unix)]
+        {
+            self.handles
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .filter_map(|(alias, handle)| {
+                    Some((alias.clone(), handle.gram_relay.as_ref()?.state()))
+                })
+                .collect()
+        }
+        #[cfg(not(unix))]
+        {
+            HashMap::new()
+        }
+    }
+
+    /// Start a gateway supervisor for every consented pinned saved peer and
+    /// detach supervisors whose consent was withdrawn. Detached supervisors
+    /// are returned so the caller drops (joins) them outside the handle lock.
+    #[cfg(unix)]
+    fn sync_gram_relays(
+        &self,
+        handles: &mut HashMap<String, PeerHandle>,
+    ) -> Vec<crate::api::gram_gateway::GramRelaySupervisor> {
+        let spawner = self
+            .gram_spawner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let mut detached = Vec::new();
+        for (alias, handle) in handles.iter_mut() {
+            let consented = (self.gram_consent)(alias);
+            if !consented {
+                if let Some(supervisor) = handle.gram_relay.take() {
+                    info!(alias = %alias, "Gram reverse gateway stopped: consent withdrawn");
+                    detached.push(supervisor);
+                }
+                continue;
+            }
+            if handle.gram_relay.is_some() {
+                continue;
+            }
+            let Some(spec) = handle.gram_spec.clone() else {
+                continue;
+            };
+            let Some(spawner) = spawner.clone() else {
+                tracing::warn!(alias = %alias, "Gram reverse gateway requires the API sender");
+                continue;
+            };
+            handle.gram_relay = Some(crate::api::gram_gateway::GramRelaySupervisor::start(
+                spec,
+                handle.route.clone(),
+                spawner,
+                Arc::clone(&self.gram_clock),
+                Arc::clone(&self.running),
+                Arc::clone(&self.gram_consent),
+            ));
+        }
+        detached
     }
 
     /// A cheap snapshot of the outbound proxy registry for the hot per-connection
@@ -398,6 +534,7 @@ impl FederationPeerManager {
             })
             .map(|profile| profile.id.to_string())
             .collect();
+        let mut gram_relay_states = self.gram_relay_states();
         let store = self
             .store
             .lock()
@@ -459,6 +596,10 @@ impl FederationPeerManager {
                     remote_capabilities: peer
                         .and_then(|entry| entry.observation.remote_capabilities.clone()),
                     stale,
+                    gram_relay: gram_relay_states.remove(&profile_id).or_else(|| {
+                        self.gram_relay_consented(&profile_id)
+                            .then_some(crate::api::schema::GramGatewayState::Off)
+                    }),
                 };
                 (profile_id, status)
             })
@@ -588,6 +729,8 @@ impl FederationPeerManager {
         let mut bridge_retirements = Vec::new();
         #[cfg(unix)]
         let mut retired_gateways = Vec::new();
+        #[cfg(unix)]
+        let mut retired_gram_relays = Vec::new();
         for alias in &to_stop {
             let Some(handle) = handles.remove(alias) else {
                 continue;
@@ -608,6 +751,8 @@ impl FederationPeerManager {
             if let Some(gateway) = handle._reverse_gateway {
                 retired_gateways.push(gateway);
             }
+            #[cfg(unix)]
+            retired_gram_relays.extend(handle.gram_relay);
             let PeerHandle {
                 join, _ssh_bridge, ..
             } = handle;
@@ -622,10 +767,13 @@ impl FederationPeerManager {
             info!(alias = %alias, "federation peer stopped and evicted (reconcile)");
         }
         // Supervisor joins run concurrently and never hold the handle registry
-        // lock. Waiting here closes stable profile sockets before replacement.
+        // lock. Waiting here closes stable profile sockets before replacement,
+        // and stops each retired Gram gateway before a replacement can start.
         drop(handles);
         #[cfg(unix)]
         drop(retired_gateways);
+        #[cfg(unix)]
+        drop(retired_gram_relays);
         for join in bridge_retirements {
             let _ = join.join();
         }
@@ -661,7 +809,11 @@ impl FederationPeerManager {
             }
         }
 
-        // 5. Rebuild the outbound proxy registry from the same routes held by
+        // 5. Start or stop Gram reverse gateway supervisors against consent.
+        #[cfg(unix)]
+        let detached_gram_relays = self.sync_gram_relays(&mut handles);
+
+        // 6. Rebuild the outbound proxy registry from the same routes held by
         // the live pollers. SSH clones point at the manager-owned local bridge.
         let new_map = handles
             .iter()
@@ -672,6 +824,10 @@ impl FederationPeerManager {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *registry = Arc::new(new_map);
+        drop(registry);
+        drop(handles);
+        #[cfg(unix)]
+        drop(detached_gram_relays);
     }
 
     /// Resolve one outbound route and spawn its poll thread. SSH peers use the
@@ -733,46 +889,14 @@ impl FederationPeerManager {
             Arc::clone(&self.generation_clock),
             peer.expected_node_id.is_some(),
         );
+        // The gateway itself is supervised by `sync_gram_relays`, independently
+        // of this bridge, so a failed attempt is retried without a respawn.
         #[cfg(unix)]
-        let gram_reverse = if crate::api::reverse::allowed_alias(&peer.alias) {
-            match (
-                peer.profile_id.as_deref(),
-                peer.remote_session.as_deref(),
-                peer.expected_node_id.as_deref(),
-                peer.endpoint
-                    .as_deref()
-                    .and_then(|endpoint| endpoint.strip_prefix("ssh://")),
-                self.gram_api_tx
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-            ) {
-                (Some(profile), Some(session), Some(machine), Some(target), Some(tx)) => {
-                    match crate::api::reverse::ReverseGateway::start(
-                        profile,
-                        target,
-                        session,
-                        peer.alias.clone(),
-                        machine,
-                        route.clone(),
-                        tx,
-                        Arc::clone(&self.running),
-                    ) {
-                        Ok(gateway) => Some(gateway),
-                        Err(error) => {
-                            tracing::warn!(alias = %peer.alias, %error, "Gram reverse gateway failed closed");
-                            None
-                        }
-                    }
-                }
-                _ => {
-                    tracing::warn!(alias = %peer.alias, "Gram reverse gateway requires a pinned saved SSH peer and API sender");
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let gram_spec = crate::api::gram_gateway::GramGatewaySpec::for_peer(&peer);
+        #[cfg(unix)]
+        if gram_spec.is_none() && (self.gram_consent)(&peer.alias) {
+            tracing::warn!(alias = %peer.alias, "Gram reverse gateway requires a pinned saved SSH peer");
+        }
         let endpoint = peer.endpoint.clone().unwrap_or_default();
         #[cfg(unix)]
         let reverse_gateway = if reverse_grants.is_empty() {
@@ -831,7 +955,9 @@ impl FederationPeerManager {
             token,
             profile_id,
             #[cfg(unix)]
-            _gram_reverse: gram_reverse,
+            gram_spec,
+            #[cfg(unix)]
+            gram_relay: None,
             remote_session,
             route,
             presentation,
@@ -958,6 +1084,27 @@ impl FederationPeerManager {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(alias)
             .and_then(|handle| handle.remote_session.clone())
+    }
+
+    /// Gram gateway state and transport identity of one live peer, for tests.
+    #[cfg(all(test, unix))]
+    pub(crate) fn gram_relay_for(
+        &self,
+        alias: &str,
+    ) -> Option<(Option<crate::api::schema::GramGatewayState>, usize)> {
+        self.handles
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(alias)
+            .map(|handle| {
+                (
+                    handle
+                        .gram_relay
+                        .as_ref()
+                        .map(crate::api::gram_gateway::GramRelaySupervisor::state),
+                    Arc::as_ptr(&handle.stop) as usize,
+                )
+            })
     }
 
     /// Reap finished retiring threads, then report how many are still pending,
@@ -1562,5 +1709,160 @@ mod tests {
             saved_bridge_failure_class(&error),
             crate::api::schema::FederationPollErrorClass::AuthenticationFailed
         );
+    }
+
+    #[cfg(unix)]
+    mod gram_relay {
+        use super::*;
+        use crate::api::gram_gateway::test_support::{wait_until, FakeSpawner, ManualClock};
+        use crate::api::schema::GramGatewayState;
+
+        const ALIAS: &str = "8195b6326f748f4da1945364a4e205b9";
+
+        fn pinned_peer() -> FederationPeer {
+            FederationPeer {
+                alias: ALIAS.into(),
+                display_label: Some("mac".into()),
+                // Unroutable TCP keeps the test free of SSH; the gateway spawner is fake.
+                endpoint: Some("tcp://127.0.0.1:9".into()),
+                profile_id: Some(ALIAS.into()),
+                remote_session: Some("main".into()),
+                token_file: None,
+                expected_node_id: Some("machine_cf86dc42c063eac7b83162361990ae59".into()),
+                capability: crate::config::CapabilityTier::Admin,
+            }
+        }
+
+        fn manager(
+            spawner: &Arc<FakeSpawner>,
+            clock: &Arc<ManualClock>,
+        ) -> Arc<FederationPeerManager> {
+            FederationPeerManager::with_gram_hooks(
+                Arc::new(Mutex::new(FederationStore::default())),
+                Arc::new(AtomicBool::new(true)),
+                Arc::clone(spawner) as Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>,
+                Arc::clone(clock) as Arc<dyn crate::api::gram_gateway::GatewayClock>,
+                Arc::new(|alias: &str| alias == ALIAS),
+            )
+        }
+
+        fn state(manager: &FederationPeerManager) -> Option<GramGatewayState> {
+            manager.gram_relay_for(ALIAS).and_then(|(state, _)| state)
+        }
+
+        fn transport(manager: &FederationPeerManager) -> usize {
+            manager.gram_relay_for(ALIAS).expect("live peer").1
+        }
+
+        #[test]
+        fn failed_preflight_is_retried_without_restarting_the_peer_bridge() {
+            let spawner = FakeSpawner::scripted([Err(
+                "remote Gram reverse socket preflight failed: exit status: 255".into(),
+            )]);
+            let clock = ManualClock::new();
+            let manager = manager(&spawner, &clock);
+            manager.reconcile(&[pinned_peer()]);
+            let bridge = transport(&manager);
+
+            wait_until("first retry scheduled", || {
+                matches!(
+                    state(&manager),
+                    Some(GramGatewayState::Retrying { attempt: 1, .. })
+                )
+            });
+            assert_eq!(
+                state(&manager),
+                Some(GramGatewayState::Retrying {
+                    attempt: 1,
+                    next_in_secs: 2,
+                    last_error: "remote Gram reverse socket preflight failed: exit status: 255"
+                        .into(),
+                })
+            );
+            clock.advance(Duration::from_secs(2));
+            wait_until("gateway up", || {
+                state(&manager) == Some(GramGatewayState::Up)
+            });
+            assert_eq!(spawner.calls(), 2);
+            assert_eq!(transport(&manager), bridge, "peer bridge was not respawned");
+            manager.join_all();
+            assert_eq!(spawner.live(), 0);
+        }
+
+        #[test]
+        fn retiring_a_peer_during_backoff_stops_further_attempts() {
+            let spawner = FakeSpawner::failing();
+            let clock = ManualClock::new();
+            let manager = manager(&spawner, &clock);
+            manager.reconcile(&[pinned_peer()]);
+            wait_until("retry scheduled", || {
+                matches!(state(&manager), Some(GramGatewayState::Retrying { .. }))
+            });
+
+            manager.reconcile(&[]);
+            assert!(manager.live_aliases().is_empty());
+            let attempts = spawner.calls();
+            clock.advance(Duration::from_secs(600));
+            std::thread::sleep(Duration::from_millis(100));
+            assert_eq!(spawner.calls(), attempts, "a retired peer never retries");
+            manager.join_all();
+        }
+
+        #[test]
+        fn one_gateway_survives_exit_recovery_and_repeated_reconciles() {
+            let spawner = FakeSpawner::scripted([]);
+            let clock = ManualClock::new();
+            let manager = manager(&spawner, &clock);
+            manager.reconcile(&[pinned_peer()]);
+            wait_until("gateway up", || {
+                state(&manager) == Some(GramGatewayState::Up)
+            });
+
+            spawner.exit_latest("Gram relay SSH forward exited: exit status: 255");
+            wait_until("retry scheduled", || {
+                matches!(state(&manager), Some(GramGatewayState::Retrying { .. }))
+            });
+            manager.reconcile(&[pinned_peer()]);
+            clock.advance(Duration::from_secs(2));
+            wait_until("gateway recovered", || {
+                state(&manager) == Some(GramGatewayState::Up)
+            });
+            manager.reconcile(&[pinned_peer()]);
+            std::thread::sleep(Duration::from_millis(50));
+
+            assert_eq!(spawner.calls(), 2);
+            assert_eq!(spawner.live(), 1);
+            assert_eq!(
+                spawner.max_live.load(Ordering::Acquire),
+                1,
+                "never two ssh -R forwards for one peer"
+            );
+            manager.join_all();
+            assert_eq!(spawner.live(), 0);
+        }
+
+        #[test]
+        fn machine_status_reports_the_gateway_state() {
+            let spawner = FakeSpawner::failing();
+            let clock = ManualClock::new();
+            let manager = manager(&spawner, &clock);
+            manager.reconcile(&[pinned_peer()]);
+            wait_until("retry scheduled", || {
+                matches!(state(&manager), Some(GramGatewayState::Retrying { .. }))
+            });
+            let profile = crate::client::endpoint::SavedSshEndpoint {
+                id: crate::client::endpoint::ProfileId::parse(ALIAS).unwrap(),
+                label: "mac".into(),
+                target: "ssh://mac".into(),
+                session: "main".into(),
+                enabled: true,
+            };
+            let statuses = manager.machine_statuses_with_profiles(Some(&[profile]));
+            assert!(matches!(
+                statuses[ALIAS].gram_relay,
+                Some(GramGatewayState::Retrying { attempt: 1, .. })
+            ));
+            manager.join_all();
+        }
     }
 }

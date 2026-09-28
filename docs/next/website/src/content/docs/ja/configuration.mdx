@@ -179,6 +179,8 @@ Federation が公開する API は、意図的に限定された読み取り・�
 
 コーディネーターで `herdr machine status`（または `herdr machine status --json`）を使うと、保存済みプロファイル、接続先/TUI、Federation の健全性を別々に確認できます。信頼されていないプロファイルでは、次の操作として `herdr machine federate <profile-id>` が表示されます（JSON では `next_action`）。Federation の到達可能性、検証済みリモートマシン ID、最後に成功したポーリング、範囲を限定したエラー分類、合意したバージョンと機能、古いデータは個別に報告されます。エラーには SSH コマンド、トークン、リモートの stderr は表示されません。
 
+Gram リレーの同意対象になっている保存済みマシンでは、ステータスに `gram_relay` も含まれます（テキスト表示では `gram relay:` 行）。`state` は `off`、`starting`、`up`、`retrying` のいずれかで、`retrying` には `attempt`、`next_in_secs`、長さを制限した `last_error` が付きます。コーディネーターは失敗または終了したリバースゲートウェイを、マシンのフェデレーションブリッジを再起動せずに、2 秒から倍々で最大 60 秒の間隔で自動的に再試行します。例: `"gram_relay": {"state": "retrying", "attempt": 3, "next_in_secs": 8, "last_error": "remote Gram reverse socket preflight failed: exit status: 255"}`。
+
 `herdr machine add --label <label> <user@host>` の後に `herdr machine federate <label-or-id>` を実行すると、その保存済みマシンだけを明示的に Federation に参加させます。このコマンドは OpenSSH 経由で接続し、初回利用時にリモートのインストール ID を取得して `federation.saved_machines` にピン留めし、コーディネーターモードを有効化して稼働中のデーモンを再読み込みします。`herdr machine status` で到達可能性を確認してください。`herdr machine unfederate <label-or-id>` はそのポリシーだけを削除し、保存済み SSH プロファイルは保持します。後で ID が一致しなくなった場合、ピンを置き換えずに安全側に倒して接続を拒否します。初回接続前に SSH ホスト鍵を確認してください。このコマンドは未知のホストを信頼できるものにはしません。
 
 ### SSH Federation ピアの移行

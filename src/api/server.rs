@@ -834,7 +834,7 @@ fn sleep_interruptible(running: &Arc<AtomicBool>, peer_stop: &Arc<AtomicBool>, t
 /// Base poll interval plus a small randomized jitter, so peers that fail at the
 /// same time do not retry in lockstep. Jitter is a cheap wall-clock-derived
 /// value — no RNG dependency — capped at [`FEDERATION_POLL_MAX_JITTER`].
-fn failure_backoff(base: Duration) -> Duration {
+pub(crate) fn failure_backoff(base: Duration) -> Duration {
     let entropy = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|since| u64::from(since.subsec_nanos()))

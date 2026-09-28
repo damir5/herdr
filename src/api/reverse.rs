@@ -13,12 +13,13 @@ use interprocess::local_socket::{
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::api::client::{ApiClient, ConnectionTarget};
 use crate::api::federation_manager::PeerRoute;
+use crate::api::gram_gateway::{GramGatewaySession, GramGatewaySpawner, GramGatewaySpec};
 use crate::api::schema::{GramRelayCall, GramRelayParams, Method, Request};
 use crate::api::ApiRequestSender;
 
@@ -147,50 +148,116 @@ fn serve_one(
     conn.write_all(b"\n")
 }
 
+/// Production spawner: one [`ReverseGateway`] attempt per call.
+pub(crate) struct SshGramGatewaySpawner {
+    tx: ApiRequestSender,
+    running: Arc<AtomicBool>,
+}
+
+impl SshGramGatewaySpawner {
+    pub(crate) fn new(tx: ApiRequestSender, running: Arc<AtomicBool>) -> Self {
+        Self { tx, running }
+    }
+}
+
+impl GramGatewaySpawner for SshGramGatewaySpawner {
+    fn start(
+        &self,
+        spec: &GramGatewaySpec,
+        route: &PeerRoute,
+        cancel: &Arc<AtomicBool>,
+    ) -> io::Result<Box<dyn GramGatewaySession>> {
+        ReverseGateway::start(
+            spec,
+            route.clone(),
+            self.tx.clone(),
+            Arc::clone(&self.running),
+            Arc::clone(cancel),
+        )
+        .map(|gateway| Box::new(gateway) as Box<dyn GramGatewaySession>)
+    }
+}
+
+/// One gateway attempt: a private local listener plus one `ssh -R` child. It
+/// never respawns SSH itself; [`crate::api::gram_gateway::GramRelaySupervisor`]
+/// retries it after [`GramGatewaySession::exited`] reports a reason.
 pub(crate) struct ReverseGateway {
     stop: Arc<AtomicBool>,
+    exited: Arc<Mutex<Option<String>>>,
     listener: Option<JoinHandle<()>>,
     ssh: Option<JoinHandle<()>>,
     socket: PathBuf,
     socket_identity: crate::ipc::SocketFileIdentity,
 }
 
+impl GramGatewaySession for ReverseGateway {
+    fn exited(&self) -> Option<String> {
+        self.exited
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+fn record_exit(exited: &Mutex<Option<String>>, reason: String) {
+    exited
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get_or_insert(reason);
+}
+
 impl ReverseGateway {
-    pub(crate) fn start(
-        profile_id: &str,
-        ssh_target: &str,
-        session: &str,
-        alias: String,
-        remote_machine_id: &str,
+    fn start(
+        spec: &GramGatewaySpec,
         route: PeerRoute,
         tx: ApiRequestSender,
         running: Arc<AtomicBool>,
+        cancel: Arc<AtomicBool>,
     ) -> io::Result<Self> {
+        let profile_id = spec.profile_id.as_str();
+        let ssh_target = spec
+            .endpoint
+            .strip_prefix("ssh://")
+            .ok_or_else(|| io::Error::other("Gram reverse gateway requires an SSH peer"))?;
         let coordinator_id = crate::persist::machine::get_or_create();
-        let remote = reverse_socket_path(&coordinator_id, remote_machine_id);
+        let remote = reverse_socket_path(&coordinator_id, &spec.remote_machine_id);
         let socket = crate::platform::remote_bridge_endpoint_path(
             &format!(
                 "herdr-gram-gateway-{}-{}.sock",
                 std::process::id(),
                 profile_id
             ),
-            &format!("hg-{}-{}.sock", std::process::id(), &profile_id[..16]),
+            &format!(
+                "hg-{}-{}.sock",
+                std::process::id(),
+                profile_id.get(..16).unwrap_or(profile_id)
+            ),
         );
         let listener = crate::ipc::bind_private_local_listener(&socket)?;
         let socket_identity = crate::ipc::socket_file_identity(&socket)?;
         crate::ipc::restrict_socket_permissions(&socket, 0o600)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
         // ExitOnForwardFailure makes a failed remote bind terminate SSH. Do not
-        // advertise a ready gateway until the initial forwarding attempt has
-        // survived its setup interval. The request path still fails closed until
-        // the route's pinned machine identity is validated by federation polling.
-        let first_child = (|| -> io::Result<std::process::Child> {
+        // advertise a ready gateway until the forwarding attempt has survived
+        // its setup interval. The request path still fails closed until the
+        // route's pinned machine identity is validated by federation polling.
+        let child = (|| -> io::Result<std::process::Child> {
             let mut command = crate::remote::reverse_forward_command(
-                profile_id, ssh_target, session, &remote, &socket,
+                profile_id,
+                ssh_target,
+                &spec.session,
+                &remote,
+                &socket,
+                Arc::clone(&cancel),
             )?;
             let mut child = command.spawn()?;
             for _ in 0..20 {
                 std::thread::sleep(Duration::from_millis(100));
+                if cancel.load(Ordering::Acquire) || !running.load(Ordering::Acquire) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::other("Gram relay gateway start cancelled"));
+                }
                 if let Some(status) = child.try_wait()? {
                     return Err(io::Error::other(format!(
                         "Gram relay SSH reverse bind failed: {status}"
@@ -199,7 +266,7 @@ impl ReverseGateway {
             }
             Ok(child)
         })();
-        let first_child = match first_child {
+        let mut child = match child {
             Ok(child) => child,
             Err(error) => {
                 let _ = crate::ipc::remove_socket_file_if_owned(&socket, &socket_identity);
@@ -207,8 +274,11 @@ impl ReverseGateway {
             }
         };
         let stop = Arc::new(AtomicBool::new(false));
+        let exited = Arc::new(Mutex::new(None));
         let listener_stop = Arc::clone(&stop);
         let listener_running = Arc::clone(&running);
+        let listener_exited = Arc::clone(&exited);
+        let alias = spec.alias.clone();
         let active = Arc::new(AtomicUsize::new(0));
         let mut last_sweep = std::time::Instant::now() - Duration::from_secs(60 * 60);
         let listener_thread = std::thread::spawn(move || {
@@ -237,58 +307,43 @@ impl ReverseGateway {
                         std::thread::sleep(Duration::from_millis(25))
                     }
                     Err(error) => {
-                        tracing::warn!(%error, "Gram relay gateway listener failed");
+                        record_exit(
+                            &listener_exited,
+                            format!("Gram relay gateway listener failed: {error}"),
+                        );
                         break;
                     }
                 }
             }
         });
-        let profile_id = profile_id.to_owned();
-        let ssh_target = ssh_target.to_owned();
-        let session = session.to_owned();
-        let ssh_socket = socket.clone();
         let ssh_stop = Arc::clone(&stop);
-        let mut first_child = Some(first_child);
+        let ssh_exited = Arc::clone(&exited);
         let ssh_thread = std::thread::spawn(move || {
             while !ssh_stop.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
-                let child = match first_child.take() {
-                    Some(child) => Ok(child),
-                    None => crate::remote::reverse_forward_command(
-                        &profile_id,
-                        &ssh_target,
-                        &session,
-                        &remote,
-                        &ssh_socket,
-                    )
-                    .and_then(|mut command| command.spawn()),
-                };
-                match child {
-                    Ok(mut child) => {
-                        while !ssh_stop.load(Ordering::Relaxed) && running.load(Ordering::Relaxed) {
-                            match child.try_wait() {
-                                Ok(Some(status)) => {
-                                    tracing::warn!(%status, "Gram relay SSH forward exited");
-                                    break;
-                                }
-                                Ok(None) => std::thread::sleep(Duration::from_millis(250)),
-                                Err(error) => {
-                                    tracing::warn!(%error, "Gram relay SSH forward failed");
-                                    break;
-                                }
-                            }
-                        }
-                        let _ = child.kill();
-                        let _ = child.wait();
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        record_exit(
+                            &ssh_exited,
+                            format!("Gram relay SSH forward exited: {status}"),
+                        );
+                        break;
                     }
-                    Err(error) => tracing::warn!(%error, "Gram relay SSH forward could not start"),
-                }
-                if !ssh_stop.load(Ordering::Relaxed) {
-                    std::thread::sleep(Duration::from_secs(2));
+                    Ok(None) => std::thread::sleep(Duration::from_millis(250)),
+                    Err(error) => {
+                        record_exit(
+                            &ssh_exited,
+                            format!("Gram relay SSH forward failed: {error}"),
+                        );
+                        break;
+                    }
                 }
             }
+            let _ = child.kill();
+            let _ = child.wait();
         });
         Ok(Self {
             stop,
+            exited,
             listener: Some(listener_thread),
             ssh: Some(ssh_thread),
             socket,

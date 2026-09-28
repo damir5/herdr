@@ -179,6 +179,8 @@ expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
 
 在协调端运行 `herdr machine status`（或 `herdr machine status --json`），分别查看已保存配置档案、端点/TUI 和联邦的健康状况。不受信任的配置档案会显示 `herdr machine federate <profile-id>` 作为下一步操作（JSON 中为 `next_action`）。联邦可达性、已验证的远端机器 ID、上次成功轮询、有限类别的错误、协商的版本/能力及过期数据会分别报告。错误信息不会暴露 SSH 命令、令牌或远端 stderr。
 
+当某台已保存机器在 Gram 中继授权范围内时，其状态还包含 `gram_relay`（文本输出显示 `gram relay:` 一行）。`state` 为 `off`、`starting`、`up` 或 `retrying`；`retrying` 另含 `attempt`、`next_in_secs` 和截断后的 `last_error`。协调端会自行重试失败或已退出的反向网关，间隔从 2 秒起倍增，上限 60 秒，且不会重启该机器的联邦桥接。示例：`"gram_relay": {"state": "retrying", "attempt": 3, "next_in_secs": 8, "last_error": "remote Gram reverse socket preflight failed: exit status: 255"}`。
+
 运行 `herdr machine add --label <label> <user@host>` 后，再运行 `herdr machine federate <label-or-id>`，仅为该已保存机器启用联邦。该命令通过 OpenSSH 连接，首次使用时获取远端安装身份，将其固定在 `federation.saved_machines` 中，启用协调端模式并重新加载正在运行的守护进程。用 `herdr machine status` 验证可达性；`herdr machine unfederate <label-or-id>` 仅移除该策略，保留已保存的 SSH 配置档案。后续身份不匹配时会拒绝访问，而不会替换固定的身份。首次连接前请检查 SSH 主机密钥：该命令不会让未知主机自动变得可信。
 
 ### 迁移 SSH 联邦对等方

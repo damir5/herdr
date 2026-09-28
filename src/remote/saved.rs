@@ -167,6 +167,7 @@ pub(crate) fn reverse_forward_command(
     session: &str,
     remote_socket: &std::path::Path,
     local_gateway: &std::path::Path,
+    cancellation: Arc<AtomicBool>,
 ) -> io::Result<std::process::Command> {
     let _ = validated_saved_ssh(profile_id, target, session)?;
     // sshd leaves a stream-local -R socket pathname behind after the forwarding
@@ -178,7 +179,8 @@ pub(crate) fn reverse_forward_command(
         "if [ -e {quoted} ] || [ -L {quoted} ]; then\n  [ ! -L {quoted} ] && [ -S {quoted} ] || exit 1\n  rm -- {quoted}\nfi"
     );
     let preflight =
-        super::attach::RemoteSsh::new_noninteractive(target.to_owned()).sh_output(&cleanup)?;
+        super::attach::RemoteSsh::new_noninteractive_cancellable(target.to_owned(), cancellation)
+            .sh_output(&cleanup)?;
     if !preflight.status.success() {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,

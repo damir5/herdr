@@ -25,18 +25,26 @@ pub(super) const MAX_SESSIONS: usize = 32;
 /// guest sends one request line, so this only trips on abuse.
 const INBOUND_QUEUE: usize = 32;
 
-/// Session output for the connection thread to put on the socket.
+/// Session output for the connection thread to put on the socket. Each
+/// carries the generation of the session that produced it, because the relay
+/// may reuse an id: output of a replaced session must never reach its successor.
 pub(super) enum Outbound {
     Data {
         session: u32,
+        generation: u64,
         frame: Vec<u8>,
     },
     Close {
         session: u32,
+        generation: u64,
         reason: String,
     },
     /// A CLOSE for a session the host refused or dropped itself.
-    Refused(Vec<u8>),
+    Refused {
+        session: u32,
+        generation: u64,
+        frame: Vec<u8>,
+    },
 }
 
 /// The session's end of its API stream, once admitted.
@@ -78,6 +86,7 @@ impl Shared {
 }
 
 struct Handle {
+    generation: u64,
     inbound: SyncSender<Bytes>,
     shared: Arc<Shared>,
 }
@@ -93,6 +102,8 @@ pub(super) struct Sessions<H: GuestHost> {
     host: Arc<H>,
     keys: Arc<ResponderKeys>,
     live: HashMap<u32, Handle>,
+    /// Stamped on each OPEN, so a reused id is a different session.
+    next_generation: u64,
     outbound: SyncSender<Outbound>,
     waker: Waker,
     handshake_timeout: Duration,
@@ -110,6 +121,7 @@ impl<H: GuestHost> Sessions<H> {
             host,
             keys,
             live: HashMap::new(),
+            next_generation: 0,
             outbound,
             waker,
             handshake_timeout,
@@ -118,10 +130,12 @@ impl<H: GuestHost> Sessions<H> {
 
     /// Starts a session for a relay OPEN, or refuses it with a CLOSE.
     pub(super) fn open(&mut self, id: u32) {
-        // Ids are unique per host; a reused one replaces the stale session.
+        // A reused id replaces the stale session, whose output then drops.
         self.live.remove(&id);
+        let generation = self.next_generation;
+        self.next_generation += 1;
         if self.live.len() >= MAX_SESSIONS {
-            return self.refuse(id, "host_busy");
+            return self.refuse(id, generation, "host_busy");
         }
         let (inbound, receiver) = mpsc::sync_channel(INBOUND_QUEUE);
         let shared = Arc::new(Shared {
@@ -129,6 +143,7 @@ impl<H: GuestHost> Sessions<H> {
         });
         let session = Session {
             id,
+            generation,
             host: Arc::clone(&self.host),
             keys: Arc::clone(&self.keys),
             inbound: receiver,
@@ -141,9 +156,16 @@ impl<H: GuestHost> Sessions<H> {
             .name(format!("herdr-guest-session-{id}"))
             .spawn(move || session.run());
         if spawned.is_err() {
-            return self.refuse(id, "internal");
+            return self.refuse(id, generation, "internal");
         }
-        self.live.insert(id, Handle { inbound, shared });
+        self.live.insert(
+            id,
+            Handle {
+                generation,
+                inbound,
+                shared,
+            },
+        );
     }
 
     /// Hands a guest message to its session, closing a session that is not
@@ -153,19 +175,21 @@ impl<H: GuestHost> Sessions<H> {
             return;
         };
         if let Err(TrySendError::Full(_)) = handle.inbound.try_send(payload) {
+            let generation = handle.generation;
             self.live.remove(&id);
-            self.refuse(id, "overloaded");
+            self.refuse(id, generation, "overloaded");
         }
     }
 
     /// Queues a CLOSE for a session the host will not serve. A relay that
     /// floods OPENs faster than the socket drains loses these CLOSEs rather
     /// than growing memory; the relay closes such guests on its own timeouts.
-    fn refuse(&self, id: u32, reason: &str) {
-        match self
-            .outbound
-            .try_send(Outbound::Refused(frame::close(id, reason)))
-        {
+    fn refuse(&self, id: u32, generation: u64, reason: &str) {
+        match self.outbound.try_send(Outbound::Refused {
+            session: id,
+            generation,
+            frame: frame::close(id, reason),
+        }) {
             Ok(()) => {}
             Err(TrySendError::Full(_)) => debug!("guest session {id}: queue full, CLOSE dropped"),
             Err(TrySendError::Disconnected(_)) => {}
@@ -177,21 +201,45 @@ impl<H: GuestHost> Sessions<H> {
         self.live.remove(&id);
     }
 
-    /// Turns session output into a frame, dropping output of ended sessions.
+    /// Turns session output into a frame, dropping output of ended or
+    /// replaced sessions.
     pub(super) fn outbound(&mut self, message: Outbound) -> Option<Vec<u8>> {
+        let current = |live: &HashMap<u32, Handle>, session, generation| {
+            live.get(&session)
+                .is_some_and(|handle| handle.generation == generation)
+        };
         match message {
-            Outbound::Data { session, frame } => self.live.contains_key(&session).then_some(frame),
-            Outbound::Close { session, reason } => self
+            Outbound::Data {
+                session,
+                generation,
+                frame,
+            } => current(&self.live, session, generation).then_some(frame),
+            Outbound::Close {
+                session,
+                generation,
+                reason,
+            } => current(&self.live, session, generation).then(|| {
+                self.live.remove(&session);
+                frame::close(session, &reason)
+            }),
+            // A refused session was never live, or was removed when refused,
+            // so any live handle under its id is a later session.
+            Outbound::Refused {
+                session,
+                generation,
+                frame,
+            } => self
                 .live
-                .remove(&session)
-                .map(|_| frame::close(session, &reason)),
-            Outbound::Refused(frame) => Some(frame),
+                .get(&session)
+                .is_none_or(|handle| handle.generation == generation)
+                .then_some(frame),
         }
     }
 }
 
 struct Session<H: GuestHost> {
     id: u32,
+    generation: u64,
     host: Arc<H>,
     keys: Arc<ResponderKeys>,
     inbound: Receiver<Bytes>,
@@ -284,6 +332,7 @@ impl<H: GuestHost> Session<H> {
 
         let pump = Pump {
             id: self.id,
+            generation: self.generation,
             outbound: self.outbound.clone(),
             waker: self.waker.clone(),
         };
@@ -335,6 +384,7 @@ impl<H: GuestHost> Session<H> {
     fn send_data(&self, frame: Vec<u8>) -> Result<(), &'static str> {
         let sent = self.outbound.send(Outbound::Data {
             session: self.id,
+            generation: self.generation,
             frame,
         });
         self.waker.wake();
@@ -344,6 +394,7 @@ impl<H: GuestHost> Session<H> {
     fn close(&self, reason: &str) {
         let _ = self.outbound.send(Outbound::Close {
             session: self.id,
+            generation: self.generation,
             reason: reason.to_owned(),
         });
         self.waker.wake();
@@ -353,6 +404,7 @@ impl<H: GuestHost> Session<H> {
 /// Encrypts the API's output into DATA frames, then closes the session.
 struct Pump {
     id: u32,
+    generation: u64,
     outbound: SyncSender<Outbound>,
     waker: Waker,
 }
@@ -372,6 +424,7 @@ impl Pump {
             };
             let sent = self.outbound.send(Outbound::Data {
                 session: self.id,
+                generation: self.generation,
                 frame,
             });
             self.waker.wake();
@@ -381,6 +434,7 @@ impl Pump {
         };
         let _ = self.outbound.send(Outbound::Close {
             session: self.id,
+            generation: self.generation,
             reason: reason.to_owned(),
         });
         self.waker.wake();

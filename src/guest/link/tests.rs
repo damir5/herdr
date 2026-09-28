@@ -973,3 +973,38 @@ fn relay_close_reasons_are_sanitized_before_reporting() {
     );
     assert!(error.chars().count() < 120, "{error:?}");
 }
+
+#[test]
+fn a_reused_session_id_never_gets_the_old_sessions_output() {
+    let stub = StubRelay::new();
+    let (_link, host, served) = start(&stub, timing());
+    let mut relay = stub.accept();
+
+    // Session 5 is serving when the relay opens 5 again. Replacing it ends
+    // the old API stream, so its pump's final CLOSE races the new session.
+    let mut old = admitted(&mut relay, 5);
+    old.send(&mut relay, "hello\n");
+    assert_eq!(old.recv(&mut relay), "plotarmordev: hello\n");
+    relay.send(frame::open(5));
+    assert_eq!(
+        served.recv_timeout(WAIT).unwrap(),
+        "plotarmordev",
+        "the replaced session's API stream ended"
+    );
+
+    // Its CLOSE and any late DATA are dropped: the new session handshakes,
+    // serves, and is still open afterwards.
+    let mut new = admitted(&mut relay, 5);
+    new.send(&mut relay, "again\n");
+    assert_eq!(new.recv(&mut relay), "plotarmordev: again\n");
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(
+        already_sent(&mut relay),
+        None,
+        "nothing stale reached session 5"
+    );
+    relay.ws.get_ref().set_nonblocking(false).unwrap();
+    new.send(&mut relay, "still open\n");
+    assert_eq!(new.recv(&mut relay), "plotarmordev: still open\n");
+    assert_eq!(host.hellos.lock().unwrap().len(), 2);
+}

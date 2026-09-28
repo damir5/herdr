@@ -84,6 +84,7 @@ pub struct GuestGrantInfo {
     pub agent_session: AgentSessionInfo,
 }
 
+#[cfg(unix)]
 impl GuestGrantInfo {
     pub fn kind(&self) -> &str {
         self.agent_kind

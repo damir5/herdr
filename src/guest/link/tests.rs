@@ -1,5 +1,7 @@
 //! The link end to end: a fake host behind the real link, against a
-//! plain-WebSocket stub relay that plays the guest side of each session.
+//! plain-WebSocket stub relay that plays the guest side of each session. The
+//! stub relay and guest device are shared with the real-daemon tests in
+//! `api::server::guest_gate`.
 
 use std::io::{BufRead, BufReader, ErrorKind, Write};
 use std::net::{TcpListener, TcpStream};
@@ -155,15 +157,15 @@ impl GuestHost for FakeHost {
     }
 }
 
-struct StubRelay {
+pub(crate) struct StubRelay {
     listener: TcpListener,
-    url: String,
+    pub(crate) url: String,
 }
 
 // tungstenite's handshake `Callback` fixes the large `ErrorResponse` error type.
 #[allow(clippy::result_large_err)]
 impl StubRelay {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let url = format!("ws://{}", listener.local_addr().unwrap());
@@ -190,14 +192,18 @@ impl StubRelay {
         }
     }
 
-    /// Accepts the next host socket after checking its path and bearer.
     fn accept(&self) -> HostSocket {
+        self.accept_host(HOST_ID, RELAY_SECRET)
+    }
+
+    /// Accepts the next host socket after checking its path and bearer.
+    pub(crate) fn accept_host(&self, host_id: &str, relay_secret: &str) -> HostSocket {
         let tcp = self.tcp(WAIT).expect("the link connects");
         let check = |request: &Request, response: Response| {
-            assert_eq!(request.uri().path(), format!("/v1/host/{HOST_ID}"));
+            assert_eq!(request.uri().path(), format!("/v1/host/{host_id}"));
             assert_eq!(
                 request.headers()["authorization"],
-                format!("Bearer {RELAY_SECRET}").as_str()
+                format!("Bearer {relay_secret}").as_str()
             );
             Ok(response)
         };
@@ -220,7 +226,7 @@ impl StubRelay {
     }
 }
 
-struct HostSocket {
+pub(crate) struct HostSocket {
     ws: WebSocket<TcpStream>,
     auto_pong: bool,
 }
@@ -260,56 +266,102 @@ impl HostSocket {
             other => panic!("expected a close, got {other:?}"),
         }
     }
+
+    /// Expects the link to close `session`, returning the reason.
+    pub(crate) fn closed(&mut self, session: u32) -> String {
+        match self.frame() {
+            Frame::Close(id, reason) if id == session => reason,
+            other => panic!("expected CLOSE for session {session}, got {other:?}"),
+        }
+    }
 }
 
 /// The guest side of one session.
-struct Guest {
+pub(crate) struct Guest {
     session: u32,
     transport: TransportState,
     /// The last transport message sent, for replays.
     sent: Vec<u8>,
 }
 
-/// Opens `session` and runs the handshake, returning the host's reply payload.
+/// A guest app install: its device key and the host it was invited to.
+pub(crate) struct Device {
+    pub(crate) secret: [u8; 32],
+    pub(crate) host_pub: [u8; 32],
+    pub(crate) host_id: String,
+}
+
+impl Device {
+    fn fake() -> Self {
+        Self {
+            secret: DEVICE_SECRET,
+            host_pub: public_key(&NODE_SECRET),
+            host_id: HOST_ID.into(),
+        }
+    }
+
+    /// Opens `session` and runs the handshake, returning the host's reply
+    /// payload and, when admitted, the guest's side of the session.
+    pub(crate) fn connect(
+        &self,
+        relay: &mut HostSocket,
+        session: u32,
+        hello: &Value,
+    ) -> (Value, Option<Guest>) {
+        let (reply, init, _) = self.handshake(relay, session, hello);
+        let guest = (reply["ok"] == true).then(|| Guest {
+            session,
+            transport: init.into_transport_mode().unwrap(),
+            sent: Vec::new(),
+        });
+        (reply, guest)
+    }
+
+    fn handshake(
+        &self,
+        relay: &mut HostSocket,
+        session: u32,
+        hello: &Value,
+    ) -> (Value, HandshakeState, Vec<u8>) {
+        relay.send(frame::open(session));
+        let mut init = initiator(&self.secret, &self.host_pub, &self.host_id, None);
+        let mut message1 = vec![0; MAX_MESSAGE];
+        let len = init
+            .write_message(&serde_json::to_vec(hello).unwrap(), &mut message1)
+            .unwrap();
+        message1.truncate(len);
+        relay.send(frame::data(session, &message1));
+        let Frame::Data(id, message2) = relay.frame() else {
+            panic!("expected message 2");
+        };
+        assert_eq!(id, session);
+        let mut reply = vec![0; MAX_MESSAGE];
+        let len = init.read_message(&message2, &mut reply).unwrap();
+        (
+            serde_json::from_slice(&reply[..len]).unwrap(),
+            init,
+            message1,
+        )
+    }
+}
+
+/// Opens `session` as the fake host's device, returning the reply payload.
 fn handshake(
     relay: &mut HostSocket,
     session: u32,
     hello: &Value,
 ) -> (Value, HandshakeState, Vec<u8>) {
-    relay.send(frame::open(session));
-    let mut init = initiator(&DEVICE_SECRET, &public_key(&NODE_SECRET), HOST_ID, None);
-    let mut message1 = vec![0; MAX_MESSAGE];
-    let len = init
-        .write_message(&serde_json::to_vec(hello).unwrap(), &mut message1)
-        .unwrap();
-    message1.truncate(len);
-    relay.send(frame::data(session, &message1));
-    let Frame::Data(id, message2) = relay.frame() else {
-        panic!("expected message 2");
-    };
-    assert_eq!(id, session);
-    let mut reply = vec![0; MAX_MESSAGE];
-    let len = init.read_message(&message2, &mut reply).unwrap();
-    (
-        serde_json::from_slice(&reply[..len]).unwrap(),
-        init,
-        message1,
-    )
+    Device::fake().handshake(relay, session, hello)
 }
 
 fn admitted(relay: &mut HostSocket, session: u32) -> Guest {
-    let (reply, init, _) = handshake(relay, session, &json!({"v": 1}));
-    assert_eq!(reply["ok"], true);
-    Guest {
-        session,
-        transport: init.into_transport_mode().unwrap(),
-        sent: Vec::new(),
-    }
+    let (reply, guest) = Device::fake().connect(relay, session, &json!({"v": 1}));
+    guest.unwrap_or_else(|| panic!("refused: {reply}"))
 }
 
 impl Guest {
     /// Sends `plaintext` in Noise-message-sized chunks.
-    fn send(&mut self, relay: &mut HostSocket, plaintext: &str) {
+    pub(crate) fn send(&mut self, relay: &mut HostSocket, plaintext: &str) {
         for chunk in plaintext.as_bytes().chunks(MAX_PLAINTEXT) {
             let mut message = vec![0; MAX_MESSAGE];
             let len = self.transport.write_message(chunk, &mut message).unwrap();
@@ -321,7 +373,7 @@ impl Guest {
 
     /// Reads DATA messages until a full line arrives; returns it and how many
     /// Noise messages carried it.
-    fn recv_line(&mut self, relay: &mut HostSocket) -> (String, usize) {
+    pub(crate) fn recv_line(&mut self, relay: &mut HostSocket) -> (String, usize) {
         let (mut line, mut messages) = (Vec::new(), 0);
         let mut plaintext = vec![0; MAX_MESSAGE];
         while line.last() != Some(&b'\n') {
@@ -487,6 +539,7 @@ fn flipped_ciphertext_bit_closes_the_session() {
     let (_link, _host, served) = start(&stub, timing());
     let mut relay = stub.accept();
 
+    // Before the API connection starts: no request reaches `serve`.
     let mut guest = admitted(&mut relay, 1);
     let mut message = vec![0; MAX_MESSAGE];
     let len = guest
@@ -495,13 +548,39 @@ fn flipped_ciphertext_bit_closes_the_session() {
         .unwrap();
     message[len / 2] ^= 0x01;
     relay.send(frame::data(1, &message[..len]));
+    assert_eq!(relay.closed(1), "decrypt_failed");
 
-    assert_eq!(relay.frame(), Frame::Close(1, "decrypt_failed".into()));
-    assert_eq!(
-        served.recv_timeout(WAIT).unwrap(),
-        "plotarmordev",
-        "the API stream ends with the session"
+    // Mid-connection: the API stream ends with the session.
+    let mut guest = admitted(&mut relay, 2);
+    guest.send(&mut relay, "hello\n");
+    assert_eq!(guest.recv(&mut relay), "plotarmordev: hello\n");
+    let len = guest
+        .transport
+        .write_message(b"again\n", &mut message)
+        .unwrap();
+    message[len - 1] ^= 0x80;
+    relay.send(frame::data(2, &message[..len]));
+    assert_eq!(relay.closed(2), "decrypt_failed");
+    assert_eq!(served.recv_timeout(WAIT).unwrap(), "plotarmordev");
+    assert!(
+        served.try_recv().is_err(),
+        "only the started connection was served"
     );
+}
+
+#[test]
+fn admitted_guest_that_never_sends_a_request_is_closed() {
+    let stub = StubRelay::new();
+    let quick = Timing {
+        handshake_timeout: Duration::from_millis(300),
+        ..timing()
+    };
+    let (_link, _host, served) = start(&stub, quick);
+    let mut relay = stub.accept();
+
+    let _guest = admitted(&mut relay, 1);
+    assert_eq!(relay.closed(1), "request_timeout");
+    assert!(served.try_recv().is_err(), "no API connection was started");
 }
 
 #[test]

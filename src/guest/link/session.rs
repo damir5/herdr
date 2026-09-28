@@ -234,13 +234,23 @@ impl<H: GuestHost> Session<H> {
         }
     }
 
-    /// Runs the guest's API connection until either side ends it.
+    /// Runs the guest's API connection until either side ends it. The
+    /// connection starts with the guest's first request bytes, so the API's
+    /// request timeout covers the request, not the round trip before it.
     fn serve(
         &self,
         transport: Arc<Transport>,
         principal: H::Principal,
     ) -> Result<(), &'static str> {
-        let (ours, theirs) = UnixStream::pair().map_err(|_| "internal")?;
+        let first = match self.inbound.recv_timeout(self.handshake_timeout) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => return Err("request_timeout"),
+            Err(RecvTimeoutError::Disconnected) => return Err("closed"),
+        };
+        let mut plaintext = vec![0; MAX_MESSAGE];
+        let len = self.decrypt(&transport, &first, &mut plaintext)?;
+
+        let (mut ours, theirs) = UnixStream::pair().map_err(|_| "internal")?;
         if !self.shared.attach(&ours) {
             return Err("closed");
         }
@@ -265,26 +275,41 @@ impl<H: GuestHost> Session<H> {
             return Err("internal");
         }
 
-        self.forward(&transport, ours)
+        if ours.write_all(&plaintext[..len]).is_err() {
+            // The API side ended; the pump reports it.
+            return Ok(());
+        }
+        self.forward(&transport, ours, plaintext)
     }
 
-    /// Decrypts guest messages into the API stream. A message that fails to
-    /// decrypt (tampered, replayed or reordered) ends the session.
-    fn forward(&self, transport: &Transport, mut ours: UnixStream) -> Result<(), &'static str> {
-        let mut plaintext = vec![0; MAX_MESSAGE];
+    /// Decrypts guest messages into the API stream until either side ends.
+    fn forward(
+        &self,
+        transport: &Transport,
+        mut ours: UnixStream,
+        mut plaintext: Vec<u8>,
+    ) -> Result<(), &'static str> {
         for message in &self.inbound {
-            let len = transport
-                .decrypt(&message, &mut plaintext)
-                .map_err(|error| {
-                    debug!("guest session {}: decrypt failed: {error}", self.id);
-                    "decrypt_failed"
-                })?;
+            let len = self.decrypt(transport, &message, &mut plaintext)?;
             if ours.write_all(&plaintext[..len]).is_err() {
-                // The API side ended; the pump reports it.
                 break;
             }
         }
         Ok(())
+    }
+
+    /// A message that fails to decrypt (tampered, replayed or reordered) ends
+    /// the session.
+    fn decrypt(
+        &self,
+        transport: &Transport,
+        message: &[u8],
+        plaintext: &mut [u8],
+    ) -> Result<usize, &'static str> {
+        transport.decrypt(message, plaintext).map_err(|error| {
+            debug!("guest session {}: decrypt failed: {error}", self.id);
+            "decrypt_failed"
+        })
     }
 
     fn send_data(&self, frame: Vec<u8>) -> Result<(), &'static str> {

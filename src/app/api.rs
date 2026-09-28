@@ -1546,6 +1546,7 @@ impl App {
                 return self.handle_gram_get_file_chunk(request.id, params);
             }
             Method::GramRelayStatus(_) => return self.handle_gram_relay_status(request.id),
+            #[cfg(unix)]
             Method::GuestAgentProbe(params) => {
                 return self.handle_guest_agent_probe(request.id, params);
             }

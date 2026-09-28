@@ -107,6 +107,7 @@ impl App {
 
     /// The agent pane currently attached to `terminal_id`. Terminal ids are
     /// never reused, so a guest grant can pin one.
+    #[cfg(unix)]
     pub(crate) fn agent_target_for_terminal_id(&self, terminal_id: &str) -> Option<TerminalTarget> {
         self.terminal_targets()
             .into_iter()

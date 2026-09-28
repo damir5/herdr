@@ -1966,6 +1966,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::GuestList(_) => "guest.list",
         Method::GuestRevoke(_) => "guest.revoke",
         Method::GuestAudit(_) => "guest.audit",
+        #[cfg(unix)]
         Method::GuestAgentProbe(_) => "guest.agent_probe",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",

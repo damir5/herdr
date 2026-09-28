@@ -61,6 +61,7 @@ pub struct GuestAuditParams {
 }
 
 /// Internal probe: `terminal_id` wins over `target`.
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GuestAgentProbeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

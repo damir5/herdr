@@ -70,6 +70,7 @@ impl App {
     /// Internal guest-gate lookup. `running` is the same live-agent check
     /// `agent.prompt` applies: a known agent, no launch pending, and the agent
     /// still the pane's foreground process.
+    #[cfg(unix)]
     pub(super) fn handle_guest_agent_probe(
         &mut self,
         id: String,
@@ -96,6 +97,7 @@ impl App {
         encode_success(id, ResponseResult::GuestAgentProbed { agent, running })
     }
 
+    #[cfg(unix)]
     fn agent_pane_runs_agent(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> bool {
         let Some(terminal) = self
             .state

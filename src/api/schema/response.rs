@@ -296,6 +296,7 @@ pub enum ResponseResult {
         entries: Vec<super::guest::GuestAuditEntry>,
     },
     /// Internal: the guest gate's agent lookup plus its live-agent check.
+    #[cfg(unix)]
     #[schemars(skip)]
     GuestAgentProbed {
         agent: AgentInfo,

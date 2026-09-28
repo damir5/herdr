@@ -124,6 +124,7 @@ pub enum Method {
     #[serde(rename = "guest.audit")]
     GuestAudit(GuestAuditParams),
     /// Internal only: resolve an agent and its live-agent check for the guest gate.
+    #[cfg(unix)]
     #[serde(skip)]
     #[schemars(skip)]
     GuestAgentProbe(GuestAgentProbeParams),

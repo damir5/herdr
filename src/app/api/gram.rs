@@ -378,7 +378,7 @@ impl App {
         let item = GramItem {
             id: message_id,
             direction: StoredDirection::OwnerToAgent,
-            from: "owner".to_string(),
+            from: params.from.unwrap_or_else(|| "owner".to_string()),
             to,
             text: text.to_string(),
             grabbed_by: None,

@@ -67,6 +67,57 @@ impl App {
         )
     }
 
+    /// Internal guest-gate lookup. `running` is the same live-agent check
+    /// `agent.prompt` applies: a known agent, no launch pending, and the agent
+    /// still the pane's foreground process.
+    pub(super) fn handle_guest_agent_probe(
+        &mut self,
+        id: String,
+        params: crate::api::schema::GuestAgentProbeParams,
+    ) -> String {
+        let label = params
+            .terminal_id
+            .as_deref()
+            .or(params.target.as_deref())
+            .unwrap_or_default()
+            .to_string();
+        let resolved = match (&params.terminal_id, &params.target) {
+            (Some(terminal_id), _) => self.agent_target_for_terminal_id(terminal_id),
+            (None, Some(target)) => self.resolve_agent_target(target).ok(),
+            (None, None) => None,
+        };
+        let Some(resolved) = resolved else {
+            return agent_not_found(id, &label);
+        };
+        let Some(agent) = self.agent_info(resolved.ws_idx, resolved.pane_id) else {
+            return agent_not_found(id, &label);
+        };
+        let running = self.agent_pane_runs_agent(resolved.ws_idx, resolved.pane_id);
+        encode_success(id, ResponseResult::GuestAgentProbed { agent, running })
+    }
+
+    fn agent_pane_runs_agent(&self, ws_idx: usize, pane_id: crate::layout::PaneId) -> bool {
+        let Some(terminal) = self
+            .state
+            .workspaces
+            .get(ws_idx)
+            .and_then(|workspace| workspace.terminal_id(pane_id))
+            .and_then(|terminal_id| self.state.terminals.get(terminal_id))
+        else {
+            return false;
+        };
+        let Some(expected_agent) = terminal.effective_known_agent() else {
+            return false;
+        };
+        if terminal.managed_agent_launch_pending() {
+            return false;
+        }
+        self.lookup_runtime_sender(ws_idx, pane_id)
+            .is_some_and(|runtime| {
+                super::super::agents::runtime_hosts_agent(runtime, expected_agent)
+            })
+    }
+
     pub(super) fn handle_agent_get(&mut self, id: String, target: AgentTarget) -> String {
         self.reconcile_managed_agent_target(&target.target);
         let agent = match self.agent_info_for_target(&target.target) {

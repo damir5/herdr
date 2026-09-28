@@ -64,6 +64,10 @@ pub struct GramPostParams {
     /// `gram.upload_chunk` under `file.upload_id`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file: Option<GramFileUpload>,
+    /// Internal only: the guest gate's sender label. Never read from the wire.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub from: Option<String>,
 }
 
 /// `gram.list` — read messages. The audience is chosen by `caller_pane_id`:

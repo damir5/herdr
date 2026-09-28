@@ -912,6 +912,7 @@ mod tests {
                     mime: "application/octet-stream".into(),
                     sha256: None,
                 }),
+                from: None,
             }),
         };
 

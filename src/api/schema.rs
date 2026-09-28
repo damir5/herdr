@@ -7,6 +7,7 @@ pub mod common;
 pub mod events;
 pub mod fs;
 pub mod gram;
+pub mod guest;
 pub mod integrations;
 pub mod machines;
 pub mod panes;
@@ -25,6 +26,7 @@ pub use common::*;
 pub use events::*;
 pub use fs::*;
 pub use gram::*;
+pub use guest::*;
 pub use integrations::*;
 pub use machines::*;
 pub use panes::*;
@@ -111,6 +113,20 @@ pub enum Method {
     /// Effective Gram relay consent, its source and errors, and gateway state. Local only.
     #[serde(rename = "gram.relay_status")]
     GramRelayStatus(EmptyParams),
+    /// Owner only: invite one guest to one live agent. Never reachable by
+    /// federation peers or guests.
+    #[serde(rename = "guest.invite.create")]
+    GuestInviteCreate(GuestInviteCreateParams),
+    #[serde(rename = "guest.list")]
+    GuestList(GuestListParams),
+    #[serde(rename = "guest.revoke")]
+    GuestRevoke(GuestRevokeParams),
+    #[serde(rename = "guest.audit")]
+    GuestAudit(GuestAuditParams),
+    /// Internal only: resolve an agent and its live-agent check for the guest gate.
+    #[serde(skip)]
+    #[schemars(skip)]
+    GuestAgentProbe(GuestAgentProbeParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]

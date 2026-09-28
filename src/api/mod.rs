@@ -19,6 +19,8 @@ mod transport;
 mod wait;
 
 pub use event_hub::EventHub;
+#[cfg(unix)]
+pub(crate) use server::serve_guest_stream;
 pub use server::ServerHandle;
 pub(crate) use server::{api_method_name, start_server_with_stop_control};
 pub use status::{read_runtime_status_at, RuntimeStatus};

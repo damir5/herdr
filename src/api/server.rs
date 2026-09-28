@@ -45,6 +45,11 @@ use crate::ipc::{
 };
 
 mod gram_upload_stream;
+#[cfg(unix)]
+mod guest_gate;
+mod guest_owner;
+#[cfg(unix)]
+pub(crate) use guest_gate::serve_guest_stream;
 mod pane_graphics_stream;
 mod pane_input_stream;
 mod pane_output_stream;
@@ -222,6 +227,8 @@ fn start_server_inner(
     #[cfg(unix)]
     federation_manager.set_gram_api_sender(api_tx.clone());
     federation_manager.reconcile_config(federation);
+    #[cfg(unix)]
+    guest_gate::install_context(api_tx.clone(), event_hub.clone(), Arc::clone(&running));
 
     let listener_running = Arc::clone(&running);
     let listener_api_tx = api_tx.clone();
@@ -1011,15 +1018,53 @@ fn handle_connection(
     )
 }
 
+/// Who is on the other end of one API connection.
+pub(crate) enum ConnectionPrincipal {
+    /// The local socket or an SSH bridge to it: the owner.
+    Owner,
+    /// An inbound federation TCP peer, gated by its capability tier.
+    Federation(PeerContext),
+    /// A HerdrUp guest through the guest relay, gated to one agent.
+    #[cfg(unix)]
+    Guest(crate::guest::GuestPrincipal),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn handle_connection_with_stop(
-    mut stream: ApiStream,
+    stream: ApiStream,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
     capabilities: Option<ServerCapabilities>,
     server_stop: Option<&Arc<AtomicBool>>,
     federation: Option<PeerContext>,
+    federation_peers: &HashMap<String, PeerRoute>,
+) -> std::io::Result<()> {
+    let principal = match federation {
+        Some(peer) => ConnectionPrincipal::Federation(peer),
+        None => ConnectionPrincipal::Owner,
+    };
+    handle_principal_connection(
+        stream,
+        api_tx,
+        event_hub,
+        running,
+        capabilities,
+        server_stop,
+        principal,
+        federation_peers,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_principal_connection(
+    mut stream: ApiStream,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    capabilities: Option<ServerCapabilities>,
+    server_stop: Option<&Arc<AtomicBool>>,
+    principal: ConnectionPrincipal,
     federation_peers: &HashMap<String, PeerRoute>,
 ) -> std::io::Result<()> {
     if let Err(err) = stream.set_send_timeout(Some(STREAM_WRITE_TIMEOUT)) {
@@ -1068,6 +1113,17 @@ fn handle_connection_with_stop(
     let request_id = request.id.clone();
     let method = api_method_name(&request.method);
     let changes_ui = request_changes_ui(&request);
+
+    // A guest never reaches the owner or federation paths below: its gate is
+    // an explicit allowlist bound to one agent.
+    #[cfg(unix)]
+    if let ConnectionPrincipal::Guest(guest) = &principal {
+        return guest_gate::serve_request(stream, request, guest, api_tx, event_hub, running);
+    }
+    let federation = match &principal {
+        ConnectionPrincipal::Federation(peer) => Some(peer),
+        _ => None,
+    };
 
     // Federation capability gate. Local (unix-socket) connections carry `None`
     // here and are never filtered; only a connection bound to a federation
@@ -1129,6 +1185,19 @@ fn handle_connection_with_stop(
         running,
         &request_id,
         method,
+        changes_ui,
+    ) {
+        return result;
+    }
+
+    // Owner-only guest RPCs. Federation peers were refused above (the method
+    // table denies every guest.*), and guests never get here.
+    if let Some(result) = guest_owner::maybe_handle(
+        &mut stream,
+        &mut request,
+        federation_peers,
+        api_tx,
+        running,
         changes_ui,
     ) {
         return result;
@@ -1893,6 +1962,11 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::GramGetFileChunk(_) => "gram.get_file_chunk",
         Method::GramRelay(_) => "gram.relay",
         Method::GramRelayStatus(_) => "gram.relay_status",
+        Method::GuestInviteCreate(_) => "guest.invite.create",
+        Method::GuestList(_) => "guest.list",
+        Method::GuestRevoke(_) => "guest.revoke",
+        Method::GuestAudit(_) => "guest.audit",
+        Method::GuestAgentProbe(_) => "guest.agent_probe",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
@@ -3615,6 +3689,11 @@ mod federation_tests {
             ("gram.get_file_chunk", Denied),
             ("gram.relay", Denied),
             ("gram.relay_status", Denied),
+            ("guest.invite.create", Denied),
+            ("guest.list", Denied),
+            ("guest.revoke", Denied),
+            ("guest.audit", Denied),
+            ("guest.agent_probe", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
             ("client_shell.surface.set", Denied),
@@ -3938,6 +4017,41 @@ mod federation_tests {
             }),
         );
         assert_eq!(read_json_line(&stream)["error"]["code"], "forbidden");
+    }
+
+    #[test]
+    fn admin_federation_peers_are_forbidden_every_guest_method() {
+        use crate::api::schema::{
+            GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRevokeParams,
+        };
+        let mut fed = start_federation(one_peer("adm", CapabilityTier::Admin));
+        for method in [
+            Method::GuestInviteCreate(GuestInviteCreateParams {
+                target: "w1:p1".into(),
+                name: "friend".into(),
+                owner_name: "Jerry".into(),
+                machine_label: "Mac".into(),
+                ttl_secs: None,
+                machine: None,
+            }),
+            Method::GuestList(GuestListParams::default()),
+            Method::GuestRevoke(GuestRevokeParams {
+                guest_id: Some("g".into()),
+                ..Default::default()
+            }),
+            Method::GuestAudit(GuestAuditParams::default()),
+        ] {
+            let mut stream = raw_hello(fed.addr, "adm");
+            send_request(&mut stream, "guest", method);
+            let mut line = String::new();
+            BufReader::new(stream).read_line(&mut line).unwrap();
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(value["error"]["code"], "forbidden", "{line}");
+        }
+        assert!(
+            fed.api_rx.try_recv().is_err(),
+            "no guest RPC reached the app"
+        );
     }
 
     #[test]

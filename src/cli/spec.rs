@@ -42,6 +42,7 @@ pub(super) fn command() -> Command {
         .subcommand(tab_command())
         .subcommand(notification_command())
         .subcommand(gram_command())
+        .subcommand(guest_command())
         .subcommand(agent_command())
         .subcommand(pane_command())
         .subcommand(pair_command())
@@ -401,6 +402,40 @@ fn gram_command() -> Command {
                 .about("Delete a message (and any attached file) for good")
                 .arg(required("id", "ID"))
                 .arg(flag("owner").help("Delete any message (owner authority)")),
+        )
+}
+
+fn guest_command() -> Command {
+    let machine = || option("machine", "ALIAS").help("Run on this saved SSH machine");
+    Command::new("guest")
+        .about("Share one agent with an outside person through HerdrUp")
+        .subcommand(
+            Command::new("invite")
+                .about("Create a single-use invite for one named, running agent")
+                .arg(required("agent", "AGENT"))
+                .arg(option("name", "NAME").help("Guest name shown in prompt labels"))
+                .arg(option("owner-name", "NAME"))
+                .arg(option("machine-label", "LABEL"))
+                .arg(option("ttl", "SECS").help("Invite lifetime (default 86400)"))
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("list")
+                .about("List guests, invites and the relay link")
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("revoke")
+                .about("Revoke a guest or an invite; closes live sessions")
+                .arg(required("id", "ID"))
+                .arg(machine()),
+        )
+        .subcommand(
+            Command::new("log")
+                .about("Show guest activity, newest first")
+                .arg(Arg::new("guest-id").value_name("GUEST-ID"))
+                .arg(option("limit", "N"))
+                .arg(machine()),
         )
 }
 

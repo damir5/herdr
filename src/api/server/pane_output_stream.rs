@@ -108,11 +108,30 @@ fn encode_bytes(bytes: &[u8]) -> String {
 }
 
 pub(super) fn serve(
+    stream: ApiStream,
+    request_id: String,
+    params: PaneStreamParams,
+    api_tx: &ApiRequestSender,
+    running: &Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    serve_watched(stream, request_id, params, api_tx, running, None)
+}
+
+/// Called between frames with `closed = true` when the runtime ended. A
+/// returned line is written as the final frame and the stream closes.
+pub(super) type StreamWatch<'a> = &'a mut dyn FnMut(bool) -> Option<String>;
+
+/// Poll cadence for a watched stream, so a watch fires promptly while idle.
+const WATCH_POLL: Duration = Duration::from_millis(250);
+
+/// `pane.stream` with an optional watch (the guest gate's pause/revoke check).
+pub(super) fn serve_watched(
     mut stream: ApiStream,
     request_id: String,
     params: PaneStreamParams,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
+    watch: Option<StreamWatch<'_>>,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
     // Capture the viewer id from the OPEN params before they are moved into the
@@ -140,7 +159,14 @@ pub(super) fn serve(
     // a genuine synchronous failure (e.g. pane_not_found) no ring was created and
     // the close is a harmless no-op.
     let result = if api_response_outcome(&open_response) == "ok" {
-        serve_attached(&mut stream, &request_id, &pane_id, max_frame_bytes, running)
+        serve_attached(
+            &mut stream,
+            &request_id,
+            &pane_id,
+            max_frame_bytes,
+            running,
+            watch,
+        )
     } else {
         write_text_line_allow_disconnect(&mut stream, &open_response)
     };
@@ -154,6 +180,7 @@ fn serve_attached(
     pane_id: &str,
     max_frame_bytes: usize,
     running: &Arc<AtomicBool>,
+    mut watch: Option<StreamWatch<'_>>,
 ) -> std::io::Result<()> {
     let Some(ring) = output_registry::lookup(pane_id) else {
         // The ring vanished between attach and lookup (pane closed). Report it
@@ -174,8 +201,7 @@ fn serve_attached(
     let epoch = ring.epoch();
     let Some(seed) = ring.snapshot() else {
         // The runtime is already gone; tell the client and close.
-        emit(stream, &StreamFrameLine::exited(0, epoch))?;
-        return Ok(());
+        return finish_exited(stream, &mut watch, 0, epoch);
     };
 
     // stream_started ack carries the geometry the client lacks today.
@@ -214,22 +240,33 @@ fn serve_attached(
     let mut cursor = seed.cursor;
     let mut resize_id = seed.resize_id;
 
+    let wait = if watch.is_some() {
+        WATCH_POLL
+    } else {
+        PING_INTERVAL
+    };
+    let mut last_ping = std::time::Instant::now();
     loop {
         if !running.load(Ordering::Relaxed) {
             return Ok(());
         }
-        match ring.wait_for_activity(cursor, resize_id, PING_INTERVAL) {
+        if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
+            return write_text_line_allow_disconnect(stream, &line);
+        }
+        match ring.wait_for_activity(cursor, resize_id, wait) {
             OutputWait::Closed => {
-                emit(stream, &StreamFrameLine::exited(cursor, epoch))?;
-                return Ok(());
+                return finish_exited(stream, &mut watch, cursor, epoch);
             }
             OutputWait::Idle => {
                 // On the idle tick, reap a dead peer before heartbeating.
                 if should_stop_connection(stream, running)? {
                     return Ok(());
                 }
-                if !emit(stream, &StreamFrameLine::ping(cursor, epoch))? {
-                    return Ok(());
+                if watch.is_none() || last_ping.elapsed() >= PING_INTERVAL {
+                    last_ping = std::time::Instant::now();
+                    if !emit(stream, &StreamFrameLine::ping(cursor, epoch))? {
+                        return Ok(());
+                    }
                 }
             }
             OutputWait::Ready => match ring.drain(cursor, resize_id, max_frame_bytes) {
@@ -237,8 +274,7 @@ fn serve_attached(
                     // Snapshot-collapse resync: discard the backlog, re-seed one
                     // full-screen keyframe, and jump the cursor to the live edge.
                     let Some(seed) = ring.snapshot() else {
-                        emit(stream, &StreamFrameLine::exited(cursor, epoch))?;
-                        return Ok(());
+                        return finish_exited(stream, &mut watch, cursor, epoch);
                     };
                     if !emit(
                         stream,
@@ -290,6 +326,20 @@ fn serve_attached(
             },
         }
     }
+}
+
+/// End the stream because the runtime ended. A watched stream reports it
+/// through its watch instead of an `exited` frame.
+fn finish_exited(
+    stream: &mut ApiStream,
+    watch: &mut Option<StreamWatch<'_>>,
+    cursor: u64,
+    epoch: u64,
+) -> std::io::Result<()> {
+    if let Some(line) = watch.as_mut().and_then(|watch| watch(true)) {
+        return write_text_line_allow_disconnect(stream, &line);
+    }
+    emit(stream, &StreamFrameLine::exited(cursor, epoch)).map(|_| ())
 }
 
 /// Write one frame/response line, reporting `false` when the peer has closed so

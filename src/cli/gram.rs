@@ -112,6 +112,7 @@ fn gram_post(args: &[String]) -> std::io::Result<i32> {
             text,
             to,
             file: None,
+            from: None,
         }),
     })?)
 }

@@ -24,6 +24,8 @@ mod copy_mode;
 mod detect;
 mod events;
 mod ghostty;
+#[cfg(unix)]
+mod guest;
 mod handoff_runtime;
 mod input;
 mod integration;

@@ -272,6 +272,35 @@ pub enum ResponseResult {
         shown: bool,
         reason: NotificationShowReason,
     },
+    /// A new guest invite. The secret exists only inside the two links.
+    GuestInviteCreated {
+        invite: super::guest::GuestInviteInfo,
+        url: String,
+        web_url: String,
+    },
+    /// Guests, invites and relay link state. Never includes secrets or keys.
+    GuestList {
+        guests: Vec<super::guest::GuestInfo>,
+        invites: Vec<super::guest::GuestInviteInfo>,
+        link: super::guest::GuestLinkInfo,
+    },
+    GuestRevoked {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        guest_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        invite_id: Option<String>,
+        /// Live guest streams closed by this revoke.
+        closed_streams: usize,
+    },
+    GuestAudit {
+        entries: Vec<super::guest::GuestAuditEntry>,
+    },
+    /// Internal: the guest gate's agent lookup plus its live-agent check.
+    #[schemars(skip)]
+    GuestAgentProbed {
+        agent: AgentInfo,
+        running: bool,
+    },
     /// Effective Gram relay policy for both roles. Never includes secrets.
     GramRelayStatus {
         coordinator: super::gram::GramRelayCoordinatorStatus,

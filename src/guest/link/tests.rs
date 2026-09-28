@@ -861,12 +861,13 @@ fn a_flood_of_opens_stays_bounded_and_the_link_still_stops() {
     host.wait_status(|(state, _)| *state == LinkState::Up);
 
     // The relay floods OPENs far past the session cap and never reads, so the
-    // host's CLOSE replies can go only as far as the socket takes them.
+    // host's CLOSE replies can go only as far as the socket takes them. A
+    // million refusals are more than the kernel buffers absorb.
     let mut next = 1;
     flood_opens(
         &mut relay,
         &mut next,
-        Some(200_000),
+        Some(1_000_000),
         &AtomicBool::new(false),
     );
     // Session 1's hello comes after the flood, so its admission shows the
@@ -877,7 +878,11 @@ fn a_flood_of_opens_stays_bounded_and_the_link_still_stops() {
     relay.send(frame::data(1, &message1[..len]));
     let deadline = Instant::now() + WAIT;
     while host.hellos.lock().unwrap().is_empty() {
-        assert!(Instant::now() < deadline, "the link stopped reading");
+        assert!(
+            Instant::now() < deadline,
+            "the link did not get through the flood; status {:?}",
+            host.last_status()
+        );
         std::thread::sleep(Duration::from_millis(10));
     }
     // Replies waited for the socket instead of piling up: the link never hit

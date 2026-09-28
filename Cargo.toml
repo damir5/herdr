@@ -93,10 +93,10 @@ windows-sys = { version = "0.61.2", features = [
 
 [target.'cfg(unix)'.dependencies]
 # Guest access relay link (src/guest/link), the one documented exception to
-# "no in-process outbound networking": while guests exist, the daemon keeps one
-# outbound WSS socket to the HerdrUp guest relay, and each guest session through
-# it is end-to-end encrypted with Noise IK (snow). TLS uses rustls on ring with
-# the webpki root set.
+# keeping TLS and internet traffic out of process: while guests exist, the daemon
+# keeps one outbound WSS socket to the HerdrUp guest relay, and each guest session
+# through it is end-to-end encrypted with Noise IK (snow). TLS uses rustls on
+# ring with the webpki root set.
 snow = { version = "0.10", default-features = false, features = ["use-chacha20poly1305", "use-curve25519", "use-getrandom", "use-sha2"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tungstenite = { version = "0.30", default-features = false, features = ["handshake", "rustls-tls-webpki-roots"] }

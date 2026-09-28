@@ -24,17 +24,17 @@ use crate::api::schema::{
 };
 use store::{AdmitOutcome, RevokeTarget};
 
-#[allow(dead_code)] // Read by guest::link.
 pub struct GuestHostInfo {
     pub host_id: String,
     pub relay_secret: String,
     pub node_secret: [u8; 32],
+    // Contract field; the link's Noise responder derives it from the secret.
+    #[allow(dead_code)]
     pub node_public: [u8; 32],
     pub relay_url: String,
 }
 
 /// Creates the node key and `host.json` on first use.
-#[allow(dead_code)] // Called by guest::link.
 pub(crate) fn host_info() -> std::io::Result<GuestHostInfo> {
     let (host, node_secret) = store::load_host(&store::guest_dir())?;
     Ok(GuestHostInfo {
@@ -48,7 +48,6 @@ pub(crate) fn host_info() -> std::io::Result<GuestHostInfo> {
 
 /// At least one non-revoked guest or one unexpired, unused invite. Invite
 /// expiry does not fire [`subscribe_changes`]; poll this on a timer too.
-#[allow(dead_code)] // Called by guest::link.
 pub(crate) fn link_wanted() -> bool {
     store::link_wanted_in(&store::guest_dir(), store::now_ms())
 }
@@ -105,7 +104,7 @@ impl GuestPrincipal {
 }
 
 // Short-lived per-connection value; the contract shape stays unboxed.
-#[allow(dead_code, clippy::large_enum_variant)] // Read by guest::link.
+#[allow(clippy::large_enum_variant)]
 pub enum Admission {
     Admitted {
         principal: GuestPrincipal,
@@ -115,7 +114,6 @@ pub enum Admission {
 }
 
 /// Message-1 payload in, message-2 payload out.
-#[allow(dead_code)] // Called by guest::link.
 pub(crate) fn admit(device_pub: [u8; 32], hello: &serde_json::Value) -> Admission {
     admit_in(store::guest_dir(), device_pub, hello)
 }
@@ -160,7 +158,6 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
 
 /// Run one API connection as `principal`. Blocks until the request is
 /// answered or the stream ends, then closes the stream.
-#[allow(dead_code)] // Called by guest::link.
 pub(crate) fn serve(principal: GuestPrincipal, stream: std::os::unix::net::UnixStream) {
     crate::api::serve_guest_stream(principal, stream);
 }
@@ -173,7 +170,6 @@ pub struct LinkStatus {
 
 static LINK_STATUS: Mutex<Option<LinkStatus>> = Mutex::new(None);
 
-#[allow(dead_code)] // Called by guest::link.
 pub(crate) fn set_link_status(status: LinkStatus) {
     *LINK_STATUS
         .lock()
@@ -206,7 +202,6 @@ fn link_info() -> GuestLinkInfo {
 static SUBSCRIBERS: Mutex<Vec<mpsc::Sender<()>>> = Mutex::new(Vec::new());
 
 /// Fires when guests or invites change (created, accepted, revoked).
-#[allow(dead_code)] // Called by guest::link.
 pub(crate) fn subscribe_changes() -> mpsc::Receiver<()> {
     let (tx, rx) = mpsc::channel();
     SUBSCRIBERS

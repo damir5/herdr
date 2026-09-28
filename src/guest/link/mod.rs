@@ -1,7 +1,7 @@
 //! Guest access relay link: the host side of the HerdrUp guest relay.
 //!
-//! Networking exception: Herdr otherwise does no in-process outbound
-//! networking (`src/update.rs` and push delivery shell out to curl). Guest
+//! Networking exception: Herdr otherwise keeps TLS and internet traffic out of
+//! process (`src/update.rs` and push delivery shell out to curl). Guest
 //! access needs a long-lived, bidirectional socket that curl cannot provide, so
 //! this module, and only this module, links tungstenite, rustls, webpki-roots
 //! and ring. It dials a single configured relay URL (`[guest] relay_url`, https
@@ -19,7 +19,7 @@ mod noise;
 mod relay;
 mod session;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::hash::{BuildHasher, Hasher};
 use std::io::{self, Read, Write};
@@ -32,7 +32,7 @@ use std::time::{Duration, Instant};
 
 use tracing::{info, warn};
 
-use self::host::{GuestHost, LinkState};
+use self::host::{DaemonGuestHost, GuestHost, LinkState};
 
 /// Link timings; tests shorten them.
 #[derive(Clone, Copy)]
@@ -173,8 +173,14 @@ pub(crate) struct GuestLink {
 }
 
 impl GuestLink {
-    // Called by daemon startup once the guest store's `GuestHost` impl lands.
-    #[allow(dead_code)]
+    /// Starts the daemon's link over the guest store. Guest access is optional:
+    /// a failure is logged and the daemon carries on without it.
+    pub(crate) fn start_for_daemon() -> Option<Self> {
+        Self::start(Arc::new(DaemonGuestHost))
+            .inspect_err(|err| warn!(err = %err, "guest link failed to start"))
+            .ok()
+    }
+
     pub(crate) fn start<H: GuestHost>(host: Arc<H>) -> io::Result<Self> {
         Self::start_with(host, Timing::default())
     }

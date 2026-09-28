@@ -230,9 +230,12 @@ impl HostSocket {
         self.ws.send(Message::Binary(frame.into())).unwrap();
     }
 
-    /// The next non-ping message from the link.
+    /// The next non-ping message from the link. Pings keep arriving, so the
+    /// wait is bounded here rather than by the read timeout alone.
     fn message(&mut self) -> Message {
+        let deadline = Instant::now() + WAIT;
         loop {
+            assert!(Instant::now() < deadline, "no message from the link");
             match self.ws.read().expect("relay read") {
                 Message::Text(text) if text.as_str() == "ping" => {
                     if self.auto_pong {

@@ -173,6 +173,7 @@ pub(crate) struct GuestLink {
 }
 
 impl GuestLink {
+    // Called by daemon startup once the guest store's `GuestHost` impl lands.
     #[allow(dead_code)]
     pub(crate) fn start<H: GuestHost>(host: Arc<H>) -> io::Result<Self> {
         Self::start_with(host, Timing::default())

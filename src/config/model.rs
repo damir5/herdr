@@ -1282,6 +1282,7 @@ pub const DEFAULT_PUSH_RELAY_URL: &str = "https://push.herdrup.themartian.app";
 pub struct GuestConfig {
     /// Base URL of the HerdrUp guest relay. Invites carry it, and the daemon
     /// links to it only while a guest or an unexpired invite exists.
+    #[cfg_attr(not(unix), allow(dead_code))] // Guest access is unix only.
     pub relay_url: String,
 }
 

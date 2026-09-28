@@ -108,6 +108,7 @@ Raw socket method names use dot notation:
 | Server | `ping`, `server.stop`, `server.reload_config`, `server.agent_manifests`, `server.reload_agent_manifests` |
 | Notification | `notification.show`, `notifications.register_device`, `notifications.status` |
 | Gram | `gram.send`, `gram.post`, `gram.list`, `gram.grab`, `gram.mark_read`, `gram.delete`, `gram.upload_chunk`, `gram.get_file`, `gram.relay_status` |
+| Guest | `guest.invite.create`, `guest.list`, `guest.revoke`, `guest.audit` (owner only; denied to federation peers and guests) |
 | Client | `client.window_title.set`, `client.window_title.clear` |
 | Session | `session.snapshot` |
 | Workspace | `workspace.create`, `workspace.list`, `workspace.get`, `workspace.focus`, `workspace.rename`, `workspace.move`, `workspace.move_block`, `workspace.report_metadata`, `workspace.close` |

@@ -3000,6 +3000,120 @@
           ],
           "type": "object"
         },
+        "GuestAuditParams": {
+          "description": "`guest.audit`: activity log entries, newest first.",
+          "properties": {
+            "before_ms": {
+              "description": "Only entries strictly older than this timestamp.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "guest_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "limit": {
+              "description": "Maximum entries (1 to 500). Default: 100.",
+              "format": "uint",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "GuestInviteCreateParams": {
+          "description": "`guest.invite.create`: invite one named guest to one live local agent.\nWith `machine`, the coordinator routes the call to that saved SSH machine\nand `target` names the agent there.",
+          "properties": {
+            "machine": {
+              "description": "Saved SSH machine alias to route this call to.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_label": {
+              "type": "string"
+            },
+            "name": {
+              "description": "Guest name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`. Prompts arrive labeled\n`<name> (via HerdrUp): `.",
+              "type": "string"
+            },
+            "owner_name": {
+              "type": "string"
+            },
+            "target": {
+              "description": "Agent pane id or agent name. The agent must be named, running and have a\nstable harness session.",
+              "type": "string"
+            },
+            "ttl_secs": {
+              "description": "Invite lifetime in seconds (60 to 604800). Default: 86400.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "target",
+            "name",
+            "owner_name",
+            "machine_label"
+          ],
+          "type": "object"
+        },
+        "GuestListParams": {
+          "description": "`guest.list`: guests, invites and relay link state.",
+          "properties": {
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "GuestRevokeParams": {
+          "description": "`guest.revoke`: exactly one of `guest_id` or `invite_id`. Revoking a guest\ncloses its live sessions immediately.",
+          "properties": {
+            "guest_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "invite_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
         "IntegrationInstallParams": {
           "properties": {
             "target": {
@@ -6247,6 +6361,71 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/EmptyParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Owner only: invite one guest to one live agent. Never reachable by\nfederation peers or guests.",
+          "properties": {
+            "method": {
+              "const": "guest.invite.create",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestInviteCreateParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "guest.list",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestListParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "guest.revoke",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestRevokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "guest.audit",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestAuditParams"
             }
           },
           "required": [
@@ -10754,6 +10933,236 @@
             }
           ]
         },
+        "GuestAuditEntry": {
+          "description": "One `audit.jsonl` line.",
+          "properties": {
+            "event": {
+              "$ref": "#/schemas/success_response/$defs/GuestAuditEvent"
+            },
+            "file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/success_response/$defs/GuestAuditFile"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "fingerprint": {
+              "type": "string"
+            },
+            "guest_id": {
+              "type": "string"
+            },
+            "method": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "pane": {
+              "description": "Terminal id of the granted pane.",
+              "type": "string"
+            },
+            "text": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ts_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "ts_ms",
+            "guest_id",
+            "name",
+            "fingerprint",
+            "event",
+            "pane"
+          ],
+          "type": "object"
+        },
+        "GuestAuditEvent": {
+          "enum": [
+            "accepted",
+            "connected",
+            "prompt",
+            "upload",
+            "denied",
+            "paused",
+            "revoked"
+          ],
+          "type": "string"
+        },
+        "GuestAuditFile": {
+          "properties": {
+            "name": {
+              "type": "string"
+            },
+            "sha256": {
+              "type": "string"
+            },
+            "size": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "name",
+            "size",
+            "sha256"
+          ],
+          "type": "object"
+        },
+        "GuestGrantInfo": {
+          "description": "The one agent a guest may use. It lapses when the pane, name or harness\nsession changes.",
+          "properties": {
+            "agent_name": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session": {
+              "$ref": "#/schemas/success_response/$defs/AgentSessionInfo"
+            },
+            "terminal_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "terminal_id",
+            "agent_session"
+          ],
+          "type": "object"
+        },
+        "GuestInfo": {
+          "properties": {
+            "created_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "device": {
+              "type": "string"
+            },
+            "fingerprint": {
+              "description": "`SHA256:` plus the first 8 bytes of SHA-256(device key), for example\n`SHA256:9f3a·e71c·04bd·c21e`.",
+              "type": "string"
+            },
+            "grant": {
+              "$ref": "#/schemas/success_response/$defs/GuestGrantInfo"
+            },
+            "guest_id": {
+              "type": "string"
+            },
+            "last_seen_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "revoked": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "guest_id",
+            "name",
+            "fingerprint",
+            "device",
+            "grant",
+            "created_ms",
+            "revoked"
+          ],
+          "type": "object"
+        },
+        "GuestInviteInfo": {
+          "properties": {
+            "created_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "expires_ms": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "grant": {
+              "$ref": "#/schemas/success_response/$defs/GuestGrantInfo"
+            },
+            "invite_id": {
+              "type": "string"
+            },
+            "machine_label": {
+              "type": "string"
+            },
+            "name": {
+              "type": "string"
+            },
+            "owner_name": {
+              "type": "string"
+            },
+            "used_by": {
+              "description": "Guest id that accepted this invite, once used.",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "invite_id",
+            "name",
+            "grant",
+            "owner_name",
+            "machine_label",
+            "created_ms",
+            "expires_ms"
+          ],
+          "type": "object"
+        },
+        "GuestLinkInfo": {
+          "properties": {
+            "last_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "state": {
+              "$ref": "#/schemas/success_response/$defs/GuestLinkState"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "GuestLinkState": {
+          "enum": [
+            "off",
+            "connecting",
+            "up",
+            "retrying"
+          ],
+          "type": "string"
+        },
         "InputPromptKind": {
           "description": "Best-effort classification of a live agent-owned input prompt.",
           "enum": [
@@ -13817,6 +14226,112 @@
                 "type",
                 "shown",
                 "reason"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "A new guest invite. The secret exists only inside the two links.",
+              "properties": {
+                "invite": {
+                  "$ref": "#/schemas/success_response/$defs/GuestInviteInfo"
+                },
+                "type": {
+                  "const": "guest_invite_created",
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string"
+                },
+                "web_url": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "invite",
+                "url",
+                "web_url"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "Guests, invites and relay link state. Never includes secrets or keys.",
+              "properties": {
+                "guests": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/GuestInfo"
+                  },
+                  "type": "array"
+                },
+                "invites": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/GuestInviteInfo"
+                  },
+                  "type": "array"
+                },
+                "link": {
+                  "$ref": "#/schemas/success_response/$defs/GuestLinkInfo"
+                },
+                "type": {
+                  "const": "guest_list",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "guests",
+                "invites",
+                "link"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "closed_streams": {
+                  "description": "Live guest streams closed by this revoke.",
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "guest_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "invite_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "guest_revoked",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "closed_streams"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "entries": {
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/GuestAuditEntry"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "guest_audit",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "entries"
               ],
               "type": "object"
             },

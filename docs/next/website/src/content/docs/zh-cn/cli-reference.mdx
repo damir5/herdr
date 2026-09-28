@@ -155,6 +155,19 @@ herdr gram relay-status [--json]                # 中继授权、来源、错误
 
 `send --file` 附加一个文件(说明文字可选),并分块上传以适应请求大小上限;`get-file` 用于下载。`delete` 会彻底删除消息及其附件字节——适合只发送一次随后即弃的短期机密(例如临时 API 密钥)。你可以删除自己发送的、认领的或发给你的消息;`--owner` 可删除任意消息。
 
+## 访客访问
+
+将一个已命名且正在运行的智能体共享给一位外部人员,对方无需 SSH 访问、无需开放端口,即可通过 HerdrUp 应用使用它。访客的应用经由 HerdrUp 访客中继(`[guest] relay_url`)连接到本机,连接使用 Noise IK 端到端加密,中继只转发密文。仅支持 Unix。
+
+```bash
+herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS]
+herdr guest list                                  # 访客、邀请及中继连接状态(不含机密或密钥)
+herdr guest revoke <guest-or-invite-id>           # 立即关闭该访客的实时会话
+herdr guest log [<guest-id>] [--limit N]          # 活动记录,最新在前
+```
+
+每个命令都可用 `--machine ALIAS` 在该已保存的 SSH 机器上运行。智能体必须有名称和稳定的 harness 会话。邀请只能使用一次,默认 24 小时后过期,并绑定到一个访客名称和该智能体。访客可以向智能体发送提示(带 `<name> (via HerdrUp): ` 标签)、附加文件并查看其终端,但不能在终端中输入、调整终端大小或访问其他窗格。当智能体不是窗格的前台进程时,访问会暂停。活动记录写入配置目录下的 `guest/audit.jsonl`,不会以通知形式发送。
+
 ## 会话
 
 ```bash

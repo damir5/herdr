@@ -158,6 +158,19 @@ An agent's identity comes from `HERDR_PANE_ID` and resolves to its agent name (o
 
 `send --file` attaches a file (with optional caption text), uploaded in chunks so it fits the request-size limits; `get-file` downloads one. `delete` removes a message and any attached bytes for good — useful for a short-lived secret you send once and then discard. You can delete a message you sent, grabbed, or that is addressed to you; `--owner` deletes any message.
 
+## Guest access
+
+Share one named, running agent with one outside person, who uses it from the HerdrUp app with no SSH access and no open ports. The guest's app reaches this machine through the HerdrUp guest relay (`[guest] relay_url`), and the connection is end-to-end encrypted with Noise IK, so the relay only forwards ciphertext. Unix only.
+
+```bash
+herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS]
+herdr guest list                                  # guests, invites and relay link state (no secrets or keys)
+herdr guest revoke <guest-or-invite-id>           # closes the guest's live sessions immediately
+herdr guest log [<guest-id>] [--limit N]          # activity, newest first
+```
+
+Every command accepts `--machine ALIAS` to run on that saved SSH machine. The agent must have a name and a stable harness session. An invite works once, expires after 24 hours by default, and is bound to one guest name and that agent. The guest can prompt the agent, labeled `<name> (via HerdrUp): `, attach files to it, and watch its terminal. The guest cannot type into the terminal, resize it, or reach any other pane. Access pauses while the agent is not the pane's foreground process. Activity is written to `guest/audit.jsonl` in the config directory, not sent as notifications.
+
 ## Sessions
 
 ```bash

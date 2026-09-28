@@ -118,10 +118,6 @@ pub struct ServerHandle {
     path: PathBuf,
     identity: SocketFileIdentity,
     running: Arc<AtomicBool>,
-    /// The guest relay link, whose guests this server serves. Daemon servers
-    /// only; dropping it closes the relay socket and its guest sessions.
-    #[cfg(unix)]
-    _guest_link: Option<crate::guest::link::GuestLink>,
 }
 
 impl Drop for ServerHandle {
@@ -174,21 +170,14 @@ pub(crate) fn start_server_with_stop_control(
     // decides which saved peers get a reverse gateway.
     crate::api::gram_relay::apply_config(&config.gram_relay);
     let federation = &config.federation;
-    #[cfg_attr(not(unix), allow(unused_mut))]
-    let mut server = start_server_inner(
+    start_server_inner(
         api_tx,
         event_hub,
         default_capabilities(),
         Some(server_stop),
         federation,
         federation_store,
-    )?;
-    // After the guest API context is installed, which guest sessions run on.
-    #[cfg(unix)]
-    {
-        server._guest_link = crate::guest::link::GuestLink::start_for_daemon();
-    }
-    Ok(server)
+    )
 }
 
 pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
@@ -316,8 +305,6 @@ fn start_server_inner(
         path,
         identity,
         running,
-        #[cfg(unix)]
-        _guest_link: None,
     })
 }
 

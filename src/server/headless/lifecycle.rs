@@ -21,8 +21,34 @@ pub(super) fn wait_for_live_handoff_response_write(
 }
 
 impl HeadlessServer {
+    /// Starts the guest relay link once this process owns the panes.
+    #[cfg(unix)]
+    pub(super) fn start_guest_link(&mut self) {
+        if self.guest_link.is_none() {
+            self.guest_link = crate::guest::link::GuestLink::start_for_daemon();
+        }
+    }
+
+    /// Hands the panes to a replacement server. The replacement starts its
+    /// guest link only after the handoff commits, so this one stops first:
+    /// dropping it returns once its relay socket is closed, so the two never
+    /// hold the relay's host slot at once. A failed handoff has already reaped
+    /// the replacement, so the link restarts here.
     #[cfg(unix)]
     pub(super) fn perform_live_handoff(
+        &mut self,
+        params: crate::api::schema::ServerLiveHandoffParams,
+    ) -> io::Result<()> {
+        drop(self.guest_link.take());
+        let result = self.export_live_handoff(params);
+        if result.is_err() {
+            self.start_guest_link();
+        }
+        result
+    }
+
+    #[cfg(unix)]
+    fn export_live_handoff(
         &mut self,
         params: crate::api::schema::ServerLiveHandoffParams,
     ) -> io::Result<()> {

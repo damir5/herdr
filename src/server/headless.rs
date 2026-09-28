@@ -248,6 +248,10 @@ pub struct HeadlessServer {
     /// Imported panes get one app-safe resize nudge after the first client attaches.
     #[cfg(unix)]
     pending_handoff_repaint_nudge: bool,
+    /// The guest relay link. Runs only while this process owns the panes: a
+    /// live handoff stops it before the replacement starts its own.
+    #[cfg(unix)]
+    guest_link: Option<crate::guest::link::GuestLink>,
     /// Flag set by Ctrl+C or `server stop` signal.
     should_quit: Arc<AtomicBool>,
     /// Channel for receiving server events from client connection threads.
@@ -376,6 +380,8 @@ impl HeadlessServer {
             handoff_in_progress: false,
             #[cfg(unix)]
             pending_handoff_repaint_nudge: false,
+            #[cfg(unix)]
+            guest_link: None,
             should_quit,
             server_event_rx,
             server_event_tx,

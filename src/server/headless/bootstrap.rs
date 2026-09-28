@@ -92,6 +92,8 @@ pub fn run_server() -> io::Result<()> {
             "herdr server started"
         );
         print_ready_message(&api::socket_path(), &client_socket_path());
+        #[cfg(unix)]
+        server.start_guest_link();
         server.app.run_plugin_startup_hooks();
 
         server.run().await
@@ -201,6 +203,8 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
         crate::server::handoff::report_ready(&mut received.stream)?;
         crate::server::handoff::wait_committed(&mut received.stream)?;
         server.app.assume_handoff_ownership();
+        // Only now: the old server stopped its link before handing off.
+        server.start_guest_link();
         server.app.unpause_handoff_readers();
         server.pending_handoff_repaint_nudge = true;
         if let Err(err) = crate::server::handoff::report_owned(&mut received.stream) {

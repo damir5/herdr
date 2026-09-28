@@ -132,6 +132,61 @@ fn serve_one(
     conn.write_all(b"\n")
 }
 
+const FORWARD_READY_WINDOW: Duration = Duration::from_secs(2);
+const FORWARD_READY_POLL: Duration = Duration::from_millis(100);
+
+/// Owns a starting `ssh -R` child and kills and reaps it on drop, so no early
+/// return during setup can leak a forward the supervisor would then duplicate.
+struct ChildGuard(Option<std::process::Child>);
+
+impl ChildGuard {
+    fn new(child: std::process::Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn child(&mut self) -> &mut std::process::Child {
+        self.0
+            .as_mut()
+            .expect("guarded child is present until released")
+    }
+
+    fn release(mut self) -> std::process::Child {
+        self.0.take().expect("guarded child is released once")
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+/// ExitOnForwardFailure makes a failed remote bind terminate SSH, so a forward
+/// that survives `window` is established. Every failure path (exit, cancel, or
+/// a `try_wait` error) drops the guard, which kills and reaps the child.
+fn await_forward_ready(
+    mut guard: ChildGuard,
+    window: Duration,
+    cancelled: impl Fn() -> bool,
+) -> io::Result<std::process::Child> {
+    let deadline = std::time::Instant::now() + window;
+    while std::time::Instant::now() < deadline {
+        std::thread::sleep(FORWARD_READY_POLL.min(window));
+        if cancelled() {
+            return Err(io::Error::other("Gram relay gateway start cancelled"));
+        }
+        if let Some(status) = guard.child().try_wait()? {
+            return Err(io::Error::other(format!(
+                "Gram relay SSH reverse bind failed: {status}"
+            )));
+        }
+    }
+    Ok(guard.release())
+}
+
 /// Production spawner: one [`ReverseGateway`] attempt per call.
 pub(crate) struct SshGramGatewaySpawner {
     tx: ApiRequestSender,
@@ -235,21 +290,11 @@ impl ReverseGateway {
                 &socket,
                 Arc::clone(&cancel),
             )?;
-            let mut child = command.spawn()?;
-            for _ in 0..20 {
-                std::thread::sleep(Duration::from_millis(100));
-                if cancel.load(Ordering::Acquire) || !running.load(Ordering::Acquire) {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(io::Error::other("Gram relay gateway start cancelled"));
-                }
-                if let Some(status) = child.try_wait()? {
-                    return Err(io::Error::other(format!(
-                        "Gram relay SSH reverse bind failed: {status}"
-                    )));
-                }
-            }
-            Ok(child)
+            await_forward_ready(
+                ChildGuard::new(command.spawn()?),
+                FORWARD_READY_WINDOW,
+                || cancel.load(Ordering::Acquire) || !running.load(Ordering::Acquire),
+            )
         })();
         let mut child = match child {
             Ok(child) => child,
@@ -347,5 +392,61 @@ impl Drop for ReverseGateway {
             let _ = listener.join();
         }
         let _ = crate::ipc::remove_socket_file_if_owned(&self.socket, &self.socket_identity);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+
+    fn sleeper() -> (ChildGuard, libc::pid_t) {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        (ChildGuard::new(child), pid)
+    }
+
+    /// True once the pid is gone entirely: killed AND reaped (no zombie).
+    fn reaped(pid: libc::pid_t) -> bool {
+        // SAFETY: signal 0 only checks for the process's existence.
+        let missing = unsafe { libc::kill(pid, 0) } == -1;
+        missing && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+
+    #[test]
+    fn dropping_the_guard_kills_and_reaps_the_forward() {
+        let (guard, pid) = sleeper();
+        assert!(!reaped(pid));
+        drop(guard);
+        assert!(reaped(pid));
+    }
+
+    #[test]
+    fn cancelled_readiness_kills_and_reaps_the_forward() {
+        let (guard, pid) = sleeper();
+        let error = await_forward_ready(guard, Duration::from_secs(5), || true).unwrap_err();
+        assert!(error.to_string().contains("cancelled"));
+        assert!(reaped(pid));
+    }
+
+    #[test]
+    fn surviving_the_window_hands_over_the_live_child() {
+        let (guard, pid) = sleeper();
+        let mut child = await_forward_ready(guard, Duration::from_millis(250), || false).unwrap();
+        assert!(!reaped(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    #[test]
+    fn an_exited_forward_reports_its_status() {
+        let child = Command::new("sh").args(["-c", "exit 255"]).spawn().unwrap();
+        let error = await_forward_ready(ChildGuard::new(child), Duration::from_secs(5), || false)
+            .unwrap_err();
+        assert!(error.to_string().contains("reverse bind failed"), "{error}");
     }
 }

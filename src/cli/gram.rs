@@ -33,11 +33,12 @@ pub(super) fn run_gram_command(args: &[String]) -> std::io::Result<i32> {
         "mark-read" => gram_mark_read(&args[1..]),
         "delete" => gram_delete(&args[1..]),
         "get-file" => gram_get_file(&args[1..]),
+        "relay-status" => gram_relay_status(&args[1..]),
         #[cfg(unix)]
         "relay-path" if args.len() == 2 => {
             println!(
                 "{}",
-                crate::api::reverse::reverse_socket_path(
+                crate::api::gram_relay::reverse_socket_path(
                     &args[1],
                     &crate::persist::machine::get_or_create(),
                 )
@@ -515,6 +516,85 @@ fn gram_mark_read(args: &[String]) -> std::io::Result<i32> {
     })?)
 }
 
+fn gram_relay_status(args: &[String]) -> std::io::Result<i32> {
+    let json = match args {
+        [] => false,
+        [flag] if flag == "--json" => true,
+        _ => {
+            eprintln!("usage: herdr gram relay-status [--json]");
+            return Ok(2);
+        }
+    };
+    let response = super::send_request(&Request {
+        id: "cli:gram:relay_status".into(),
+        method: Method::GramRelayStatus(crate::api::schema::EmptyParams {}),
+    })?;
+    if response.get("error").is_some() {
+        eprintln!("{}", serde_json::to_string(&response).unwrap_or_default());
+        return Ok(1);
+    }
+    let result = &response["result"];
+    if json {
+        let mut result = result.clone();
+        if let Some(object) = result.as_object_mut() {
+            object.remove("type");
+        }
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&result).map_err(std::io::Error::other)?
+        );
+        return Ok(0);
+    }
+    let text = |value: &serde_json::Value| match value {
+        serde_json::Value::Null => "-".to_string(),
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) if items.is_empty() => "[]".to_string(),
+        serde_json::Value::Array(items) => items
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .collect::<Vec<_>>()
+            .join(","),
+        other => other.to_string(),
+    };
+    let coordinator = &result["coordinator"];
+    println!("coordinator:");
+    for key in [
+        "configured",
+        "environment",
+        "effective",
+        "source",
+        "error",
+        "message",
+    ] {
+        println!("  {key}: {}", text(&coordinator[key]));
+    }
+    if let Some(peers) = coordinator["peers"].as_array() {
+        for peer in peers {
+            let state = serde_json::from_value::<crate::api::schema::GramGatewayState>(
+                peer["gateway"].clone(),
+            )
+            .map(|state| super::machine::gram_gateway_summary(&state))
+            .unwrap_or_else(|_| text(&peer["gateway"]));
+            println!("  peer {}: {state}", text(&peer["alias"]));
+        }
+    }
+    let remote = &result["remote"];
+    println!("remote:");
+    for key in [
+        "configured_coordinator_machine_id",
+        "configured_socket",
+        "environment",
+        "effective_socket",
+        "source",
+        "error",
+        "message",
+        "accepting",
+    ] {
+        println!("  {key}: {}", text(&remote[key]));
+    }
+    Ok(0)
+}
+
 fn gram_delete(args: &[String]) -> std::io::Result<i32> {
     let (id, owner) = match parse_delete_args(args) {
         Ok(parsed) => parsed,
@@ -983,6 +1063,7 @@ fn print_gram_help() {
     eprintln!("  herdr gram grab <id> [--as LABEL]        claim a shared queue item");
     eprintln!("  herdr gram get-file <id> -o PATH         download a message's attached file");
     eprintln!("  herdr gram relay-path <COORDINATOR_MACHINE_ID>   remote SSH socket path");
+    eprintln!("  herdr gram relay-status [--json]               effective relay consent and state");
     eprintln!("  herdr gram post <text> [--to AGENT]      owner: post to the queue or one agent");
     eprintln!("  herdr gram mark-read <id>                owner: mark an agent message read");
     eprintln!(
@@ -998,12 +1079,14 @@ fn print_gram_help() {
     eprintln!("print raw values. Threads are PER-AGENT: `list` only ever shows YOUR own thread,");
     eprintln!("so it cannot audit another agent's grams.");
     eprintln!();
+    eprintln!("Cross-machine files: in the owner daemon's config.toml set");
     eprintln!(
-        "Cross-machine files: owner daemon must set HERDR_GRAM_RELAY_PEERS=<saved-peer-alias>"
+        "[gram_relay] peers = [\"<saved-machine-profile-id>\"] for a pinned saved SSH machine;"
     );
-    eprintln!("and use a pinned saved SSH machine profile. Remote daemon must set");
-    eprintln!("HERDR_GRAM_REVERSE_SOCKET=$(herdr gram relay-path <coordinator-machine-id>)");
-    eprintln!("before startup. OpenSSH must allow StreamLocalForwarding and -R Unix sockets;");
+    eprintln!("in the remote daemon's config.toml set");
+    eprintln!("[gram_relay] coordinator_machine_id = \"<coordinator-machine-id>\"; then run");
+    eprintln!("`herdr server reload-config` on each and check `herdr gram relay-status`.");
+    eprintln!("OpenSSH must allow StreamLocalForwarding and -R Unix sockets;");
     eprintln!("remote-to-coordinator SSH keys are NOT copied or required. This is trusted-machine");
     eprintln!("access: another same-user process on the trusted peer can claim a pane ID.");
 }

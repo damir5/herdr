@@ -151,6 +151,7 @@ herdr gram get-file <id> -o PATH                # download a message's attached 
 herdr gram post "<text>" [--to AGENT]           # owner: shared queue, or one agent
 herdr gram mark-read <id>                        # owner: mark a message read
 herdr gram delete <id> [--owner]                # delete a message (and any file) for good
+herdr gram relay-status [--json]                # relay consent, source, errors, and gateway/socket state
 ```
 
 An agent's identity comes from `HERDR_PANE_ID` and resolves to its agent name (or the pane id if it has no name). The name is durable across a restart or deploy handoff, but it is a name: renaming, clearing, or reusing it changes which items show as "mine" in `gram list`. The grab itself is always first-wins atomic regardless of identity — two agents can never claim the same item. Attribution (`from`, and owner-posted messages) is advisory, not authenticated.

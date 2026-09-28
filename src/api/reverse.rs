@@ -26,30 +26,14 @@ use crate::api::ApiRequestSender;
 const MAX_LINE: usize = 1_100_000; // one 512-KiB chunk encoded as JSON/base64
 const RESPONSE_LIMIT: usize = 2_000_000;
 
-/// Operator consent: comma-separated peer routing aliases, set on the
-/// coordinator daemon *before* starting it. A saved profile alone never grants
-/// Gram access. Changing this requires restarting the daemon.
-pub(crate) fn allowed_alias(alias: &str) -> bool {
-    std::env::var("HERDR_GRAM_RELAY_PEERS")
-        .ok()
-        .is_some_and(|list| {
-            list.split(',')
-                .any(|name| !name.is_empty() && name.trim() == alias)
-        })
-}
-
-/// Stable remote socket name. The remote daemon must opt in with this path in
-/// HERDR_GRAM_REVERSE_SOCKET; SSH creates it with an owner-only bind mask.
-pub(crate) fn reverse_socket_path(coordinator_id: &str, remote_id: &str) -> PathBuf {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("herdr-gram:{coordinator_id}:{remote_id}"));
-    let suffix: String = digest[..12].iter().map(|b| format!("{b:02x}")).collect();
-    PathBuf::from("/tmp").join(format!("herdr-gram-{suffix}.sock"))
-}
-
 pub(crate) fn forward_local(request: &Request) -> Option<String> {
-    let path = std::env::var_os("HERDR_GRAM_REVERSE_SOCKET")?;
     let method = &request.method;
+    // Status is always answered by this daemon.
+    if matches!(method, Method::GramRelayStatus(_)) {
+        return None;
+    }
+    // Read per request so reload-config changes apply to the next call.
+    let path = crate::api::gram_relay::policy().remote_socket()?;
     if !matches!(
         method,
         Method::GramSend(_)
@@ -67,7 +51,7 @@ pub(crate) fn forward_local(request: &Request) -> Option<String> {
             .to_string()
         });
     }
-    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.into()));
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path));
     let reply =
         client.request_value_bounded(request, RESPONSE_LIMIT, Duration::from_secs(30), None);
     Some(match reply {
@@ -220,7 +204,8 @@ impl ReverseGateway {
             .strip_prefix("ssh://")
             .ok_or_else(|| io::Error::other("Gram reverse gateway requires an SSH peer"))?;
         let coordinator_id = crate::persist::machine::get_or_create();
-        let remote = reverse_socket_path(&coordinator_id, &spec.remote_machine_id);
+        let remote =
+            crate::api::gram_relay::reverse_socket_path(&coordinator_id, &spec.remote_machine_id);
         let socket = crate::platform::remote_bridge_endpoint_path(
             &format!(
                 "herdr-gram-gateway-{}-{}.sock",

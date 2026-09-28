@@ -9,6 +9,7 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "advanced",
     "experimental",
     "federation",
+    "gram_relay",
     "keys",
     "onboarding",
     "push",
@@ -393,6 +394,14 @@ fn load_live_config_from_str(content: &str) -> Result<LoadedConfig, Vec<String>>
         &mut diagnostics,
         &mut invalid_sections,
         |section| config.federation = section,
+    );
+    load_live_section(
+        table,
+        "gram_relay",
+        "gram relay config",
+        &mut diagnostics,
+        &mut invalid_sections,
+        |section| config.gram_relay = section,
     );
     load_live_section(
         table,

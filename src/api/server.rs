@@ -158,9 +158,13 @@ pub(crate) fn start_server_with_stop_control(
     api_tx: ApiRequestSender,
     event_hub: EventHub,
     server_stop: Arc<AtomicBool>,
-    federation: &FederationConfig,
+    config: &crate::config::Config,
     federation_store: Arc<Mutex<FederationStore>>,
 ) -> std::io::Result<ServerHandle> {
+    // Gram relay consent must be effective before the first peer reconcile
+    // decides which saved peers get a reverse gateway.
+    crate::api::gram_relay::apply_config(&config.gram_relay);
+    let federation = &config.federation;
     start_server_inner(
         api_tx,
         event_hub,
@@ -1888,6 +1892,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::GramGetFile(_) => "gram.get_file",
         Method::GramGetFileChunk(_) => "gram.get_file_chunk",
         Method::GramRelay(_) => "gram.relay",
+        Method::GramRelayStatus(_) => "gram.relay_status",
         Method::ClientWindowTitleSet(_) => "client.window_title.set",
         Method::ClientWindowTitleClear(_) => "client.window_title.clear",
         Method::ClientShellSurfaceSet(_) => "client_shell.surface.set",
@@ -3609,6 +3614,7 @@ mod federation_tests {
             ("gram.get_file", Denied),
             ("gram.get_file_chunk", Denied),
             ("gram.relay", Denied),
+            ("gram.relay_status", Denied),
             ("client.window_title.set", Denied),
             ("client.window_title.clear", Denied),
             ("client_shell.surface.set", Denied),

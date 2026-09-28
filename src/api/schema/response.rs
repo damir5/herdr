@@ -272,6 +272,11 @@ pub enum ResponseResult {
         shown: bool,
         reason: NotificationShowReason,
     },
+    /// Effective Gram relay policy for both roles. Never includes secrets.
+    GramRelayStatus {
+        coordinator: super::gram::GramRelayCoordinatorStatus,
+        remote: super::gram::GramRelayRemoteStatus,
+    },
     /// Remote push readiness. Counts only; never tokens, capabilities, or key material.
     NotificationsStatus {
         state: NotificationsStatusState,

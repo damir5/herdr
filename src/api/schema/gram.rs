@@ -259,3 +259,87 @@ pub struct GramMessageInfo {
     #[serde(default)]
     pub origin_id: String,
 }
+
+/// Where an effective Gram relay setting came from.
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum GramRelaySource {
+    /// Disabled: nothing configured, or a conflict.
+    #[default]
+    None,
+    /// `[gram_relay]` in config.toml (also when an equal legacy variable is set).
+    Config,
+    /// The deprecated legacy environment variable alone.
+    Environment,
+}
+
+/// Whether the role's legacy environment variable is set in the daemon process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GramRelayEnvironment {
+    Present,
+    Absent,
+}
+
+impl GramRelayEnvironment {
+    pub(crate) fn from_present(present: bool) -> Self {
+        if present {
+            Self::Present
+        } else {
+            Self::Absent
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GramRelayErrorCode {
+    /// Config and the legacy environment variable differ; the role is disabled.
+    Conflict,
+    /// The last reload's `[gram_relay]` section was refused; the previous
+    /// effective setting is kept.
+    InvalidConfig,
+}
+
+/// One consented saved peer and its supervised reverse gateway.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayPeerStatus {
+    pub alias: String,
+    pub gateway: super::GramGatewayState,
+}
+
+/// Coordinator role: which saved peers may relay Gram.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayCoordinatorStatus {
+    /// `gram_relay.peers` from config; `null` when unset.
+    pub configured: Option<Vec<String>>,
+    /// Legacy `HERDR_GRAM_RELAY_PEERS`.
+    pub environment: GramRelayEnvironment,
+    /// Peers actually allowed; `null` when disabled.
+    pub effective: Option<Vec<String>>,
+    pub source: GramRelaySource,
+    pub error: Option<GramRelayErrorCode>,
+    pub message: Option<String>,
+    /// Gateway state of every effective peer.
+    pub peers: Vec<GramRelayPeerStatus>,
+}
+
+/// Remote role: where local Gram calls are forwarded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayRemoteStatus {
+    /// `gram_relay.coordinator_machine_id` from config; `null` when unset.
+    pub configured_coordinator_machine_id: Option<String>,
+    /// Reverse socket derived from the configured coordinator and this install.
+    pub configured_socket: Option<String>,
+    /// Legacy `HERDR_GRAM_REVERSE_SOCKET`.
+    pub environment: GramRelayEnvironment,
+    /// Socket Gram calls go to; `null` when disabled.
+    pub effective_socket: Option<String>,
+    pub source: GramRelaySource,
+    pub error: Option<GramRelayErrorCode>,
+    pub message: Option<String>,
+    /// Whether the effective socket accepts a connection now; `null` when disabled.
+    pub accepting: Option<bool>,
+}

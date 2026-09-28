@@ -334,7 +334,7 @@ impl FederationPeerManager {
             GramGatewayHooks {
                 spawner: None,
                 clock: Arc::new(crate::api::gram_gateway::SystemClock),
-                consent: Arc::new(crate::api::reverse::allowed_alias),
+                consent: Arc::new(|alias: &str| crate::api::gram_relay::policy().allows(alias)),
             },
         )
     }
@@ -411,6 +411,23 @@ impl FederationPeerManager {
                 consent,
             },
         )
+    }
+
+    /// Gateway state for each consented peer; `off` when it has no live gateway.
+    pub(crate) fn gram_relay_peer_statuses(
+        &self,
+        aliases: &[String],
+    ) -> Vec<crate::api::schema::GramRelayPeerStatus> {
+        let mut states = self.gram_relay_states();
+        aliases
+            .iter()
+            .map(|alias| crate::api::schema::GramRelayPeerStatus {
+                alias: alias.clone(),
+                gateway: states
+                    .remove(alias)
+                    .unwrap_or(crate::api::schema::GramGatewayState::Off),
+            })
+            .collect()
     }
 
     /// Per-alias Gram reverse gateway state, snapshotted under the handle lock
@@ -1839,6 +1856,49 @@ mod tests {
             );
             manager.join_all();
             assert_eq!(spawner.live(), 0);
+        }
+
+        #[test]
+        fn relay_config_changes_start_and_tear_down_gateways_on_reconcile() {
+            let policy = Arc::new(crate::api::gram_relay::GramRelayPolicy::default());
+            let consent_policy = Arc::clone(&policy);
+            let spawner = FakeSpawner::scripted([]);
+            let clock = ManualClock::new();
+            let manager = FederationPeerManager::with_gram_hooks(
+                Arc::new(Mutex::new(FederationStore::default())),
+                Arc::new(AtomicBool::new(true)),
+                Arc::clone(&spawner) as Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>,
+                Arc::clone(&clock) as Arc<dyn crate::api::gram_gateway::GatewayClock>,
+                Arc::new(move |alias: &str| consent_policy.allows(alias)),
+            );
+            let apply = |peers: &[&str]| {
+                policy.apply(
+                    &crate::config::GramRelayConfig {
+                        peers: peers.iter().map(|peer| (*peer).to_owned()).collect(),
+                        coordinator_machine_id: None,
+                    },
+                    &crate::api::gram_relay::RelayEnvironment::default(),
+                    || unreachable!("no coordinator pin configured"),
+                );
+            };
+
+            manager.reconcile(&[pinned_peer()]);
+            assert_eq!(state(&manager), None, "default config grants no gateway");
+            assert_eq!(spawner.calls(), 0);
+
+            apply(&[ALIAS]);
+            manager.reconcile(&[pinned_peer()]);
+            wait_until("gateway up", || {
+                state(&manager) == Some(GramGatewayState::Up)
+            });
+            let bridge = transport(&manager);
+
+            apply(&[]);
+            manager.reconcile(&[pinned_peer()]);
+            assert_eq!(state(&manager), None);
+            assert_eq!(spawner.live(), 0, "revoked gateway is torn down");
+            assert_eq!(transport(&manager), bridge, "peer bridge untouched");
+            manager.join_all();
         }
 
         #[test]

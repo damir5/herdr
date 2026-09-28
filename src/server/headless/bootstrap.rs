@@ -39,7 +39,7 @@ pub fn run_server() -> io::Result<()> {
         api_tx.clone(),
         event_hub.clone(),
         should_quit.clone(),
-        &loaded_config.config.federation,
+        &loaded_config.config,
         federation_store.clone(),
     ) {
         Ok(server) => server,
@@ -183,7 +183,7 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             api_tx.clone(),
             event_hub.clone(),
             should_quit.clone(),
-            &loaded_config.config.federation,
+            &loaded_config.config,
             federation_store.clone(),
         )?;
         app.set_federation_store(federation_store);

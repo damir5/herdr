@@ -1089,6 +1089,18 @@ impl App {
         // (tests, no-federation path) makes this a no-op; `reconcile` with an
         // empty peer list is a clean full teardown. The inbound listener is bound
         // at boot and is intentionally NOT touched here.
+        // Gram relay consent first, so this reconcile starts gateways for newly
+        // allowed peers and tears down gateways of revoked ones. A refused
+        // section keeps the previous effective consent.
+        if invalid_section("gram_relay") {
+            let message = diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.starts_with("invalid gram relay config"))
+                .map_or("invalid gram relay config", String::as_str);
+            crate::api::gram_relay::policy().reject(message);
+        } else {
+            crate::api::gram_relay::apply_config(&config.gram_relay);
+        }
         if let Some(manager) = &self.federation_manager {
             manager.reconcile_config(&config.federation);
         }

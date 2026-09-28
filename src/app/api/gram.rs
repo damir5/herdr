@@ -77,6 +77,20 @@ enum DeleteOutcome {
     Forbidden,
 }
 
+/// Whether a Unix socket accepts a connection right now. The probe closes
+/// without sending a request.
+fn socket_accepts(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::net::UnixStream::connect(path).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
 impl App {
     /// Resolve a peer's claimed pane only within that peer's pinned roster.
     /// Same-user processes on the trusted peer can claim another pane ID; this
@@ -101,13 +115,30 @@ impl App {
             .map(|agent| agent.name.unwrap_or(qualified))
     }
 
+    /// Effective relay policy for both roles plus live gateway and socket state.
+    pub(super) fn handle_gram_relay_status(&self, id: String) -> String {
+        let policy = crate::api::gram_relay::policy();
+        let peers = self
+            .federation_manager
+            .as_ref()
+            .map(|manager| manager.gram_relay_peer_statuses(&policy.allowed_peers()))
+            .unwrap_or_default();
+        encode_success(
+            id,
+            crate::api::schema::ResponseResult::GramRelayStatus {
+                coordinator: policy.coordinator_status(peers),
+                remote: policy.remote_status(socket_accepts),
+            },
+        )
+    }
+
     #[cfg(unix)]
     pub(super) fn handle_gram_relay(&mut self, id: String, params: GramRelayParams) -> String {
         if self.no_session {
             return gram_unavailable(id);
         }
         let alias = params.peer_alias;
-        if !crate::api::reverse::allowed_alias(&alias) {
+        if !crate::api::gram_relay::policy().allows(&alias) {
             return encode_error(id, "forbidden", "Gram relay is disabled for this peer");
         }
         match params.call {
@@ -880,10 +911,9 @@ impl App {
                                         == Some(
                                             crate::api::federation_store::Reachability::Reachable,
                                         )
-                                    && agent
-                                        .machine_id
-                                        .as_deref()
-                                        .is_some_and(crate::api::reverse::allowed_alias)
+                                    && agent.machine_id.as_deref().is_some_and(|alias| {
+                                        crate::api::gram_relay::policy().allows(alias)
+                                    })
                             })
                 }
                 #[cfg(not(unix))]
@@ -2015,5 +2045,150 @@ mod tests {
             )
         });
         assert_eq!(answer["error"]["code"], "invalid_params");
+    }
+
+    #[cfg(unix)]
+    mod relay_reload {
+        use super::*;
+
+        const PEER: &str = "8195b6326f748f4da1945364a4e205b9";
+        const COORDINATOR: &str = "machine_f872cca4c7743d39c1fad1fa5a74a087";
+
+        fn app_with_config_file() -> (App, std::path::PathBuf) {
+            let tmp = std::env::temp_dir().join(format!(
+                "herdr-gram-relay-reload-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&tmp).unwrap();
+            std::env::set_var("XDG_CONFIG_HOME", &tmp);
+            std::env::remove_var(crate::api::gram_relay::PEERS_ENV);
+            std::env::remove_var(crate::api::gram_relay::SOCKET_ENV);
+            let path = tmp.join("config.toml");
+            std::env::set_var(crate::config::CONFIG_PATH_ENV_VAR, &path);
+            let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+            let app = App::new(
+                &crate::config::Config::default(),
+                crate::app::AppPolicy::TEST,
+                None,
+                api_rx,
+                crate::api::EventHub::default(),
+            );
+            (app, path)
+        }
+
+        fn reload(
+            app: &mut App,
+            path: &std::path::Path,
+            toml: &str,
+        ) -> crate::config::ConfigReloadStatus {
+            std::fs::write(path, toml).unwrap();
+            app.apply_config_from_disk(false).status
+        }
+
+        fn relay_list(app: &mut App) -> serde_json::Value {
+            serde_json::from_str(&app.handle_gram_relay(
+                "relay".into(),
+                GramRelayParams {
+                    peer_alias: PEER.into(),
+                    call: GramRelayCall::List(GramListParams {
+                        caller_pane_id: None,
+                        only_queue: false,
+                        unread_only: false,
+                        if_unchanged_digest: None,
+                        limit: None,
+                        before_id: None,
+                    }),
+                },
+            ))
+            .unwrap()
+        }
+
+        fn status(app: &App) -> serde_json::Value {
+            serde_json::from_str::<serde_json::Value>(&app.handle_gram_relay_status("s".into()))
+                .unwrap()["result"]
+                .clone()
+        }
+
+        #[test]
+        fn reload_grants_then_revokes_a_peer_without_restart() {
+            let (mut app, path) = app_with_config_file();
+            assert_eq!(relay_list(&mut app)["error"]["code"], "forbidden");
+
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\npeers = [\"{PEER}\"]\n"),
+            );
+            let granted = relay_list(&mut app);
+            assert_ne!(granted["error"]["code"], "forbidden", "{granted}");
+            assert_eq!(status(&app)["coordinator"]["source"], "config");
+            assert_eq!(
+                status(&app)["coordinator"]["effective"],
+                serde_json::json!([PEER])
+            );
+
+            reload(&mut app, &path, "");
+            assert_eq!(relay_list(&mut app)["error"]["code"], "forbidden");
+            assert_eq!(
+                status(&app)["coordinator"]["effective"],
+                serde_json::Value::Null
+            );
+        }
+
+        #[test]
+        fn invalid_reload_keeps_the_previous_effective_setting() {
+            let (mut app, path) = app_with_config_file();
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\npeers = [\"{PEER}\"]\ncoordinator_machine_id = \"{COORDINATOR}\"\n"),
+            );
+            let before = status(&app)["remote"]["effective_socket"].clone();
+            assert!(before.is_string());
+
+            let outcome = reload(
+                &mut app,
+                &path,
+                "[gram_relay]\npeers = []\ncoordinator_machine_id = \"not-a-machine\"\n",
+            );
+            assert_eq!(outcome, crate::config::ConfigReloadStatus::Partial);
+            assert_ne!(relay_list(&mut app)["error"]["code"], "forbidden");
+            let after = status(&app);
+            assert_eq!(after["remote"]["effective_socket"], before);
+            assert_eq!(after["remote"]["error"], "invalid_config");
+            assert_eq!(after["coordinator"]["error"], "invalid_config");
+            assert!(after["remote"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("coordinator_machine_id"));
+        }
+
+        #[test]
+        fn remote_socket_follows_reload() {
+            let (mut app, path) = app_with_config_file();
+            let own = crate::persist::machine::get_or_create();
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\ncoordinator_machine_id = \"{COORDINATOR}\"\n"),
+            );
+            let expected = crate::api::gram_relay::reverse_socket_path(COORDINATOR, &own);
+            assert_eq!(
+                crate::api::gram_relay::policy().remote_socket(),
+                Some(expected.clone())
+            );
+            let remote = status(&app)["remote"].clone();
+            assert_eq!(remote["effective_socket"], expected.display().to_string());
+            assert_eq!(remote["environment"], "absent");
+            assert_eq!(remote["accepting"], false);
+
+            reload(&mut app, &path, "");
+            assert_eq!(crate::api::gram_relay::policy().remote_socket(), None);
+            assert_eq!(status(&app)["remote"]["accepting"], serde_json::Value::Null);
+        }
     }
 }

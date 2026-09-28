@@ -108,6 +108,9 @@ pub enum Method {
     /// Internal only: the restricted reverse SSH gateway inserts the machine alias.
     #[serde(rename = "gram.relay")]
     GramRelay(GramRelayParams),
+    /// Effective Gram relay consent, its source and errors, and gateway state. Local only.
+    #[serde(rename = "gram.relay_status")]
+    GramRelayStatus(EmptyParams),
     #[serde(rename = "client.window_title.set")]
     ClientWindowTitleSet(ClientWindowTitleSetParams),
     #[serde(rename = "client.window_title.clear")]

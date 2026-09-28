@@ -329,6 +329,7 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub push: PushConfig,
     pub federation: FederationConfig,
+    pub gram_relay: GramRelayConfig,
     pub accounts: Vec<AccountConfig>,
 }
 
@@ -1321,6 +1322,64 @@ pub enum CapabilityTier {
     Interact,
     /// Interact plus focus, rename, and input/authority mutations.
     Admin,
+}
+
+/// Durable, default-off consent for the machine-scoped Gram file relay.
+///
+/// Independent of `[federation]` reverse agent access and per-agent grants.
+/// Same-user processes on a trusted machine can impersonate that machine's
+/// panes; this is not per-process isolation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct GramRelayConfig {
+    /// Coordinator: saved-machine profile ids whose pinned SSH peer may relay
+    /// Gram through a restricted reverse gateway. Empty grants nothing.
+    #[serde(deserialize_with = "deserialize_gram_relay_peers")]
+    pub peers: Vec<String>,
+    /// Remote: install id of the trusted coordinator. The reverse socket path is
+    /// derived from it and this daemon's own install id. Unset grants nothing.
+    #[serde(deserialize_with = "deserialize_gram_relay_coordinator")]
+    pub coordinator_machine_id: Option<String>,
+}
+
+fn deserialize_gram_relay_peers<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let peers = Vec::<String>::deserialize(deserializer)?;
+    for peer in &peers {
+        crate::client::endpoint::ProfileId::parse(peer.clone()).map_err(|_| {
+            de::Error::custom(format!(
+                "gram_relay.peers entry {peer:?} must be a saved-machine profile id (32 lowercase hex characters)"
+            ))
+        })?;
+    }
+    Ok(peers)
+}
+
+fn deserialize_gram_relay_coordinator<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let machine_id = Option::<String>::deserialize(deserializer)?;
+    if let Some(machine_id) = &machine_id {
+        if !is_install_machine_id(machine_id) {
+            return Err(de::Error::custom(
+                "gram_relay.coordinator_machine_id must be \"machine_\" followed by 32 lowercase hex characters",
+            ));
+        }
+    }
+    Ok(machine_id)
+}
+
+/// Shape of a persisted Herdr install identity (`persist::machine`).
+pub(crate) fn is_install_machine_id(machine_id: &str) -> bool {
+    machine_id.strip_prefix("machine_").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Peer-to-peer federation between Herdr daemons.

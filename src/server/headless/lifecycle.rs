@@ -244,7 +244,7 @@ impl HeadlessServer {
             api_tx,
             self.app.event_hub.clone(),
             self.should_quit.clone(),
-            &loaded_config.config.federation,
+            &loaded_config.config,
             self.app.federation.clone(),
         )?;
 

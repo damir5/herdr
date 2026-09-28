@@ -207,7 +207,27 @@ TCP 联邦令牌只授予对应对等方的能力级别，不会授予更多权�
 
 Gram 仍保存在协调端的规范存储中。已保存且固定了身份的 SSH 对等方可以通过另一个默认关闭的反向 Unix socket，在远端执行 `gram send --file`、列出文件、下载文件和删除文件。所有者通过带机器限定名称的代理名向远端代理发送消息（`herdr gram post "message" --to <profile-id>/<agent>`）。这**不会**将 `gram.*` 添加到普通 TCP 联邦的允许列表，也不会转发协调端不受限制的本地 API。
 
-启动**协调端守护进程**前，在其环境中设置 `HERDR_GRAM_RELAY_PEERS=<profile-id>`（多个明确受信任的配置档案 ID 以逗号分隔）。从 Herdr 配置目录下的 `machine.json` 读取协调端安装 ID。启动**远端守护进程**前，将其 `HERDR_GRAM_REVERSE_SOCKET` 设置为 `herdr gram relay-path <coordinator-install-id>` 的输出。两端都需要更新后的二进制文件；协调端已保存的 SSH 配置档案必须已固定远端安装 ID。OpenSSH 必须允许反向 stream-local 转发。不会将任何私有 SSH 密钥复制到远端机器。
+中继授权是持久化的 Herdr 配置，默认关闭。两端都需要更新后的二进制；协调端的已保存 SSH 配置档必须已固定远程机器的安装 ID（`herdr machine federate`）。OpenSSH 必须允许反向 stream-local 转发。不会把任何 SSH 私钥复制到远程机器。
+
+**协调端**（`config.toml`）：用 `herdr machine list` 显示的配置档 ID 允许一台已保存机器。
+
+```toml
+[gram_relay]
+peers = ["8195b6326f748f4da1945364a4e205b9"]
+```
+
+**远程机器**（`config.toml`）：信任协调端的安装 ID，该 ID 可从协调端 Herdr 配置目录下的 `machine.json` 读取。反向套接字路径由该 ID 与远程机器自身的安装 ID 推导得出（`herdr gram relay-path <coordinator-install-id>` 会打印它）。
+
+```toml
+[gram_relay]
+coordinator_machine_id = "machine_f872cca4c7743d39c1fad1fa5a74a087"
+```
+
+两端都可用 `herdr server reload-config` 应用，无需重启守护进程，窗格和其他联邦路由保持不变。协调端会为新允许的对端启动反向网关，并带退避地重试直到成功。用 `herdr gram relay-status`（脚本可加 `--json`）检查各端：显示配置值、旧环境变量是否存在、生效值及其 `source`（`config`、`environment` 或 `none`）、`error`，协调端还显示每个允许对端的网关状态，远程端显示套接字路径以及当前是否接受连接。无效的 `[gram_relay]` 段（例如格式错误的安装 ID）在重新加载时会被拒绝：之前的生效设置保持不变，状态报告 `invalid_config`。启动时若配置文件无法解析，则回退到默认值，不授予任何访问。
+
+回滚时，删除 `[gram_relay]` 中的键（或整个段）并运行 `herdr server reload-config`。协调端会拆除该对端的网关、关闭其反向套接字，并拒绝该对端之后的中继请求；远程端的 Gram 回到本地存储。
+
+环境变量 `HERDR_GRAM_RELAY_PEERS` 和 `HERDR_GRAM_REVERSE_SOCKET` 已弃用。只设置了变量的守护进程仍会遵循它（`source` 为 `environment`，并在日志和状态中给出弃用警告）。配置与变量都已设置且相同时，以配置为准（`source` 为 `config`）。两者不同时，该端的中继会以 `error: conflict` 被禁用，直到两者一致或在没有该变量的情况下启动守护进程；Herdr 绝不会通过合并两者来扩大访问范围。
 
 反向 socket 仅供远端账户私用，并随已保存的 SSH 会话重新连接。断开连接期间，远端 Gram 操作会失败，而不会悄悄写入另一个本地存储。`gram post` 和 `gram grab` 等仅供协调端使用的方法在远端也会明确失败；请在协调端运行它们。文件先按现有大小限制暂存，只有长度和 SHA-256 均匹配后才提交到协调端；下载也会验证两者，然后以原子方式替换目标文件。默认的疑似凭据下载警告会扫描每个数据块；`--reveal` 是显式覆盖选项。已删除的源附件无法下载；上传中断只会留下有大小上限的暂存数据，并在过期后清理。
 

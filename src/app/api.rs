@@ -1545,6 +1545,7 @@ impl App {
             Method::GramGetFileChunk(params) => {
                 return self.handle_gram_get_file_chunk(request.id, params);
             }
+            Method::GramRelayStatus(_) => return self.handle_gram_relay_status(request.id),
             Method::GramRelay(params) => {
                 #[cfg(unix)]
                 {

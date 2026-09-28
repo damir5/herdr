@@ -834,54 +834,74 @@ fn shrink_receive_buffer(listener: &TcpListener) {
     assert_eq!(result, 0, "setsockopt SO_RCVBUF");
 }
 
+/// Sends OPENs for fresh session ids, 1000 per flush, until `stop` is set or
+/// the link goes away.
+fn flood_opens(relay: &mut HostSocket, next: &mut u32, total: Option<u32>, stop: &AtomicBool) {
+    let end = total.map(|total| *next + total);
+    while !stop.load(Ordering::Relaxed) && end.is_none_or(|end| *next < end) {
+        for _ in 0..1000 {
+            let open = Message::Binary(frame::open(*next).into());
+            if relay.ws.write(open).is_err() {
+                return;
+            }
+            *next += 1;
+        }
+        if relay.ws.flush().is_err() {
+            return;
+        }
+    }
+}
+
 #[test]
 fn a_flood_of_opens_stays_bounded_and_the_link_still_stops() {
     let stub = StubRelay::new();
     shrink_receive_buffer(&stub.listener);
     let (link, host, _served) = start(&stub, timing());
-    let relay = stub.accept();
+    let mut relay = stub.accept();
     host.wait_status(|(state, _)| *state == LinkState::Up);
 
-    // The relay floods OPENs far past the session cap and never reads, so
-    // the host's CLOSE replies can only go as far as the socket takes them.
-    let sent = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let stop = Arc::new(AtomicBool::new(false));
-    let flood = {
-        let (sent, stop) = (Arc::clone(&sent), Arc::clone(&stop));
-        let mut relay = relay;
-        std::thread::spawn(move || {
-            let mut session = 1_u32;
-            while !stop.load(Ordering::Relaxed) {
-                for _ in 0..1000 {
-                    let open = Message::Binary(frame::open(session).into());
-                    if relay.ws.write(open).is_err() {
-                        return;
-                    }
-                    session += 1;
-                }
-                if relay.ws.flush().is_err() {
-                    return;
-                }
-                sent.fetch_add(1000, Ordering::Relaxed);
-            }
-        })
-    };
+    // The relay floods OPENs far past the session cap and never reads, so the
+    // host's CLOSE replies can go only as far as the socket takes them.
+    let mut next = 1;
+    flood_opens(
+        &mut relay,
+        &mut next,
+        Some(200_000),
+        &AtomicBool::new(false),
+    );
+    // Session 1's hello comes after the flood, so its admission shows the
+    // link has handled every OPEN.
+    let mut init = initiator(&DEVICE_SECRET, &public_key(&NODE_SECRET), HOST_ID, None);
+    let mut message1 = vec![0; MAX_MESSAGE];
+    let len = init.write_message(b"{\"v\":1}", &mut message1).unwrap();
+    relay.send(frame::data(1, &message1[..len]));
     let deadline = Instant::now() + WAIT;
-    while sent.load(Ordering::Relaxed) < 100_000 {
-        assert!(Instant::now() < deadline, "the link stopped reading OPENs");
+    while host.hellos.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the link stopped reading");
         std::thread::sleep(Duration::from_millis(10));
     }
-
-    // Writes respect the bounded buffers: the link never hit its hard cap.
+    // Replies waited for the socket instead of piling up: the link never hit
+    // its write-buffer cap, which would have dropped the connection.
     assert_eq!(host.last_status(), Some((LinkState::Up, None)));
-    let stopping = Instant::now();
-    drop(link);
-    assert!(
-        stopping.elapsed() < Duration::from_secs(2),
-        "stopping took {:?} while the relay kept sending",
-        stopping.elapsed()
-    );
+
+    // Stopping still wins while the relay keeps sending.
+    let stop = Arc::new(AtomicBool::new(false));
+    let flood = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || flood_opens(&mut relay, &mut next, None, &stop))
+    };
+    std::thread::sleep(Duration::from_millis(200));
+    let (stopped, stopping) = mpsc::channel();
+    std::thread::spawn(move || {
+        drop(link);
+        let _ = stopped.send(());
+    });
+    let waited = stopping.recv_timeout(Duration::from_secs(2));
     stop.store(true, Ordering::Relaxed);
+    assert!(
+        waited.is_ok(),
+        "the link did not stop while the relay kept sending"
+    );
     flood.join().unwrap();
 }
 

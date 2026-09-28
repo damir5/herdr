@@ -174,12 +174,36 @@ fn names_grant(target: &str, guest: &GuestPrincipal, agent: Option<&AgentInfo>) 
         || agent.is_some_and(|agent| agent.pane_id == target)
 }
 
-fn with_running(agent: AgentInfo, running: bool) -> serde_json::Value {
-    let mut value = serde_json::to_value(agent).unwrap_or_default();
-    if let Some(object) = value.as_object_mut() {
-        object.insert("guest_running".into(), running.into());
-    }
-    value
+/// The only agent fields a guest sees. Titles, cwd, ids of other scopes,
+/// session references, tokens and account details stay with the owner.
+#[derive(serde::Serialize)]
+struct GuestAgentView<'a> {
+    terminal_id: &'a str,
+    pane_id: &'a str,
+    name: Option<&'a str>,
+    agent: Option<&'a str>,
+    display_agent: Option<&'a str>,
+    agent_status: &'a crate::api::schema::AgentStatus,
+    guest_running: bool,
+}
+
+fn guest_view(agent: &AgentInfo, running: bool) -> serde_json::Value {
+    serde_json::to_value(GuestAgentView {
+        terminal_id: &agent.terminal_id,
+        pane_id: &agent.pane_id,
+        name: agent.name.as_deref(),
+        agent: agent.agent.as_deref(),
+        display_agent: agent.display_agent.as_deref(),
+        agent_status: &agent.agent_status,
+        guest_running: running,
+    })
+    .unwrap_or_default()
+}
+
+/// Revoked in this process (live registry) or in the store, which another
+/// daemon sharing it may have written.
+fn is_revoked(guest: &GuestPrincipal, live: &crate::guest::LiveSession) -> bool {
+    live.revoked() || crate::guest::store::is_revoked(&guest.dir, &guest.guest_id)
 }
 
 fn guest_error(id: &str, code: &str) -> String {
@@ -206,7 +230,7 @@ pub(super) fn serve_request(
     let id = request.id.clone();
     let method = crate::api::api_method_name(&request.method);
     let live = crate::guest::register_live(&guest.guest_id);
-    if live.revoked() || crate::guest::store::is_revoked(&guest.dir, &guest.guest_id) {
+    if is_revoked(guest, &live) {
         return write_text_line_allow_disconnect(&mut stream, &guest_error(&id, "guest_revoked"));
     }
     let forbidden = |stream: &mut ApiStream| {
@@ -234,7 +258,7 @@ pub(super) fn serve_request(
         Method::AgentList(_) => {
             let (agent, running) = grant_state(guest, api_tx).into_parts();
             let agents: Vec<_> = agent
-                .map(|agent| with_running(agent, running))
+                .map(|agent| guest_view(&agent, running))
                 .into_iter()
                 .collect();
             let result = serde_json::json!({"type": "agent_list", "agents": agents});
@@ -249,7 +273,7 @@ pub(super) fn serve_request(
                 return paused(&mut stream);
             };
             let result =
-                serde_json::json!({"type": "agent_info", "agent": with_running(agent, running)});
+                serde_json::json!({"type": "agent_info", "agent": guest_view(&agent, running)});
             write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
         }
         Method::PaneStream(mut params) => {
@@ -263,17 +287,20 @@ pub(super) fn serve_request(
             // View-only: no viewer id, so no width lease and no resize path.
             params.pane_id = agent.pane_id;
             params.viewer_id = None;
-            let mut last_probe = Instant::now();
+            // Asked before every frame: the live revoke flag and a fresh grant
+            // probe each time; the store at most every WATCH_INTERVAL.
+            let mut last_store_check = Instant::now();
             let mut watch = |closed: bool| -> Option<String> {
-                if live.revoked() {
+                let store_due = last_store_check.elapsed() >= WATCH_INTERVAL;
+                if store_due {
+                    last_store_check = Instant::now();
+                }
+                if live.revoked() || (store_due && is_revoked(guest, &live)) {
                     return Some(guest_error(&id, "guest_revoked"));
                 }
-                if closed || last_probe.elapsed() >= WATCH_INTERVAL {
-                    last_probe = Instant::now();
-                    if closed || !matches!(grant_state(guest, api_tx), GrantState::Live(_)) {
-                        guest.audit(GuestAuditEvent::Paused, Some(method), None, None);
-                        return Some(guest_error(&id, "guest_paused"));
-                    }
+                if closed || !matches!(grant_state(guest, api_tx), GrantState::Live(_)) {
+                    guest.audit(GuestAuditEvent::Paused, Some(method), None, None);
+                    return Some(guest_error(&id, "guest_paused"));
                 }
                 None
             };
@@ -325,6 +352,9 @@ pub(super) fn serve_request(
                     &error_response_json(id, "invalid_params", "upload chunk is too large".into()),
                 );
             }
+            if !matches!(grant_state(guest, api_tx), GrantState::Live(_)) {
+                return paused(&mut stream);
+            }
             let request = Request {
                 id,
                 method: Method::GramUploadChunk(GramUploadChunkParams {
@@ -336,11 +366,8 @@ pub(super) fn serve_request(
             write_text_line_allow_disconnect(&mut stream, &response)
         }
         Method::GramPost(params) => {
-            let Some(agent_name) = grant_state(guest, api_tx)
-                .into_parts()
-                .0
-                .map(|agent| agent.name)
-            else {
+            let (agent, is_live) = grant_state(guest, api_tx).into_parts();
+            let Some(agent_name) = agent.filter(|_| is_live).map(|agent| agent.name) else {
                 return paused(&mut stream);
             };
             if params.to.is_some() && params.to != agent_name {
@@ -532,7 +559,12 @@ mod tests {
         /// Invite through the store and accept it through `admit`, as the
         /// relay link would.
         fn admit(&self) -> GuestPrincipal {
-            let (agent, running) = probe_target(&self.api_tx, None, Some(&self.pane_ids[0]))
+            self.admit_to(0)
+        }
+
+        /// Accept a new invite for agent `index` from the same device.
+        fn admit_to(&self, index: usize) -> GuestPrincipal {
+            let (agent, running) = probe_target(&self.api_tx, None, Some(&self.pane_ids[index]))
                 .expect("probe the granted agent");
             assert!(running, "the granted agent passes the live-agent check");
             let grant = GuestGrantInfo {
@@ -841,6 +873,133 @@ mod tests {
         handle.join().unwrap();
         let ping = harness.call(&guest, json!({"id": "p", "method": "ping", "params": {}}));
         assert_eq!(code(&ping), "guest_revoked");
+    }
+
+    #[test]
+    fn guest_agent_views_expose_only_the_safe_fields() {
+        let harness = start("projection");
+        let guest = harness.admit();
+        let allowed: std::collections::BTreeSet<&str> = [
+            "terminal_id",
+            "pane_id",
+            "name",
+            "agent",
+            "display_agent",
+            "agent_status",
+            "guest_running",
+        ]
+        .into();
+        let list = harness.call(
+            &guest,
+            json!({"id": "l", "method": "agent.list", "params": {}}),
+        );
+        let get = harness.call(
+            &guest,
+            json!({"id": "g", "method": "agent.get", "params": {"target": "llm-opt"}}),
+        );
+        for agent in [&list[0]["result"]["agents"][0], &get[0]["result"]["agent"]] {
+            let keys: std::collections::BTreeSet<&str> = agent
+                .as_object()
+                .unwrap_or_else(|| panic!("agent object: {list:?} {get:?}"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(keys, allowed, "{agent}");
+            assert_eq!(agent["name"], "llm-opt");
+            assert_eq!(agent["pane_id"], harness.pane_ids[0].as_str());
+        }
+    }
+
+    /// Open the granted stream and read past the ack and the reset seed, so
+    /// the next line is whatever the stream sends after that.
+    fn open_stream_past_seed(
+        harness: &Harness,
+        guest: &GuestPrincipal,
+    ) -> (BufReader<UnixStream>, JoinHandle<()>) {
+        let (mut reader, handle) = open_stream(harness, guest);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let seed: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(seed["frame"], "reset", "{seed}");
+        (reader, handle)
+    }
+
+    /// The very next line is the closing error, then EOF: no frame first.
+    fn next_is_close(reader: &mut BufReader<UnixStream>) -> Value {
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let value: Value = serde_json::from_str(&line).unwrap();
+        assert!(value.get("error").is_some(), "a frame followed: {value}");
+        let mut rest = String::new();
+        assert_eq!(
+            reader.read_line(&mut rest).unwrap(),
+            0,
+            "EOF after the error"
+        );
+        value
+    }
+
+    fn write_output(harness: &Harness) {
+        crate::api::output_registry::lookup(&harness.pane_ids[0])
+            .expect("the granted pane has a live output ring")
+            .append(b"owner-only output\r\n");
+    }
+
+    #[test]
+    fn no_frame_follows_a_pause_even_with_output_pending() {
+        let harness = start("pause-frame");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_stream_past_seed(&harness, &guest);
+        harness.agent_exits();
+        write_output(&harness);
+        assert_eq!(next_is_close(&mut reader)["error"]["code"], "guest_paused");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn no_frame_follows_a_revoke_even_with_output_pending() {
+        let harness = start("revoke-frame");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_stream_past_seed(&harness, &guest);
+        crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+            .unwrap();
+        write_output(&harness);
+        assert_eq!(next_is_close(&mut reader)["error"]["code"], "guest_revoked");
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn a_new_invite_on_the_same_device_closes_the_old_grants_stream() {
+        let harness = start("replace-stream");
+        let first = harness.admit_to(0);
+        let (mut reader, handle) = open_stream(&harness, &first);
+        let second = harness.admit_to(1);
+        assert_ne!(first.guest_id, second.guest_id);
+        assert_eq!(stream_end(&mut reader)["error"]["code"], "guest_revoked");
+        handle.join().unwrap();
+        let ping = harness.call(&first, json!({"id": "p", "method": "ping", "params": {}}));
+        assert_eq!(code(&ping), "guest_revoked");
+    }
+
+    #[test]
+    fn uploads_and_posts_need_a_running_agent_and_an_active_grant() {
+        let harness = start("gram-state");
+        let guest = harness.admit();
+        let upload = json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": "up-1", "offset": 0, "data_base64": "aGk="}});
+        let post =
+            json!({"id": "g", "method": "gram.post", "params": {"text": "hello", "to": "llm-opt"}});
+        harness.agent_exits();
+        std::thread::sleep(Duration::from_millis(50));
+        for request in [&upload, &post] {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "guest_paused", "{request} -> {lines:?}");
+        }
+        crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+            .unwrap();
+        for request in [&upload, &post] {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "guest_revoked", "{request} -> {lines:?}");
+        }
     }
 
     #[test]

@@ -129,9 +129,14 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
     };
     let (record, event) = match outcome {
         AdmitOutcome::Refused(error) => return Admission::Refused(error),
-        AdmitOutcome::Accepted(record) => {
+        AdmitOutcome::Accepted { guest, replaced } => {
+            // Close the replaced grants' live sessions now, not at their next
+            // request.
+            for guest_id in &replaced {
+                revoke_live(guest_id);
+            }
             notify_changes();
-            (record, Some(GuestAuditEvent::Accepted))
+            (guest, Some(GuestAuditEvent::Accepted))
         }
         AdmitOutcome::Returning { guest, connected } => {
             (guest, connected.then_some(GuestAuditEvent::Connected))

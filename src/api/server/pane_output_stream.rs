@@ -117,8 +117,9 @@ pub(super) fn serve(
     serve_watched(stream, request_id, params, api_tx, running, None)
 }
 
-/// Called between frames with `closed = true` when the runtime ended. A
-/// returned line is written as the final frame and the stream closes.
+/// Called before every frame, on idle ticks, and with `closed = true` when the
+/// runtime ended. A returned line is written as the final frame and the
+/// stream closes.
 pub(super) type StreamWatch<'a> = &'a mut dyn FnMut(bool) -> Option<String>;
 
 /// Poll cadence for a watched stream, so a watch fires promptly while idle.
@@ -205,8 +206,9 @@ fn serve_attached(
     };
 
     // stream_started ack carries the geometry the client lacks today.
-    if !emit(
+    if !emit_watched(
         stream,
+        &mut watch,
         &SuccessResponse {
             id: request_id.to_string(),
             result: ResponseResult::StreamStarted {
@@ -223,8 +225,9 @@ fn serve_attached(
     }
 
     // reset seed: base64 full-screen ANSI at exactly `base_seq`.
-    if !emit(
+    if !emit_watched(
         stream,
+        &mut watch,
         &StreamFrameLine::reset(
             seed.cursor,
             epoch,
@@ -250,9 +253,6 @@ fn serve_attached(
         if !running.load(Ordering::Relaxed) {
             return Ok(());
         }
-        if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
-            return write_text_line_allow_disconnect(stream, &line);
-        }
         match ring.wait_for_activity(cursor, resize_id, wait) {
             OutputWait::Closed => {
                 return finish_exited(stream, &mut watch, cursor, epoch);
@@ -262,9 +262,13 @@ fn serve_attached(
                 if should_stop_connection(stream, running)? {
                     return Ok(());
                 }
+                // An idle watched stream still closes promptly on pause or revoke.
+                if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
+                    return write_text_line_allow_disconnect(stream, &line);
+                }
                 if watch.is_none() || last_ping.elapsed() >= PING_INTERVAL {
                     last_ping = std::time::Instant::now();
-                    if !emit(stream, &StreamFrameLine::ping(cursor, epoch))? {
+                    if !emit_watched(stream, &mut watch, &StreamFrameLine::ping(cursor, epoch))? {
                         return Ok(());
                     }
                 }
@@ -276,8 +280,9 @@ fn serve_attached(
                     let Some(seed) = ring.snapshot() else {
                         return finish_exited(stream, &mut watch, cursor, epoch);
                     };
-                    if !emit(
+                    if !emit_watched(
                         stream,
+                        &mut watch,
                         &StreamFrameLine::reset(
                             seed.cursor,
                             epoch,
@@ -297,7 +302,11 @@ fn serve_attached(
                     rows,
                     resize_id: next_resize_id,
                 } => {
-                    if !emit(stream, &StreamFrameLine::resize(cursor, epoch, cols, rows))? {
+                    if !emit_watched(
+                        stream,
+                        &mut watch,
+                        &StreamFrameLine::resize(cursor, epoch, cols, rows),
+                    )? {
                         return Ok(());
                     }
                     resize_id = next_resize_id;
@@ -314,8 +323,9 @@ fn serve_attached(
                     for chunk in &chunks {
                         payload.extend_from_slice(chunk);
                     }
-                    if !emit(
+                    if !emit_watched(
                         stream,
+                        &mut watch,
                         &StreamFrameLine::data(cursor, epoch, encode_bytes(&payload)),
                     )? {
                         return Ok(());
@@ -340,6 +350,21 @@ fn finish_exited(
         return write_text_line_allow_disconnect(stream, &line);
     }
     emit(stream, &StreamFrameLine::exited(cursor, epoch)).map(|_| ())
+}
+
+/// [`emit`] after asking the watch whether the stream may still send. Every
+/// frame is checked, so no output follows a pause or revoke; a refusal writes
+/// the watch's line and reports `false` to stop.
+fn emit_watched<T: serde::Serialize>(
+    stream: &mut ApiStream,
+    watch: &mut Option<StreamWatch<'_>>,
+    value: &T,
+) -> std::io::Result<bool> {
+    if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
+        write_text_line_allow_disconnect(stream, &line)?;
+        return Ok(false);
+    }
+    emit(stream, value)
 }
 
 /// Write one frame/response line, reporting `false` when the peer has closed so

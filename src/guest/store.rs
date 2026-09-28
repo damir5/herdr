@@ -410,7 +410,11 @@ pub(crate) enum AdmitOutcome {
         guest: GuestRecord,
         connected: bool,
     },
-    Accepted(GuestRecord),
+    /// `replaced` lists this device's earlier guest ids, now revoked.
+    Accepted {
+        guest: GuestRecord,
+        replaced: Vec<String>,
+    },
     Refused(&'static str),
 }
 
@@ -477,12 +481,14 @@ pub(crate) fn admit_in(
             Err(_) => return (AdmitOutcome::Refused("invite_invalid"), false),
         };
         // One live record per device: a new invite replaces the old grant.
+        let mut replaced = Vec::new();
         for existing in store
             .guests
             .iter_mut()
-            .filter(|guest| guest.device_pub == device)
+            .filter(|guest| guest.device_pub == device && !guest.revoked)
         {
             existing.revoked = true;
+            replaced.push(existing.guest_id.clone());
         }
         let guest = GuestRecord {
             guest_id: guest_id.clone(),
@@ -499,7 +505,7 @@ pub(crate) fn admit_in(
         };
         store.invites[index].used_by = Some(guest_id);
         store.guests.push(guest.clone());
-        (AdmitOutcome::Accepted(guest), true)
+        (AdmitOutcome::Accepted { guest, replaced }, true)
     })
 }
 
@@ -680,7 +686,8 @@ pub(crate) mod tests {
     fn invite_is_single_use_and_binds_name_and_grant() {
         let dir = TempDir::new("single");
         let invite = invite(&dir.0, at(1_000));
-        let AdmitOutcome::Accepted(guest) = accept(&invite, &[7; 32], at(2_000), &dir.0) else {
+        let AdmitOutcome::Accepted { guest, .. } = accept(&invite, &[7; 32], at(2_000), &dir.0)
+        else {
             panic!("first use accepts");
         };
         assert_eq!(guest.name, "plotarmordev");
@@ -755,7 +762,8 @@ pub(crate) mod tests {
             AdmitOutcome::Refused("unknown")
         );
         let invite = invite(&dir.0, at(1_000));
-        let AdmitOutcome::Accepted(guest) = accept(&invite, &[9; 32], at(2_000), &dir.0) else {
+        let AdmitOutcome::Accepted { guest, .. } = accept(&invite, &[9; 32], at(2_000), &dir.0)
+        else {
             panic!("accepts");
         };
         let AdmitOutcome::Returning {
@@ -795,15 +803,21 @@ pub(crate) mod tests {
     fn a_new_invite_replaces_the_same_devices_old_grant() {
         let dir = TempDir::new("replace");
         let first = invite(&dir.0, at(1_000));
-        let AdmitOutcome::Accepted(old) = accept(&first, &[5; 32], at(2_000), &dir.0) else {
+        let AdmitOutcome::Accepted { guest: old, .. } = accept(&first, &[5; 32], at(2_000), &dir.0)
+        else {
             panic!("accepts");
         };
         let second = invite(&dir.0, at(3_000));
-        let AdmitOutcome::Accepted(new) = accept(&second, &[5; 32], at(4_000), &dir.0) else {
+        let AdmitOutcome::Accepted {
+            guest: new,
+            replaced,
+        } = accept(&second, &[5; 32], at(4_000), &dir.0)
+        else {
             panic!("accepts");
         };
         assert!(is_revoked(&dir.0, &old.guest_id));
         assert!(!is_revoked(&dir.0, &new.guest_id));
+        assert_eq!(replaced, vec![old.guest_id]);
     }
 
     #[test]

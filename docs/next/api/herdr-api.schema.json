@@ -10991,16 +10991,25 @@
           "type": "object"
         },
         "GuestAuditEvent": {
-          "enum": [
-            "accepted",
-            "connected",
-            "prompt",
-            "upload",
-            "denied",
-            "paused",
-            "revoked"
-          ],
-          "type": "string"
+          "oneOf": [
+            {
+              "enum": [
+                "accepted",
+                "connected",
+                "prompt",
+                "upload",
+                "denied",
+                "paused",
+                "revoked"
+              ],
+              "type": "string"
+            },
+            {
+              "const": "resumed",
+              "description": "The granted agent came back under a new harness session.",
+              "type": "string"
+            }
+          ]
         },
         "GuestAuditFile": {
           "properties": {
@@ -11024,8 +11033,15 @@
           "type": "object"
         },
         "GuestGrantInfo": {
-          "description": "The one agent a guest may use. It lapses when the pane, name or harness\nsession changes.",
+          "description": "The one agent a guest may use: the agent with this name and kind in this\nterminal. A restarted agent keeps the grant, and `agent_session` follows\nits latest harness session.",
           "properties": {
+            "agent_kind": {
+              "description": "Agent kind at invite time, for example `claude`. Grants from before\nthis field use `agent_session.agent`.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "agent_name": {
               "type": [
                 "string",

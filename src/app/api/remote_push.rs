@@ -48,6 +48,10 @@ struct SeenPane {
     agent: Option<String>,
     /// The agent left the pane since its status last changed.
     released: bool,
+    /// The pane's process exited and its died alert went out. Until a new
+    /// agent run shows up, whatever the peer still reports for it (a late
+    /// status, a poll that predates the exit, a repeated exit) sends nothing.
+    exited: bool,
     alert: AlertContext,
 }
 
@@ -215,15 +219,15 @@ impl RemotePushTracker {
                 }
                 RemotePaneEvent::Exited => {
                     self.held.retain(|(_, held)| held.pane_id != pane_id);
-                    // Forget the pane: whatever it shows next starts over, so
-                    // its release status is not a finish and a repeated exit
-                    // finds nothing to push.
-                    if let Some(seen) = self.panes.remove(&pane_id) {
-                        transitions.push(RemoteTransition {
-                            kind: PushKind::Died,
-                            pane_id,
-                            alert: seen.alert,
-                        });
+                    if let Some(seen) = self.panes.get_mut(&pane_id) {
+                        if !std::mem::replace(&mut seen.exited, true) {
+                            seen.released = false;
+                            transitions.push(RemoteTransition {
+                                kind: PushKind::Died,
+                                pane_id,
+                                alert: seen.alert.clone(),
+                            });
+                        }
                     }
                 }
             }
@@ -280,12 +284,23 @@ impl RemotePushTracker {
                     status: agent.status,
                     agent: agent.agent,
                     released: false,
+                    exited: false,
                     alert: agent.alert,
                 },
             );
             return;
         };
-        let kind = transition_kind(seen.status, seen.agent.as_deref(), &agent);
+        // A new run of an agent (working again, or the pane back to a plain
+        // shell) re-arms an exited pane; nothing it reports until then counts.
+        let exited = seen.exited;
+        if exited && (agent.status == AgentStatus::Working || agent.agent.is_none()) {
+            seen.exited = false;
+        }
+        let kind = if exited {
+            None
+        } else {
+            transition_kind(seen.status, seen.agent.as_deref(), &agent)
+        };
         // A finish that comes with a release waits for a possible exit; the
         // release is spent by the status change it causes.
         let hold = kind == Some(PushKind::Finished) && seen.released;
@@ -648,6 +663,45 @@ mod tests {
             capture.take().alerts.is_empty(),
             "the held finish is dropped"
         );
+    }
+
+    fn pane_event(app: &App, event: RemotePaneEvent) {
+        app.federation
+            .lock()
+            .unwrap()
+            .relay_pane_event(PEER, PANE, event);
+    }
+
+    #[test]
+    fn blocked_remote_exit_pushes_died_once_and_nothing_else() {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        relay(&app, &agent, AgentStatus::Blocked);
+        assert_eq!(sync(&mut app, &capture).len(), 1);
+        let mut blocked = agent.clone();
+        blocked.agent_status = AgentStatus::Blocked;
+
+        // Killed while blocked: the store still lists the blocked agent.
+        pane_event(&app, RemotePaneEvent::Exited);
+        let alerts = sync(&mut app, &capture);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].kind, PushKind::Died);
+
+        // A repeated exit, a poll still listing the dead agent, and its final
+        // status arriving late send nothing.
+        pane_event(&app, RemotePaneEvent::Exited);
+        assert!(sync(&mut app, &capture).is_empty());
+        poll(&app, vec![blocked]);
+        assert!(sync(&mut app, &capture).is_empty());
+        relay(&app, &agent, AgentStatus::Done);
+        assert!(sync(&mut app, &capture).is_empty());
+
+        // A new agent run in the same pane notifies again.
+        relay(&app, &agent, AgentStatus::Working);
+        assert!(sync(&mut app, &capture).is_empty());
+        relay(&app, &agent, AgentStatus::Blocked);
+        let alerts = sync(&mut app, &capture);
+        assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, PushKind::NeedsInput);
     }
 
     #[test]

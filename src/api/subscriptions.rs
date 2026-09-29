@@ -656,11 +656,14 @@ impl ActiveAllPanesAgentStatusSubscription {
             return lines;
         }
         let before_snapshot_sequence = self.last_sequence;
+        // Advance the timer before listing: a snapshot invalidated by an event that
+        // lands during the call must still wait a full interval, or a busy hub would
+        // turn the once-per-interval diff into a pane.list on every 100 ms tick.
+        self.next_snapshot = Instant::now() + self.snapshot_interval;
         let panes = pane_list(format!("{}:panes", self.request_prefix), api_tx);
         if event_hub.current_sequence() != before_snapshot_sequence {
             return lines;
         }
-        self.next_snapshot = Instant::now() + self.snapshot_interval;
         let Ok(panes) = panes else {
             return lines;
         };
@@ -1340,6 +1343,66 @@ mod tests {
         };
         assert_eq!(data.title.as_deref(), Some("short lived"));
         assert!(subscription.initial_event.is_none());
+    }
+
+    /// A hub event that lands while the all-panes diff is listing panes invalidates that
+    /// snapshot. The next snapshot must still wait a full interval: otherwise a busy hub
+    /// makes every 100 ms tick call pane.list.
+    #[test]
+    fn an_invalidated_all_panes_snapshot_still_waits_a_full_interval() {
+        let event_hub = EventHub::default();
+        let lists = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (api_tx, mut api_rx) =
+            tokio::sync::mpsc::unbounded_channel::<crate::api::ApiRequestMessage>();
+        let responder_hub = event_hub.clone();
+        let responder_lists = std::sync::Arc::clone(&lists);
+        std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                let Method::PaneList(_) = msg.request.method else {
+                    panic!("unexpected request {:?}", msg.request.method);
+                };
+                responder_lists.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // An unrelated event lands while the list is being taken.
+                responder_hub.push(workspace_focused_event("workspace_1"));
+                let _ = msg.respond_to.send(
+                    serde_json::to_string(&crate::api::schema::SuccessResponse {
+                        id: msg.request.id,
+                        result: crate::api::schema::ResponseResult::PaneList {
+                            panes: vec![pane_status("pane_1", AgentStatus::Working)],
+                        },
+                    })
+                    .unwrap(),
+                );
+            }
+        });
+        let ActiveSubscription::AllPanesAgentStatusChanged(mut subscription) =
+            ActiveSubscription::new(
+                Subscription::PaneAgentStatusChanged {
+                    pane_id: None,
+                    agent_status: None,
+                },
+                "test",
+                0,
+                &api_tx,
+                &event_hub,
+                event_hub.current_sequence(),
+            )
+            .expect("all-panes subscription")
+        else {
+            panic!("expected an all-panes subscription");
+        };
+        let baseline = lists.load(std::sync::atomic::Ordering::SeqCst);
+        subscription.snapshot_interval = Duration::from_secs(3600);
+        subscription.next_snapshot = Instant::now();
+        for _ in 0..3 {
+            let batch = event_hub.read_after(subscription.last_sequence);
+            subscription.poll(&api_tx, &event_hub, &batch);
+        }
+        assert_eq!(
+            lists.load(std::sync::atomic::Ordering::SeqCst) - baseline,
+            1,
+            "an invalidated snapshot must not be retried before the interval"
+        );
     }
 
     #[test]

@@ -909,6 +909,36 @@ changes three things for that request only:
 Without `events_v2`, streams never contain `control` lines, a missing pane still
 fails the request, and events lost to a lagging stream are skipped silently.
 
+### Remote events on a coordinator
+
+A federation coordinator relays each outbound peer's events into its own
+stream, so a local subscriber receives remote changes the same way it receives
+local ones, usually within a second. Every id in a relayed event gains the
+peer's `<alias>/` prefix: pane, terminal, workspace and tab ids, including those
+inside pane, workspace, tab, worktree and layout snapshots. Workspace and tab
+snapshots carry the coordinator's `machine_id`, `machine_label` and
+`machine_profile_id`. Relayed events get the coordinator's `seq` numbers, not
+the peer's.
+
+All-pane `pane.agent_status_changed` and `pane.turn_completed` entries include
+remote panes automatically. An entry can also name one remote pane, for example
+`"pane_id": "build/w1:p2"`. Its initial state comes from the coordinator's
+cached `agent.list` entry for that pane. An unknown alias or pane fails with
+`pane_not_found`, or is listed in `rejected` with `events_v2`.
+
+Relaying needs a peer that advertises `capabilities.events_v2` and, when the
+peer's machine ID is pinned, a validated identity. Other peers keep the
+5-second `agent.list` poll only: their changes show up in `agent.list` but
+produce no events. After a reconnect, or a `lagged` line from the peer, the
+coordinator compares a fresh `agent.list` with what it already relayed and
+emits each missed status change once. After a peer restart it emits the
+current status of every pane on that peer.
+
+Set `"local_only": true` to leave out the events a server relays from its own
+peers. A coordinator sets it on its relay stream, so a peer that is itself a
+coordinator never re-exports a third machine's events. Older servers ignore
+the field; they have no relayed events to leave out.
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.

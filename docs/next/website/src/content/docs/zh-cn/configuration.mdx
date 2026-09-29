@@ -179,6 +179,8 @@ expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
 
 协调端还会缓存每个可达对等方的 `workspace.list`（以 `local_only: true` 请求，并以同样方式丢弃再次导出的条目）。首次代理轮询成功时获取一次，之后每 30 秒获取一次；当轮询到的代理指向缓存中不存在的工作区时，还会提前获取一次。每 5 秒一次的代理轮询不会增加其他请求。对等方处于降级或不可达状态时缓存仍会保留，因此其工作区会连同对等方的可达状态继续列出。
 
+协调端还会对每个声明 `events_v2` 且身份已验证的对等方保持一条 `events.subscribe` 流,因此远程状态变化、已完成的轮次以及窗格、工作区和标签页的生命周期事件会在约 1 秒内送达本地订阅者,而不必等待下一次轮询(参见 [Socket API](/docs/socket-api/))。该流使用与轮询相同的路径:已保存机器使用现有的 `remote-api-bridge`,TCP 使用端点和令牌,`observe` 级别即可。失败的流按轮询的退避重连,对等方启动 ID 变化时会重建,每次重连都会从 `agent.list` 重新同步。每 5 秒一次的轮询继续作为兜底,但早于某条中继事件的轮询结果不会覆盖该事件的状态。不具备该能力的对等方只会被轮询。
+
 在协调端运行 `herdr machine status`（或 `herdr machine status --json`），分别查看已保存配置档案、端点/TUI 和联邦的健康状况。不受信任的配置档案会显示 `herdr machine federate <profile-id>` 作为下一步操作（JSON 中为 `next_action`）。联邦可达性、已验证的远端机器 ID、上次成功轮询、有限类别的错误、协商的版本/能力及过期数据会分别报告。错误信息不会暴露 SSH 命令、令牌或远端 stderr。
 
 当某台已保存机器在 Gram 中继授权范围内时，其状态还包含 `gram_relay`（文本输出显示 `gram relay:` 一行）。`state` 为 `off`、`starting`、`up` 或 `retrying`；`retrying` 另含 `attempt`、`next_in_secs` 和截断后的 `last_error`。协调端会自行重试失败或已退出的反向网关，间隔从 2 秒起倍增，上限 60 秒，且不会重启该机器的联邦桥接。示例：`"gram_relay": {"state": "retrying", "attempt": 3, "next_in_secs": 8, "last_error": "remote Gram reverse socket preflight failed: exit status: 255"}`。

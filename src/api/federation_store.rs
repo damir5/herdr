@@ -139,6 +139,10 @@ pub struct PeerCacheEntry {
     /// Per remote pane (qualified id), the last status the event relay
     /// published. Empty for peers without an event stream.
     pub relayed: HashMap<String, RelayedStatus>,
+    /// Per remote pane (qualified id), when a relay resync found the peer no
+    /// longer lists it. A poll that started earlier may still list the pane,
+    /// so it must not bring it back.
+    pub vanished: HashMap<String, Instant>,
 }
 
 impl PeerCacheEntry {
@@ -165,6 +169,7 @@ impl PeerCacheEntry {
             last_error_class: None,
             observation,
             relayed: HashMap::new(),
+            vanished: HashMap::new(),
         }
     }
 }
@@ -214,9 +219,10 @@ impl FederationStore {
     ///
     /// Ordering against the event relay: a pane whose status the relay
     /// published after `poll_started` keeps that status (and its turn), since
-    /// this poll's answer may predate it. The relay's baselines are kept,
-    /// except for panes the peer no longer lists that nothing relayed since the
-    /// poll started.
+    /// this poll's answer may predate it, and a pane a resync found gone after
+    /// `poll_started` stays gone. The relay's baselines are kept, except for
+    /// panes the peer no longer lists that nothing relayed since the poll
+    /// started.
     pub fn set_polled_peer(
         &mut self,
         alias: impl Into<String>,
@@ -227,7 +233,15 @@ impl FederationStore {
         if let Some(previous) = self.peers.get_mut(&alias) {
             entry.workspaces = std::mem::take(&mut previous.workspaces);
             entry.relayed = std::mem::take(&mut previous.relayed);
+            entry.vanished = std::mem::take(&mut previous.vanished);
         }
+        entry
+            .vanished
+            .retain(|_, vanished_at| *vanished_at > poll_started);
+        let vanished = &entry.vanished;
+        entry
+            .agents
+            .retain(|agent| !vanished.contains_key(&agent.pane_id));
         for agent in &mut entry.agents {
             if let Some(relayed) = entry.relayed.get(&agent.pane_id) {
                 if relayed.at > poll_started {
@@ -335,8 +349,9 @@ impl FederationStore {
     /// Compare a fresh `agent.list` from `alias` (as status events, ids
     /// qualified) with what the relay published, record it as the new
     /// baseline, and return the events to publish so each missed change is
-    /// reported exactly once. Panes the peer no longer lists lose their
-    /// baseline.
+    /// reported exactly once. The list is authoritative: panes the peer no
+    /// longer lists lose their baseline and leave the cached agents, which the
+    /// app loop reports as exited.
     pub fn relay_resync(
         &mut self,
         alias: &str,
@@ -354,6 +369,7 @@ impl FederationStore {
         let mut present = HashSet::with_capacity(current.len());
         for event in current {
             present.insert(event.pane_id.clone());
+            entry.vanished.remove(&event.pane_id);
             let changed = entry
                 .relayed
                 .get(&event.pane_id)
@@ -364,6 +380,14 @@ impl FederationStore {
             entry.record_relayed(event, now);
         }
         entry.relayed.retain(|pane_id, _| present.contains(pane_id));
+        // Archived agents have no pane and are never in `current`.
+        entry.agents.retain(|agent| {
+            if agent.pane_id.is_empty() || present.contains(&agent.pane_id) {
+                return true;
+            }
+            entry.vanished.insert(agent.pane_id.clone(), now);
+            false
+        });
         self.touch();
         missed
     }
@@ -466,6 +490,7 @@ impl FederationStore {
                         last_error_class: None,
                         observation: PeerObservation::default(),
                         relayed: HashMap::new(),
+                        vanished: HashMap::new(),
                     },
                 );
             }
@@ -691,6 +716,7 @@ mod tests {
                 last_error_class: None,
                 observation: PeerObservation::default(),
                 relayed: HashMap::new(),
+                vanished: HashMap::new(),
             },
         );
         let merged = store.merged_agents();
@@ -721,6 +747,7 @@ mod tests {
                 last_error_class: None,
                 observation: PeerObservation::default(),
                 relayed: HashMap::new(),
+                vanished: HashMap::new(),
             },
         );
         let merged = store.merged_agents();

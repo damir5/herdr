@@ -48,6 +48,9 @@ struct SeenPane {
     agent: Option<String>,
     /// The agent left the pane since its status last changed.
     released: bool,
+    /// The agent left the pane (a relayed release) and no new run has
+    /// started, so the pane dropping off the peer's list is not a death.
+    left: bool,
     /// The pane's process exited and its died alert went out. Until a new
     /// agent run shows up, whatever the peer still reports for it (a late
     /// status, a poll that predates the exit, a repeated exit) sends nothing.
@@ -215,6 +218,7 @@ impl RemotePushTracker {
                 RemotePaneEvent::AgentReleased => {
                     if let Some(seen) = self.panes.get_mut(&pane_id) {
                         seen.released = true;
+                        seen.left = true;
                     }
                 }
                 RemotePaneEvent::Exited => {
@@ -245,8 +249,22 @@ impl RemotePushTracker {
             let seeding = self.peers.insert(alias.clone());
             let present: HashSet<&str> =
                 agents.iter().map(|agent| agent.pane_id.as_str()).collect();
-            self.panes
-                .retain(|pane_id, seen| seen.alias != alias || present.contains(pane_id.as_str()));
+            // The peer's list is authoritative: a pane gone from it closed or
+            // died, possibly with its pane.exited lost across a flap. An agent
+            // that already left the pane, or whose exit was pushed, ends quietly.
+            self.panes.retain(|pane_id, seen| {
+                if seen.alias != alias || present.contains(pane_id.as_str()) {
+                    return true;
+                }
+                if !seen.exited && !seen.left {
+                    transitions.push(RemoteTransition {
+                        kind: PushKind::Died,
+                        pane_id: pane_id.clone(),
+                        alert: seen.alert.clone(),
+                    });
+                }
+                false
+            });
             for agent in agents {
                 self.observe_agent(&alias, seeding, agent, now, &mut transitions);
             }
@@ -284,6 +302,7 @@ impl RemotePushTracker {
                     status: agent.status,
                     agent: agent.agent,
                     released: false,
+                    left: false,
                     exited: false,
                     alert: agent.alert,
                 },
@@ -306,6 +325,9 @@ impl RemotePushTracker {
         let hold = kind == Some(PushKind::Finished) && seen.released;
         if seen.status != agent.status {
             seen.released = false;
+        }
+        if agent.status == AgentStatus::Working {
+            seen.left = false;
         }
         seen.status = agent.status;
         seen.agent = agent.agent;
@@ -717,6 +739,71 @@ mod tests {
         app.sync_remote_agent_notifications(Instant::now() + Duration::from_secs(5));
         let alerts = capture.take().alerts;
         assert_eq!(alerts.len(), 1);
+        assert_eq!(alerts[0].kind, PushKind::Finished);
+    }
+
+    #[test]
+    fn remote_pane_lost_across_a_flap_pushes_died_once() {
+        // The stream flaps and the pane.exited is lost: the reconnect
+        // resync no longer lists the pane.
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        relay(&app, &agent, AgentStatus::Blocked);
+        assert_eq!(sync(&mut app, &capture).len(), 1);
+        let mut blocked = agent.clone();
+        blocked.agent_status = AgentStatus::Blocked;
+        let poll_started = Instant::now();
+        app.federation.lock().unwrap().relay_resync(
+            PEER,
+            Vec::new(),
+            RelayResync::Diff,
+            Instant::now(),
+        );
+        let alerts = sync(&mut app, &capture);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].kind, PushKind::Died);
+        assert_eq!(alerts[0].title, "llm-opt on Jerry's Mac Studio exited");
+
+        // A poll that started before the resync still lists the pane; it
+        // must not bring it back, and a later one without it sends nothing.
+        app.federation.lock().unwrap().set_polled_peer(
+            PEER,
+            PeerCacheEntry::reachable(vec![blocked], poll_started),
+            poll_started,
+        );
+        assert!(sync(&mut app, &capture).is_empty());
+        poll(&app, Vec::new());
+        assert!(sync(&mut app, &capture).is_empty());
+    }
+
+    #[test]
+    fn remote_pane_missing_after_the_peer_comes_back_pushes_died() {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        app.federation
+            .lock()
+            .unwrap()
+            .degrade_peer(PEER, Reachability::Unreachable);
+        assert!(sync(&mut app, &capture).is_empty());
+        let other = remote_agent("mac/w1:p3", "reviewer", AgentStatus::Working);
+        poll(&app, vec![other]);
+        let alerts = sync(&mut app, &capture);
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert_eq!(alerts[0].kind, PushKind::Died);
+        assert_eq!(alerts[0].pane_id, agent.pane_id);
+    }
+
+    #[test]
+    fn agent_that_left_its_pane_is_not_a_death_when_the_pane_drops_off() {
+        // An unnamed agent quits to its shell: released, finished, and the
+        // pane leaves agent.list on the next poll.
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        pane_event(&app, RemotePaneEvent::AgentReleased);
+        relay(&app, &agent, AgentStatus::Done);
+        assert!(sync(&mut app, &capture).is_empty());
+        poll(&app, Vec::new());
+        assert!(sync(&mut app, &capture).is_empty());
+        app.sync_remote_agent_notifications(Instant::now() + Duration::from_secs(5));
+        let alerts = capture.take().alerts;
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
         assert_eq!(alerts[0].kind, PushKind::Finished);
     }
 

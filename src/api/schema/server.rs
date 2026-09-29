@@ -45,4 +45,10 @@ pub struct ServerCapabilities {
     /// destinations. Empty means the older Claude/Codex-only capability shape.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub agent_session_transfer_harnesses: Vec<super::AgentSessionTransferHarness>,
+    /// `events.subscribe` accepts `events_v2: true` (sequence-numbered lines,
+    /// `lagged` and `heartbeat` control lines, per-entry `pane_not_found`
+    /// rejection) and all-pane `pane.agent_status_changed` and
+    /// `pane.turn_completed` entries without a `pane_id`.
+    #[serde(default)]
+    pub events_v2: bool,
 }

@@ -951,24 +951,21 @@ pub(super) fn wait_for_event(
         Ok(subscription) => subscription,
         Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
     };
-    let mut active = match ActiveSubscription::new(
-        subscription,
-        &request_id,
-        0,
-        api_tx,
-        event_hub,
-        event_hub.current_sequence(),
-    ) {
-        Ok(active) => active,
-        Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
-    };
+    let mut cursor = event_hub.current_sequence();
+    let mut active =
+        match ActiveSubscription::new(subscription, &request_id, 0, api_tx, event_hub, cursor) {
+            Ok(active) => active,
+            Err(response) => return Ok(Some(serde_json::to_string(&response).unwrap())),
+        };
 
     loop {
         if should_stop_connection(stream, running)? {
             return Ok(None);
         }
 
-        match active.poll_for_wait(api_tx, event_hub) {
+        let batch = event_hub.read_after(cursor);
+        cursor = batch.head;
+        match active.poll_for_wait(api_tx, event_hub, &batch) {
             Ok(Some(event)) => return Ok(Some(wait_matched_response(&request_id, event))),
             Ok(None) => {}
             Err(mut response) if response.error.code == "pane_not_found" => {
@@ -1006,7 +1003,7 @@ fn event_match_subscription(
             pane_id,
             agent_status,
         } => Ok(Subscription::PaneAgentStatusChanged {
-            pane_id,
+            pane_id: Some(pane_id),
             agent_status: Some(agent_status),
         }),
         _ => Err(ErrorResponse {

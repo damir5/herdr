@@ -425,6 +425,7 @@ mod tests {
                 gram_upload_stream: false,
                 agent_session_transfer: false,
                 agent_session_transfer_harnesses: Vec::new(),
+                events_v2: false,
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,

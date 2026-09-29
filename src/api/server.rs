@@ -199,6 +199,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
             crate::api::schema::AgentSessionTransferHarness::Codex,
             crate::api::schema::AgentSessionTransferHarness::Omp,
         ],
+        events_v2: true,
     })
 }
 
@@ -2515,18 +2516,45 @@ mod windows_tests {
     }
 }
 
+/// How long an `events_v2` subscription stream may stay silent before it
+/// writes a heartbeat line. Well under [`FEDERATION_STREAM_IDLE_TIMEOUT`], so a
+/// peer relaying the stream never closes a quiet but healthy subscription.
+const SUBSCRIPTION_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 fn stream_subscriptions(
-    mut stream: ApiStream,
+    stream: ApiStream,
     request_id: String,
     params: crate::api::schema::EventsSubscribeParams,
     api_tx: &ApiRequestSender,
     event_hub: &EventHub,
     running: &Arc<AtomicBool>,
 ) -> std::io::Result<()> {
+    stream_subscriptions_with_heartbeat(
+        stream,
+        request_id,
+        params,
+        api_tx,
+        event_hub,
+        running,
+        SUBSCRIPTION_HEARTBEAT_INTERVAL,
+    )
+}
+
+fn stream_subscriptions_with_heartbeat(
+    mut stream: ApiStream,
+    request_id: String,
+    params: crate::api::schema::EventsSubscribeParams,
+    api_tx: &ApiRequestSender,
+    event_hub: &EventHub,
+    running: &Arc<AtomicBool>,
+    heartbeat_interval: Duration,
+) -> std::io::Result<()> {
+    let events_v2 = params.events_v2;
     let event_start_sequence = event_hub.current_sequence();
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
+    let mut rejected = Vec::new();
     for (index, subscription) in params.subscriptions.into_iter().enumerate() {
-        let active = match ActiveSubscription::new(
+        match ActiveSubscription::new(
             subscription,
             &request_id,
             index,
@@ -2534,50 +2562,98 @@ fn stream_subscriptions(
             event_hub,
             event_start_sequence,
         ) {
-            Ok(active) => active,
+            Ok(active) => subscriptions.push(active),
+            // A pane can close between listing and subscribing; v2 clients get
+            // the rest of their entries instead of a failed request.
+            Err(response) if events_v2 && response.error.code == "pane_not_found" => {
+                rejected.push(crate::api::schema::SubscriptionRejection {
+                    index,
+                    error: response.error,
+                });
+            }
             Err(mut response) => {
                 response.id = request_id;
-                if let Err(err) = write_json_line(&mut stream, &response) {
-                    if is_connection_closed_error(&err) {
-                        return Ok(());
-                    }
-                    return Err(err);
-                }
-                return Ok(());
+                return write_json_line_allow_disconnect(&mut stream, &response);
             }
-        };
-        subscriptions.push(active);
+        }
     }
 
-    if let Err(err) = write_json_line(
+    if !write_subscription_line(
         &mut stream,
         &SuccessResponse {
             id: request_id,
-            result: ResponseResult::SubscriptionStarted {},
+            result: ResponseResult::SubscriptionStarted { rejected },
         },
-    ) {
-        if is_connection_closed_error(&err) {
-            return Ok(());
-        }
-        return Err(err);
+    )? {
+        return Ok(());
     }
 
+    let mut cursor = event_start_sequence;
+    let mut last_write = Instant::now();
+    let mut lines = Vec::new();
     loop {
         if should_stop_connection(&mut stream, running)? {
             return Ok(());
         }
 
-        for subscription in &mut subscriptions {
-            if let Some(event) = subscription.poll(api_tx, event_hub) {
-                if let Err(err) = write_json_line(&mut stream, &event) {
-                    if is_connection_closed_error(&err) {
-                        return Ok(());
-                    }
-                    return Err(err);
-                }
+        let batch = event_hub.read_after(cursor);
+        cursor = batch.head;
+        for (index, subscription) in subscriptions.iter_mut().enumerate() {
+            lines.extend(
+                subscription
+                    .poll(api_tx, event_hub, &batch)
+                    .into_iter()
+                    .map(|line| (index, line)),
+            );
+        }
+        // One hub event can match several entries; keep hub order across
+        // entries and request order among lines that share a sequence.
+        lines.sort_by_key(|(index, line)| (line.seq, line.derived, *index));
+
+        let mut wrote = false;
+        if let Some(missed) = batch.missed.filter(|_| events_v2) {
+            let lagged = crate::api::schema::SubscriptionControlLine::Lagged {
+                seq: missed.last,
+                first_missed_seq: missed.first,
+                last_missed_seq: missed.last,
+            };
+            if !write_subscription_line(&mut stream, &lagged)? {
+                return Ok(());
             }
+            wrote = true;
+        }
+        for (_, line) in lines.drain(..) {
+            let event = crate::api::schema::SubscriptionStreamEvent {
+                seq: line.seq,
+                payload: line.payload,
+            };
+            if !write_subscription_line(&mut stream, &event)? {
+                return Ok(());
+            }
+            wrote = true;
+        }
+        if wrote {
+            last_write = Instant::now();
+        } else if events_v2 && last_write.elapsed() >= heartbeat_interval {
+            let heartbeat = crate::api::schema::SubscriptionControlLine::Heartbeat { seq: cursor };
+            if !write_subscription_line(&mut stream, &heartbeat)? {
+                return Ok(());
+            }
+            last_write = Instant::now();
         }
         std::thread::sleep(CONNECTION_POLL_INTERVAL);
+    }
+}
+
+/// Writes one subscription stream line; `Ok(false)` means the client left.
+fn write_subscription_line<T: serde::Serialize>(
+    stream: &mut ApiStream,
+    value: &T,
+) -> std::io::Result<bool> {
+    match write_json_line(stream, value) {
+        Ok(()) => Ok(true),
+        Err(err) if is_connection_closed_error(&err) => Ok(false),
+        Err(err) => Err(err),
     }
 }
 
@@ -2980,6 +3056,7 @@ mod tests {
                     crate::api::schema::AgentSessionTransferHarness::Codex,
                     crate::api::schema::AgentSessionTransferHarness::Omp,
                 ],
+                events_v2: false,
             }),
             None,
             None,
@@ -3356,6 +3433,401 @@ mod tests {
         assert_eq!(response.error.code, "pane_not_found");
         assert_eq!(response.error.message, "pane w999:p9 not found");
         fs::remove_file(path).unwrap();
+    }
+
+    /// Serves `stream_subscriptions_with_heartbeat` for `params` on a local
+    /// socket and forwards each client-side line to a channel.
+    struct SubscriptionStreamHarness {
+        lines: std::sync::mpsc::Receiver<serde_json::Value>,
+        running: Arc<AtomicBool>,
+        server: std::thread::JoinHandle<()>,
+        path: PathBuf,
+    }
+
+    impl SubscriptionStreamHarness {
+        fn start(
+            name: &str,
+            params: serde_json::Value,
+            api_tx: ApiRequestSender,
+            event_hub: &EventHub,
+            heartbeat_interval: Duration,
+        ) -> Self {
+            let params: crate::api::schema::EventsSubscribeParams =
+                serde_json::from_value(params).unwrap();
+            let (client, server, path) = local_stream_pair(name);
+            let running = Arc::new(AtomicBool::new(true));
+            let server_running = Arc::clone(&running);
+            let server_hub = event_hub.clone();
+            let server = std::thread::spawn(move || {
+                stream_subscriptions_with_heartbeat(
+                    ApiStream::Local(server),
+                    "sub".into(),
+                    params,
+                    &api_tx,
+                    &server_hub,
+                    &server_running,
+                    heartbeat_interval,
+                )
+                .unwrap();
+            });
+            let (line_tx, lines) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for line in BufReader::new(client).lines() {
+                    let Ok(line) = line else { return };
+                    if line_tx.send(serde_json::from_str(&line).unwrap()).is_err() {
+                        return;
+                    }
+                }
+            });
+            Self {
+                lines,
+                running,
+                server,
+                path,
+            }
+        }
+
+        fn next(&self) -> serde_json::Value {
+            self.lines
+                .recv_timeout(Duration::from_secs(5))
+                .expect("subscription line")
+        }
+
+        fn stop(self) {
+            self.running.store(false, Ordering::Relaxed);
+            self.server.join().unwrap();
+            let _ = fs::remove_file(self.path);
+        }
+    }
+
+    fn focused_event(workspace_id: &str) -> crate::api::schema::EventEnvelope {
+        crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::WorkspaceFocused,
+            data: crate::api::schema::EventData::WorkspaceFocused {
+                workspace_id: workspace_id.into(),
+            },
+        }
+    }
+
+    fn status_event(
+        pane_id: &str,
+        agent_status: crate::api::schema::AgentStatus,
+    ) -> crate::api::schema::EventEnvelope {
+        crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneAgentStatusChanged,
+            data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                pane_id: pane_id.into(),
+                workspace_id: "ws_1".into(),
+                agent_status,
+                input_pending: false,
+                input_prompt_kind: None,
+                agent: Some("pi".into()),
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
+            },
+        }
+    }
+
+    /// Answers `pane.list` with one idle pane and `pane.get` for `pane_1`. The
+    /// first `pane.get` after the subscribe probe reports that it is blocked
+    /// and waits for the test to release it.
+    fn spawn_gated_pane_responder() -> (
+        ApiRequestSender,
+        std::sync::mpsc::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let mut pane_gets = 0;
+            while let Some(msg) = api_rx.blocking_recv() {
+                let result = match msg.request.method {
+                    Method::PaneList(_) => ResponseResult::PaneList {
+                        panes: vec![pane_info("pane_1", crate::api::schema::AgentStatus::Idle)],
+                    },
+                    Method::PaneGet(params) if params.pane_id == "pane_1" => {
+                        pane_gets += 1;
+                        if pane_gets == 2 {
+                            let _ = blocked_tx.send(());
+                            let _ = release_rx.recv();
+                        }
+                        ResponseResult::PaneInfo {
+                            pane: pane_info("pane_1", crate::api::schema::AgentStatus::Idle),
+                        }
+                    }
+                    Method::PaneGet(params) => {
+                        let _ = msg.respond_to.send(error_response_json(
+                            msg.request.id,
+                            "pane_not_found",
+                            format!("pane {} not found", params.pane_id),
+                        ));
+                        continue;
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                let _ = msg.respond_to.send(
+                    serde_json::to_string(&SuccessResponse {
+                        id: msg.request.id,
+                        result,
+                    })
+                    .unwrap(),
+                );
+            }
+        });
+        (api_tx, blocked_rx, release_tx)
+    }
+
+    #[test]
+    fn all_panes_status_subscription_reports_pane_created_after_it_started() {
+        let (api_tx, _blocked, _release) = spawn_gated_pane_responder();
+        let event_hub = EventHub::default();
+        let stream = SubscriptionStreamHarness::start(
+            "sub-all-panes",
+            serde_json::json!({"subscriptions": [
+                {"type": "pane.agent_status_changed", "agent_status": "working"},
+                {"type": "pane.turn_completed"}
+            ]}),
+            api_tx,
+            &event_hub,
+            SUBSCRIPTION_HEARTBEAT_INTERVAL,
+        );
+        assert_eq!(stream.next()["result"]["type"], "subscription_started");
+
+        event_hub.push(status_event(
+            "pane_2",
+            crate::api::schema::AgentStatus::Idle,
+        ));
+        event_hub.push(status_event(
+            "pane_2",
+            crate::api::schema::AgentStatus::Working,
+        ));
+        event_hub.push(crate::api::schema::EventEnvelope {
+            event: crate::api::schema::EventKind::PaneTurnCompleted,
+            data: crate::api::schema::EventData::PaneTurnCompleted {
+                pane: pane_info("pane_3", crate::api::schema::AgentStatus::Done),
+                turn: 1,
+                turn_epoch: 9,
+                outcome: crate::terminal::TurnOutcome::Completed,
+                message: None,
+                message_truncated: false,
+                agent_session_path: None,
+                completed_unix_ms: 1,
+            },
+        });
+
+        let status = stream.next();
+        assert_eq!(status["event"], "pane.agent_status_changed");
+        assert_eq!(status["data"]["pane_id"], "pane_2");
+        assert_eq!(status["data"]["agent_status"], "working");
+        assert_eq!(status["seq"], 2);
+        let turn = stream.next();
+        assert_eq!(turn["event"], "pane.turn_completed");
+        assert_eq!(turn["data"]["pane"]["pane_id"], "pane_3");
+        assert_eq!(turn["seq"], 3);
+        stream.stop();
+    }
+
+    #[test]
+    fn subscription_stream_delivers_a_burst_complete_and_in_hub_order() {
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let event_hub = EventHub::default();
+        let stream = SubscriptionStreamHarness::start(
+            "sub-burst",
+            serde_json::json!({"subscriptions": [
+                {"type": "workspace.created"},
+                {"type": "workspace.focused"},
+                {"type": "pane.closed"}
+            ]}),
+            api_tx,
+            &event_hub,
+            SUBSCRIPTION_HEARTBEAT_INTERVAL,
+        );
+        assert_eq!(stream.next()["result"]["type"], "subscription_started");
+
+        const BURST: usize = 200;
+        for index in 0..BURST {
+            if index % 2 == 0 {
+                event_hub.push(focused_event(&format!("w{index}")));
+            } else {
+                event_hub.push(crate::api::schema::EventEnvelope {
+                    event: crate::api::schema::EventKind::PaneClosed,
+                    data: crate::api::schema::EventData::PaneClosed {
+                        pane_id: format!("p{index}"),
+                        workspace_id: "w".into(),
+                    },
+                });
+            }
+        }
+
+        for index in 0..BURST {
+            let line = stream.next();
+            assert_eq!(line["seq"], index as u64 + 1, "line {index}: {line}");
+            let id = if index % 2 == 0 {
+                &line["data"]["workspace_id"]
+            } else {
+                &line["data"]["pane_id"]
+            };
+            assert!(id.as_str().unwrap().ends_with(&index.to_string()), "{line}");
+        }
+        stream.stop();
+    }
+
+    /// Stalls the stream inside a `pane.get` while the ring overflows, then
+    /// returns the first line after the stall and the line after one more event.
+    fn lines_after_ring_overflow(events_v2: bool) -> Vec<serde_json::Value> {
+        let (api_tx, blocked, release) = spawn_gated_pane_responder();
+        let event_hub = EventHub::default();
+        let stream = SubscriptionStreamHarness::start(
+            if events_v2 {
+                "sub-lag-v2"
+            } else {
+                "sub-lag-v1"
+            },
+            serde_json::json!({
+                "subscriptions": [
+                    {"type": "workspace.focused"},
+                    {"type": "pane.agent_status_changed", "pane_id": "pane_1"}
+                ],
+                "events_v2": events_v2,
+            }),
+            api_tx,
+            &event_hub,
+            SUBSCRIPTION_HEARTBEAT_INTERVAL,
+        );
+        assert_eq!(
+            stream.next(),
+            serde_json::json!({"id": "sub", "result": {"type": "subscription_started"}})
+        );
+        blocked.recv_timeout(Duration::from_secs(5)).unwrap();
+        const PUSHED: usize = 5_000;
+        for index in 0..PUSHED {
+            event_hub.push(focused_event(&index.to_string()));
+        }
+        release.send(()).unwrap();
+
+        let mut lines = vec![stream.next()];
+        while lines.last().unwrap()["seq"] != PUSHED as u64 {
+            lines.push(stream.next());
+        }
+        event_hub.push(focused_event("after"));
+        lines.push(stream.next());
+        stream.stop();
+        lines
+    }
+
+    #[test]
+    fn lagged_v2_subscription_reports_missed_range_then_continues() {
+        let lines = lines_after_ring_overflow(true);
+        let first_retained = 5_000 - EventHub::MAX_EVENTS as u64 + 1;
+        assert_eq!(
+            lines[0],
+            serde_json::json!({
+                "control": "lagged",
+                "seq": first_retained - 1,
+                "first_missed_seq": 1,
+                "last_missed_seq": first_retained - 1,
+            })
+        );
+        let events = &lines[1..];
+        assert_eq!(events.len(), EventHub::MAX_EVENTS + 1);
+        assert!(events
+            .iter()
+            .zip(first_retained..)
+            .all(|(line, seq)| line["seq"] == seq && line["event"] == "workspace_focused"));
+        assert_eq!(events.last().unwrap()["data"]["workspace_id"], "after");
+    }
+
+    #[test]
+    fn lagged_legacy_subscription_writes_no_control_line() {
+        let lines = lines_after_ring_overflow(false);
+        let first_retained = 5_000 - EventHub::MAX_EVENTS as u64 + 1;
+        assert_eq!(lines.len(), EventHub::MAX_EVENTS + 1);
+        assert!(lines
+            .iter()
+            .zip(first_retained..)
+            .all(|(line, seq)| line["seq"] == seq && line["event"] == "workspace_focused"));
+    }
+
+    #[test]
+    fn idle_v2_subscription_writes_heartbeats_and_legacy_stays_silent() {
+        let event_hub = EventHub::default();
+        event_hub.push(focused_event("before"));
+        let (api_tx, _api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let v2 = SubscriptionStreamHarness::start(
+            "sub-heartbeat-v2",
+            serde_json::json!({"subscriptions": [{"type": "workspace.created"}], "events_v2": true}),
+            api_tx.clone(),
+            &event_hub,
+            Duration::from_millis(150),
+        );
+        let legacy = SubscriptionStreamHarness::start(
+            "sub-heartbeat-v1",
+            serde_json::json!({"subscriptions": [{"type": "workspace.created"}]}),
+            api_tx,
+            &event_hub,
+            Duration::from_millis(150),
+        );
+        assert_eq!(v2.next()["result"]["type"], "subscription_started");
+        assert_eq!(legacy.next()["result"]["type"], "subscription_started");
+
+        let heartbeat = serde_json::json!({"control": "heartbeat", "seq": 1});
+        assert_eq!(v2.next(), heartbeat);
+        assert_eq!(v2.next(), heartbeat);
+        assert!(legacy
+            .lines
+            .recv_timeout(Duration::from_millis(500))
+            .is_err());
+        v2.stop();
+        legacy.stop();
+    }
+
+    #[test]
+    fn v2_subscription_skips_missing_pane_entries_and_keeps_the_rest() {
+        let (api_tx, _blocked, _release) = spawn_gated_pane_responder();
+        let event_hub = EventHub::default();
+        let stream = SubscriptionStreamHarness::start(
+            "sub-rejected",
+            serde_json::json!({
+                "subscriptions": [
+                    {"type": "pane.turn_completed", "pane_id": "gone"},
+                    {"type": "workspace.focused"}
+                ],
+                "events_v2": true,
+            }),
+            api_tx,
+            &event_hub,
+            SUBSCRIPTION_HEARTBEAT_INTERVAL,
+        );
+        let ack = stream.next();
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(
+            ack["result"]["rejected"],
+            serde_json::json!([{"index": 0, "error": {"code": "pane_not_found", "message": "pane gone not found"}}])
+        );
+        event_hub.push(focused_event("w1"));
+        assert_eq!(stream.next()["data"]["workspace_id"], "w1");
+        stream.stop();
+    }
+
+    #[test]
+    fn ping_advertises_events_v2() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let response = handle_request(
+            Request {
+                id: "req_1".into(),
+                method: Method::Ping(crate::api::schema::PingParams::default()),
+            },
+            &tx,
+            default_capabilities(),
+            None,
+            None,
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["result"]["capabilities"]["events_v2"], true);
     }
 
     #[test]
@@ -3810,6 +4282,7 @@ mod federation_tests {
                 id: "fed_sub".into(),
                 method: Method::EventsSubscribe(EventsSubscribeParams {
                     subscriptions: vec![Subscription::PaneClosed {}],
+                    events_v2: false,
                 }),
             })
             .expect("open subscription stream");
@@ -5177,14 +5650,14 @@ mod federation_tests {
             crate::ipc::connect_local_stream(socket).expect("connect bridge before failure");
         failing.write_all(b"trigger\n").unwrap();
         drop(failing);
-        let failure_deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !bridge_failed.exists() && std::time::Instant::now() < failure_deadline {
+        let failure_deadline = Instant::now() + Duration::from_secs(2);
+        while !bridge_failed.exists() && Instant::now() < failure_deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(bridge_failed.exists(), "fake SSH process did not fail");
         std::fs::remove_file(&fail_bridge).unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = Instant::now() + Duration::from_secs(3);
         let recovered_line = loop {
             if let Ok(stream) = crate::ipc::connect_local_stream(socket) {
                 let mut recovered = BufReader::new(stream);
@@ -5196,15 +5669,15 @@ mod federation_tests {
                 }
             }
             assert!(
-                std::time::Instant::now() < deadline,
+                Instant::now() < deadline,
                 "bridge supervisor did not recover after the SSH process failed"
             );
             std::thread::sleep(Duration::from_millis(10));
         };
         assert_eq!(recovered_line, "recovered\n");
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !args_log.exists() && std::time::Instant::now() < deadline {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !args_log.exists() && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
         let args = std::fs::read_to_string(&args_log).expect("fake SSH invocation captured");

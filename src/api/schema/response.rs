@@ -258,7 +258,12 @@ pub enum ResponseResult {
     AgentExplain {
         explain: serde_json::Value,
     },
-    SubscriptionStarted {},
+    SubscriptionStarted {
+        /// Entries an `events_v2` request skipped because their pane does not
+        /// exist. Omitted when every entry was subscribed.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        rejected: Vec<super::events::SubscriptionRejection>,
+    },
     WaitMatched {
         event: EventEnvelope,
     },

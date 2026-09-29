@@ -2502,6 +2502,7 @@ mod tests {
                 gram_upload_stream: false,
                 agent_session_transfer: false,
                 agent_session_transfer_harnesses: Vec::new(),
+                events_v2: false,
             }),
         };
         let missing_baseline = crate::api::RuntimeStatus {
@@ -2580,6 +2581,7 @@ mod tests {
                     gram_upload_stream: false,
                     agent_session_transfer: false,
                     agent_session_transfer_harnesses: Vec::new(),
+                    events_v2: false,
                 }),
             },
         };
@@ -2844,6 +2846,7 @@ mod tests {
                     gram_upload_stream: false,
                     agent_session_transfer: false,
                     agent_session_transfer_harnesses: Vec::new(),
+                    events_v2: false,
                 }),
             },
         };

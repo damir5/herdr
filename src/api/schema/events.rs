@@ -11,6 +11,13 @@ use super::worktrees::WorktreeInfo;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct EventsSubscribeParams {
     pub subscriptions: Vec<Subscription>,
+    /// Opt into the stream contract a server advertises with the `events_v2`
+    /// capability: `control` lines (`lagged`, `heartbeat`) are interleaved with
+    /// events, and entries naming a pane that does not exist are reported in
+    /// the acknowledgement's `rejected` list instead of failing the request.
+    /// Servers without the capability ignore this field.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub events_v2: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -72,14 +79,22 @@ pub enum Subscription {
         #[serde(default = "super::common::default_true")]
         strip_ansi: bool,
     },
+    /// Omitting `pane_id` watches every pane, including panes created after
+    /// the subscription started (servers advertising `events_v2`).
     #[serde(rename = "pane.agent_status_changed")]
     PaneAgentStatusChanged {
-        pane_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_status: Option<AgentStatus>,
     },
+    /// Omitting `pane_id` watches every pane, including panes created after
+    /// the subscription started (servers advertising `events_v2`).
     #[serde(rename = "pane.turn_completed")]
-    PaneTurnCompleted { pane_id: String },
+    PaneTurnCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pane_id: Option<String>,
+    },
     #[serde(rename = "pane.scroll_changed")]
     PaneScrollChanged { pane_id: String },
     #[serde(rename = "layout.updated")]
@@ -385,6 +400,54 @@ pub enum SubscriptionEventKind {
 pub struct SubscriptionEventEnvelope {
     pub event: SubscriptionEventKind,
     pub data: SubscriptionEventData,
+}
+
+/// Payload of an `events.subscribe` stream event line: a lifecycle event or a
+/// pane subscription event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum SubscriptionStreamPayload {
+    Event(Box<EventEnvelope>),
+    Subscription(Box<SubscriptionEventEnvelope>),
+}
+
+/// One event line on an `events.subscribe` stream after the acknowledgement.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionStreamEvent {
+    /// Event hub sequence number. It never decreases along a stream. Lines for
+    /// hub events carry that event's number; lines Herdr derives from pane
+    /// state (initial or snapshot status changes, output matches, scroll
+    /// changes) carry the hub sequence they were computed at, so several lines
+    /// can share a number. Numbers restart when the server restarts.
+    pub seq: u64,
+    #[serde(flatten)]
+    pub payload: SubscriptionStreamPayload,
+}
+
+/// Stream-level line interleaved with events on an `events_v2` subscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(tag = "control", rename_all = "snake_case")]
+pub enum SubscriptionControlLine {
+    /// The server's event ring dropped events this stream had not read yet.
+    /// Events numbered `first_missed_seq` through `last_missed_seq` may be
+    /// missing, so resynchronize from a snapshot. `seq` equals
+    /// `last_missed_seq`; delivery continues with later events.
+    Lagged {
+        seq: u64,
+        first_missed_seq: u64,
+        last_missed_seq: u64,
+    },
+    /// Written when the stream has been otherwise quiet for 15 seconds. `seq`
+    /// is the hub sequence the stream has read through.
+    Heartbeat { seq: u64 },
+}
+
+/// A subscription entry an `events_v2` request skipped instead of failing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct SubscriptionRejection {
+    /// Position of the entry in the request's `subscriptions` list.
+    pub index: usize,
+    pub error: super::ErrorBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

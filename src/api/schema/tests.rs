@@ -136,6 +136,8 @@ fn protocol_schema_document() -> serde_json::Value {
             "error_response": protocol_schema_entry::<ErrorResponse>("error_response"),
             "event": protocol_schema_entry::<EventEnvelope>("event"),
             "subscription_event": protocol_schema_entry::<SubscriptionEventEnvelope>("subscription_event"),
+            "subscription_stream_event": protocol_schema_entry::<SubscriptionStreamEvent>("subscription_stream_event"),
+            "subscription_control": protocol_schema_entry::<SubscriptionControlLine>("subscription_control"),
         },
     })
 }
@@ -864,11 +866,11 @@ fn subscribe_request_parses_parameterized_subscriptions() {
         Subscription::PaneAgentStatusChanged {
             pane_id,
             agent_status: Some(AgentStatus::Done),
-        } if pane_id == "p_1_1"
+        } if pane_id.as_deref() == Some("p_1_1")
     ));
     assert!(matches!(
         &params.subscriptions[2],
-        Subscription::PaneTurnCompleted { pane_id } if pane_id == "p_1_1"
+        Subscription::PaneTurnCompleted { pane_id } if pane_id.as_deref() == Some("p_1_1")
     ));
     assert!(matches!(
         &params.subscriptions[3],
@@ -1117,6 +1119,7 @@ fn success_response_round_trips() {
                     AgentSessionTransferHarness::Codex,
                     AgentSessionTransferHarness::Omp,
                 ],
+                events_v2: false,
             }),
         },
     };
@@ -1278,6 +1281,7 @@ fn worktree_lifecycle_events_round_trip() {
                 Subscription::WorktreeOpened {},
                 Subscription::WorktreeRemoved {},
             ],
+            events_v2: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();
@@ -1636,6 +1640,7 @@ fn authority_mutation_requests_round_trip() {
                 Subscription::TabMoved {},
                 Subscription::LayoutUpdated {},
             ],
+            events_v2: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();

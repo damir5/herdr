@@ -2687,6 +2687,10 @@
         },
         "EventsSubscribeParams": {
           "properties": {
+            "events_v2": {
+              "description": "Opt into the stream contract a server advertises with the `events_v2`\ncapability: `control` lines (`lagged`, `heartbeat`) are interleaved with\nevents, and entries naming a pane that does not exist are reported in\nthe acknowledgement's `rejected` list instead of failing the request.\nServers without the capability ignore this field.",
+              "type": "boolean"
+            },
             "subscriptions": {
               "items": {
                 "$ref": "#/schemas/request/$defs/Subscription"
@@ -5521,6 +5525,7 @@
               "type": "object"
             },
             {
+              "description": "Omitting `pane_id` watches every pane, including panes created after\nthe subscription started (servers advertising `events_v2`).",
               "properties": {
                 "agent_status": {
                   "anyOf": [
@@ -5533,7 +5538,10 @@
                   ]
                 },
                 "pane_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "pane.agent_status_changed",
@@ -5541,15 +5549,18 @@
                 }
               },
               "required": [
-                "type",
-                "pane_id"
+                "type"
               ],
               "type": "object"
             },
             {
+              "description": "Omitting `pane_id` watches every pane, including panes created after\nthe subscription started (servers advertising `events_v2`).",
               "properties": {
                 "pane_id": {
-                  "type": "string"
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "type": {
                   "const": "pane.turn_completed",
@@ -5557,8 +5568,7 @@
                 }
               },
               "required": [
-                "type",
-                "pane_id"
+                "type"
               ],
               "type": "object"
             },
@@ -8203,6 +8213,63 @@
       "title": "Request",
       "type": "object"
     },
+    "subscription_control": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "description": "Stream-level line interleaved with events on an `events_v2` subscription.",
+      "oneOf": [
+        {
+          "description": "The server's event ring dropped events this stream had not read yet.\nEvents numbered `first_missed_seq` through `last_missed_seq` may be\nmissing, so resynchronize from a snapshot. `seq` equals\n`last_missed_seq`; delivery continues with later events.",
+          "properties": {
+            "control": {
+              "const": "lagged",
+              "type": "string"
+            },
+            "first_missed_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "last_missed_seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "control",
+            "seq",
+            "first_missed_seq",
+            "last_missed_seq"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Written when the stream has been otherwise quiet for 15 seconds. `seq`\nis the hub sequence the stream has read through.",
+          "properties": {
+            "control": {
+              "const": "heartbeat",
+              "type": "string"
+            },
+            "seq": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "control",
+            "seq"
+          ],
+          "type": "object"
+        }
+      ],
+      "title": "SubscriptionControlLine"
+    },
     "subscription_event": {
       "$defs": {
         "AgentSessionInfo": {
@@ -8885,6 +8952,1793 @@
         "data"
       ],
       "title": "SubscriptionEventEnvelope",
+      "type": "object"
+    },
+    "subscription_stream_event": {
+      "$defs": {
+        "AgentSessionInfo": {
+          "properties": {
+            "agent": {
+              "type": "string"
+            },
+            "kind": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/AgentSessionRefKind"
+            },
+            "source": {
+              "type": "string"
+            },
+            "value": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "source",
+            "agent",
+            "kind",
+            "value"
+          ],
+          "type": "object"
+        },
+        "AgentSessionRefKind": {
+          "enum": [
+            "id",
+            "path"
+          ],
+          "type": "string"
+        },
+        "AgentStatus": {
+          "enum": [
+            "idle",
+            "working",
+            "blocked",
+            "done",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerAuthor": {
+          "oneOf": [
+            {
+              "const": "human",
+              "description": "Typed or pasted at the keyboard by a person.",
+              "type": "string"
+            },
+            {
+              "const": "api_client",
+              "description": "Written by a client through the JSON API.",
+              "type": "string"
+            }
+          ]
+        },
+        "ComposerCursorEvidence": {
+          "enum": [
+            "draft",
+            "suggestion",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerEvidence": {
+          "properties": {
+            "cursor": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerCursorEvidence"
+            },
+            "frame_stable": {
+              "type": "boolean"
+            },
+            "provenance": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerProvenance"
+            },
+            "region": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerRegionEvidence"
+            },
+            "style": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerStyleEvidence"
+            }
+          },
+          "required": [
+            "provenance",
+            "region",
+            "cursor",
+            "style",
+            "frame_stable"
+          ],
+          "type": "object"
+        },
+        "ComposerInfo": {
+          "properties": {
+            "attempt_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "author": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/ComposerAuthor"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Who put this text here, as distinct from `provenance`, which says only\nhow it arrived. `provenance: agent_prompt` names a channel and was\nroutinely read as naming a sender; that inference is what misattributed\neleven keyboard-typed messages to the last API prompter (#31)."
+            },
+            "evidence": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerEvidence",
+              "default": {
+                "cursor": "unavailable",
+                "frame_stable": false,
+                "provenance": "unknown",
+                "region": "unavailable",
+                "style": "unavailable"
+              }
+            },
+            "state": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerState"
+            },
+            "submit_abandoned": {
+              "description": "True when a delayed prompt submission was withheld because the pane's\noccupant changed before the submitting key could be written. The text is\nin the composer and no turn started; the caller was already told the\nprompt was received, so this is the only place that fact surfaces.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "state"
+          ],
+          "type": "object"
+        },
+        "ComposerProvenance": {
+          "enum": [
+            "none",
+            "human",
+            "api",
+            "agent_prompt",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerRegionEvidence": {
+          "enum": [
+            "empty",
+            "text",
+            "missing",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "ComposerState": {
+          "enum": [
+            "empty",
+            "draft_present",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "ComposerStyleEvidence": {
+          "enum": [
+            "neutral",
+            "conflict",
+            "unavailable"
+          ],
+          "type": "string"
+        },
+        "EventData": {
+          "oneOf": [
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_created",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_metadata_updated",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_closed",
+                  "type": "string"
+                },
+                "workspace": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "workspace_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "workspace_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "insert_index",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "before_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "workspace_reordered",
+                  "type": "string"
+                },
+                "workspace_ids": {
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "workspaces": {
+                  "items": {
+                    "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                  },
+                  "type": "array"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_ids",
+                "workspaces"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "workspace_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "worktree_created",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                },
+                "worktree": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorktreeInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace",
+                "worktree"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "already_open": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "worktree_opened",
+                  "type": "string"
+                },
+                "workspace": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                },
+                "worktree": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorktreeInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace",
+                "worktree",
+                "already_open"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "forced": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "worktree_removed",
+                  "type": "string"
+                },
+                "workspace": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "workspace_id": {
+                  "type": "string"
+                },
+                "worktree": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorktreeInfo"
+                }
+              },
+              "required": [
+                "type",
+                "workspace_id",
+                "worktree",
+                "forced"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "tab": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/TabInfo"
+                },
+                "type": {
+                  "const": "tab_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "label": {
+                  "type": "string"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_renamed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id",
+                "label"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "insert_index": {
+                  "format": "uint",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tab_id": {
+                  "type": "string"
+                },
+                "tabs": {
+                  "items": {
+                    "$ref": "#/schemas/subscription_stream_event/$defs/TabInfo"
+                  },
+                  "type": "array"
+                },
+                "type": {
+                  "const": "tab_moved",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id",
+                "insert_index",
+                "tabs"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "tab_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "tab_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "tab_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "pane_created",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_closed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/PaneInfo"
+                },
+                "type": {
+                  "const": "pane_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_focused",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "closed_tab_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "closed_workspace_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "created_tab": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/TabInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "created_workspace": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceInfo"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/PaneInfo"
+                },
+                "previous_pane_id": {
+                  "type": "string"
+                },
+                "previous_tab_id": {
+                  "type": "string"
+                },
+                "previous_workspace_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_moved",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "previous_pane_id",
+                "previous_workspace_id",
+                "previous_tab_id",
+                "pane"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "revision": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_output_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "revision"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "pane_id": {
+                  "type": "string"
+                },
+                "type": {
+                  "const": "pane_exited",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "final_status": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "released": {
+                  "type": "boolean"
+                },
+                "type": {
+                  "const": "pane_agent_detected",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "agent_status": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+                },
+                "display_agent": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "input_pending": {
+                  "type": "boolean"
+                },
+                "input_prompt_kind": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/schemas/subscription_stream_event/$defs/InputPromptKind"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "pane_id": {
+                  "type": "string"
+                },
+                "state_labels": {
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "type": "object"
+                },
+                "title": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "turn": {
+                  "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "turn_epoch": {
+                  "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
+                },
+                "type": {
+                  "const": "pane_agent_status_changed",
+                  "type": "string"
+                },
+                "workspace_id": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane_id",
+                "workspace_id",
+                "agent_status"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "agent_session_path": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "completed_unix_ms": {
+                  "description": "Unix timestamp in milliseconds.",
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "message": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "message_truncated": {
+                  "type": "boolean"
+                },
+                "outcome": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/TurnOutcome",
+                  "description": "`completed` means the agent became idle normally; `aborted` means it\nbecame idle within 15 seconds of an Esc or Ctrl+C interrupt."
+                },
+                "pane": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/PaneInfo"
+                },
+                "turn": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "turn_epoch": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "type": {
+                  "const": "pane_turn_completed",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "pane",
+                "turn",
+                "turn_epoch",
+                "outcome",
+                "completed_unix_ms"
+              ],
+              "type": "object"
+            },
+            {
+              "properties": {
+                "layout": {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/PaneLayoutSnapshot"
+                },
+                "type": {
+                  "const": "layout_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "layout"
+              ],
+              "type": "object"
+            }
+          ]
+        },
+        "EventEnvelope": {
+          "properties": {
+            "data": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/EventData"
+            },
+            "event": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/EventKind"
+            }
+          },
+          "required": [
+            "event",
+            "data"
+          ],
+          "type": "object"
+        },
+        "EventKind": {
+          "enum": [
+            "workspace_created",
+            "workspace_updated",
+            "workspace_metadata_updated",
+            "workspace_closed",
+            "workspace_renamed",
+            "workspace_moved",
+            "workspace_reordered",
+            "workspace_focused",
+            "worktree_created",
+            "worktree_opened",
+            "worktree_removed",
+            "tab_created",
+            "tab_closed",
+            "tab_renamed",
+            "tab_moved",
+            "tab_focused",
+            "pane_created",
+            "pane_closed",
+            "pane_updated",
+            "pane_focused",
+            "pane_moved",
+            "pane_output_changed",
+            "pane_exited",
+            "pane_agent_detected",
+            "pane_agent_status_changed",
+            "pane_turn_completed",
+            "layout_updated"
+          ],
+          "type": "string"
+        },
+        "InputPromptKind": {
+          "description": "Best-effort classification of a live agent-owned input prompt.",
+          "enum": [
+            "confirm",
+            "select",
+            "free_text",
+            "unknown"
+          ],
+          "type": "string"
+        },
+        "LastCompletedTurn": {
+          "properties": {
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "turn_epoch",
+            "completed_unix_ms"
+          ],
+          "type": "object"
+        },
+        "PaneAgentStatusChangedEvent": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+            },
+            "display_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "state_labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "agent_status"
+          ],
+          "type": "object"
+        },
+        "PaneInfo": {
+          "properties": {
+            "agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "agent_session": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/AgentSessionInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+            },
+            "alternate_screen": {
+              "type": "boolean"
+            },
+            "composer": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ComposerInfo",
+              "default": {
+                "evidence": {
+                  "cursor": "unavailable",
+                  "frame_stable": false,
+                  "provenance": "unknown",
+                  "region": "unavailable",
+                  "style": "unavailable"
+                },
+                "state": "unknown"
+              },
+              "description": "Best-effort composer state. Older daemons omit this field; consumers\nmust treat that as `unknown`, never as an empty composer."
+            },
+            "cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "display_agent": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "foreground_cwd": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "input_pending": {
+              "type": "boolean"
+            },
+            "input_prompt_kind": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/InputPromptKind"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "label": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "last_completed_turn": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/LastCompletedTurn"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "scroll": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/PaneScrollInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "state_labels": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "terminal_id": {
+              "type": "string"
+            },
+            "terminal_title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "terminal_title_stripped": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "title": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "tokens": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "type": "object"
+            },
+            "turn": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "turn_epoch": {
+              "description": "Advisory hint only; use `pane.turns` replay as the completeness authority.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "terminal_id",
+            "workspace_id",
+            "tab_id",
+            "focused",
+            "agent_status",
+            "revision"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutPane": {
+          "properties": {
+            "focused": {
+              "type": "boolean"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "rect": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneLayoutRect"
+            }
+          },
+          "required": [
+            "pane_id",
+            "focused",
+            "rect"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutRect": {
+          "properties": {
+            "height": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "width": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "x": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
+            "y": {
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "x",
+            "y",
+            "width",
+            "height"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutSnapshot": {
+          "properties": {
+            "area": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneLayoutRect"
+            },
+            "focused_pane_id": {
+              "type": "string"
+            },
+            "panes": {
+              "items": {
+                "$ref": "#/schemas/subscription_stream_event/$defs/PaneLayoutPane"
+              },
+              "type": "array"
+            },
+            "splits": {
+              "items": {
+                "$ref": "#/schemas/subscription_stream_event/$defs/PaneLayoutSplit"
+              },
+              "type": "array"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            },
+            "zoomed": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "workspace_id",
+            "tab_id",
+            "zoomed",
+            "area",
+            "focused_pane_id",
+            "panes",
+            "splits"
+          ],
+          "type": "object"
+        },
+        "PaneLayoutSplit": {
+          "properties": {
+            "direction": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/SplitDirection"
+            },
+            "id": {
+              "type": "string"
+            },
+            "ratio": {
+              "format": "float",
+              "type": "number"
+            },
+            "rect": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneLayoutRect"
+            }
+          },
+          "required": [
+            "id",
+            "direction",
+            "ratio",
+            "rect"
+          ],
+          "type": "object"
+        },
+        "PaneOutputMatchedEvent": {
+          "properties": {
+            "matched_line": {
+              "type": "string"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "read": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneReadResult"
+            }
+          },
+          "required": [
+            "pane_id",
+            "matched_line",
+            "read"
+          ],
+          "type": "object"
+        },
+        "PaneReadResult": {
+          "properties": {
+            "format": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ReadFormat"
+            },
+            "pane_id": {
+              "type": "string"
+            },
+            "revision": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "source": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/ReadSource"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "truncated": {
+              "type": "boolean"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "tab_id",
+            "source",
+            "format",
+            "text",
+            "revision",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "PaneScrollChangedEvent": {
+          "properties": {
+            "pane_id": {
+              "type": "string"
+            },
+            "scroll": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneScrollInfo"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "pane_id",
+            "workspace_id",
+            "scroll"
+          ],
+          "type": "object"
+        },
+        "PaneScrollInfo": {
+          "properties": {
+            "max_offset_from_bottom": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "offset_from_bottom": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "viewport_rows": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "offset_from_bottom",
+            "max_offset_from_bottom",
+            "viewport_rows"
+          ],
+          "type": "object"
+        },
+        "PaneTurnCompletedEvent": {
+          "properties": {
+            "agent_session_path": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "completed_unix_ms": {
+              "description": "Unix timestamp in milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "message": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "message_truncated": {
+              "type": "boolean"
+            },
+            "outcome": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/TurnOutcome",
+              "description": "`completed` means the agent became idle normally; `aborted` means it\nbecame idle within 15 seconds of an Esc or Ctrl+C interrupt."
+            },
+            "pane": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneInfo"
+            },
+            "turn": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "turn_epoch": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "pane",
+            "turn",
+            "turn_epoch",
+            "outcome",
+            "completed_unix_ms"
+          ],
+          "type": "object"
+        },
+        "ReadFormat": {
+          "enum": [
+            "text",
+            "ansi"
+          ],
+          "type": "string"
+        },
+        "ReadSource": {
+          "enum": [
+            "visible",
+            "recent",
+            "recent_unwrapped",
+            "detection"
+          ],
+          "type": "string"
+        },
+        "SplitDirection": {
+          "enum": [
+            "right",
+            "down"
+          ],
+          "type": "string"
+        },
+        "SubscriptionEventData": {
+          "anyOf": [
+            {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneOutputMatchedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneAgentStatusChangedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneTurnCompletedEvent"
+            },
+            {
+              "$ref": "#/schemas/subscription_stream_event/$defs/PaneScrollChangedEvent"
+            }
+          ]
+        },
+        "SubscriptionEventEnvelope": {
+          "properties": {
+            "data": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/SubscriptionEventData"
+            },
+            "event": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/SubscriptionEventKind"
+            }
+          },
+          "required": [
+            "event",
+            "data"
+          ],
+          "type": "object"
+        },
+        "SubscriptionEventKind": {
+          "enum": [
+            "pane.output_matched",
+            "pane.agent_status_changed",
+            "pane.turn_completed",
+            "pane.scroll_changed"
+          ],
+          "type": "string"
+        },
+        "TabInfo": {
+          "properties": {
+            "agent_status": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "number": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_id": {
+              "type": "string"
+            },
+            "workspace_id": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "tab_id",
+            "workspace_id",
+            "number",
+            "label",
+            "focused",
+            "pane_count",
+            "agent_status"
+          ],
+          "type": "object"
+        },
+        "TurnOutcome": {
+          "oneOf": [
+            {
+              "const": "completed",
+              "description": "The agent became idle without a recent interrupt.",
+              "type": "string"
+            },
+            {
+              "const": "aborted",
+              "description": "The agent became idle within 15 seconds of an Esc or Ctrl+C interrupt.",
+              "type": "string"
+            }
+          ]
+        },
+        "WorkspaceInfo": {
+          "properties": {
+            "active_tab_id": {
+              "type": "string"
+            },
+            "agent_status": {
+              "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+            },
+            "focused": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "number": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "pane_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tab_count": {
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "tokens": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "maxProperties": 32,
+              "propertyNames": {
+                "pattern": "^[A-Za-z0-9_-]{1,32}$"
+              },
+              "type": "object"
+            },
+            "workspace_id": {
+              "type": "string"
+            },
+            "worktree": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/WorkspaceWorktreeInfo"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            }
+          },
+          "required": [
+            "workspace_id",
+            "number",
+            "label",
+            "focused",
+            "pane_count",
+            "tab_count",
+            "active_tab_id",
+            "agent_status"
+          ],
+          "type": "object"
+        },
+        "WorkspaceWorktreeInfo": {
+          "properties": {
+            "checkout_path": {
+              "type": "string"
+            },
+            "is_linked_worktree": {
+              "type": "boolean"
+            },
+            "repo_key": {
+              "type": "string"
+            },
+            "repo_name": {
+              "type": "string"
+            },
+            "repo_root": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "repo_key",
+            "repo_name",
+            "repo_root",
+            "checkout_path",
+            "is_linked_worktree"
+          ],
+          "type": "object"
+        },
+        "WorktreeInfo": {
+          "properties": {
+            "branch": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "is_bare": {
+              "type": "boolean"
+            },
+            "is_detached": {
+              "type": "boolean"
+            },
+            "is_linked_worktree": {
+              "type": "boolean"
+            },
+            "is_prunable": {
+              "type": "boolean"
+            },
+            "label": {
+              "type": "string"
+            },
+            "open_workspace_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "path": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "path",
+            "is_bare",
+            "is_detached",
+            "is_prunable",
+            "is_linked_worktree",
+            "label"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "anyOf": [
+        {
+          "$ref": "#/schemas/subscription_stream_event/$defs/EventEnvelope"
+        },
+        {
+          "$ref": "#/schemas/subscription_stream_event/$defs/SubscriptionEventEnvelope"
+        }
+      ],
+      "description": "One event line on an `events.subscribe` stream after the acknowledgement.",
+      "properties": {
+        "seq": {
+          "description": "Event hub sequence number. It never decreases along a stream. Lines for\nhub events carry that event's number; lines Herdr derives from pane\nstate (initial or snapshot status changes, output matches, scroll\nchanges) carry the hub sequence they were computed at, so several lines\ncan share a number. Numbers restart when the server restarts.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "seq"
+      ],
+      "title": "SubscriptionStreamEvent",
       "type": "object"
     },
     "success_response": {
@@ -9874,6 +11728,21 @@
           "required": [
             "name",
             "is_dir"
+          ],
+          "type": "object"
+        },
+        "ErrorBody": {
+          "properties": {
+            "code": {
+              "type": "string"
+            },
+            "message": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "code",
+            "message"
           ],
           "type": "object"
         },
@@ -14260,6 +16129,13 @@
             },
             {
               "properties": {
+                "rejected": {
+                  "description": "Entries an `events_v2` request skipped because their pane does not\nexist. Omitted when every entry was subscribed.",
+                  "items": {
+                    "$ref": "#/schemas/success_response/$defs/SubscriptionRejection"
+                  },
+                  "type": "array"
+                },
                 "type": {
                   "const": "subscription_started",
                   "type": "string"
@@ -15178,6 +17054,11 @@
                 "null"
               ]
             },
+            "events_v2": {
+              "default": false,
+              "description": "`events.subscribe` accepts `events_v2: true` (sequence-numbered lines,\n`lagged` and `heartbeat` control lines, per-entry `pane_not_found`\nrejection) and all-pane `pane.agent_status_changed` and\n`pane.turn_completed` entries without a `pane_id`.",
+              "type": "boolean"
+            },
             "gram_upload_stream": {
               "default": false,
               "description": "The daemon serves `gram.upload.stream`, uploading a whole file over one\nconnection instead of one connection per chunk. Clients feature-detect this\nand otherwise fall back to per-chunk `gram.upload_chunk`.",
@@ -15301,6 +17182,25 @@
             "version",
             "sha",
             "built_at"
+          ],
+          "type": "object"
+        },
+        "SubscriptionRejection": {
+          "description": "A subscription entry an `events_v2` request skipped instead of failing.",
+          "properties": {
+            "error": {
+              "$ref": "#/schemas/success_response/$defs/ErrorBody"
+            },
+            "index": {
+              "description": "Position of the entry in the request's `subscriptions` list.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "index",
+            "error"
           ],
           "type": "object"
         },

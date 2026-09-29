@@ -100,6 +100,10 @@ pub(super) struct ActiveAgentStatusChangedSubscription {
     last_sequence: u64,
     initial_event: Option<PaneAgentStatusChangedEvent>,
     request_prefix: String,
+    /// An alias-qualified pane of a federation peer. Its changes arrive only
+    /// as events the relay pushes into the hub; the local app cannot
+    /// `pane.get` it.
+    remote: bool,
 }
 
 /// `pane.agent_status_changed` without a `pane_id`: every local pane plus any
@@ -201,7 +205,7 @@ fn status_event_from_pane(pane: PaneInfo) -> PaneAgentStatusChangedEvent {
     }
 }
 
-fn status_event_from_hub(event: &EventEnvelope) -> Option<PaneAgentStatusChangedEvent> {
+pub(super) fn status_event_from_hub(event: &EventEnvelope) -> Option<PaneAgentStatusChangedEvent> {
     if event.event != EventKind::PaneAgentStatusChanged {
         return None;
     }
@@ -361,25 +365,25 @@ impl ActiveSubscription {
                 agent_status,
             } => {
                 let last_sequence = event_hub.current_sequence();
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
-                let last_status = probe.agent_status;
-                let last_presentation = PanePresentationSnapshot::from(&probe);
-                let last_input = (probe.input_pending, probe.input_prompt_kind);
-                let pane_id = probe.pane_id.clone();
+                let probe =
+                    probe_pane(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                let last = PaneStatusSnapshot::from_event(&probe.event);
+                let pane_id = probe.event.pane_id.clone();
                 let initial_event = agent_status
-                    .is_some_and(|wanted| wanted == probe.agent_status)
-                    .then(|| status_event_from_pane(probe));
+                    .is_some_and(|wanted| wanted == probe.event.agent_status)
+                    .then_some(probe.event);
 
                 Ok(Self::AgentStatusChanged(Box::new(
                     ActiveAgentStatusChangedSubscription {
                         pane_id,
                         status_filter: agent_status,
-                        last_status: Some(last_status),
-                        last_presentation: Some(last_presentation),
-                        last_input: Some(last_input),
+                        last_status: Some(last.status),
+                        last_presentation: Some(last.presentation),
+                        last_input: Some(last.input),
                         last_sequence,
                         initial_event,
                         request_prefix: format!("{request_id}:sub:{index}"),
+                        remote: probe.remote,
                     },
                 )))
             }
@@ -406,9 +410,10 @@ impl ActiveSubscription {
                 pane_id: Some(pane_id),
             } => {
                 let last_sequence = event_hub.current_sequence();
-                let probe = pane_get(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
+                let probe =
+                    probe_pane(format!("{request_id}:sub:{index}:probe"), &pane_id, api_tx)?;
                 Ok(Self::TurnCompleted(ActiveTurnCompletedSubscription {
-                    pane_id: Some(probe.pane_id),
+                    pane_id: Some(probe.event.pane_id),
                     last_sequence,
                 }))
             }
@@ -582,6 +587,9 @@ impl ActiveAgentStatusChangedSubscription {
             )]);
         }
 
+        if self.remote {
+            return Ok(lines);
+        }
         let before_snapshot_sequence = self.last_sequence;
         let pane = pane_get(
             format!("{}:pane", self.request_prefix),
@@ -863,6 +871,70 @@ fn pane_get(
             message: "failed to decode pane get result".into(),
         },
     })
+}
+
+/// A subscribed pane's current status and whether it belongs to a federation
+/// peer.
+struct PaneProbe {
+    event: PaneAgentStatusChangedEvent,
+    remote: bool,
+}
+
+/// Probe the pane a subscription names. An alias-qualified id
+/// (`<alias>/w1:p9`) that names a cached peer agent is seeded from the
+/// coordinator's federation directory, since the peer's events reach the local
+/// hub through the relay; any other id, including an unknown alias or pane,
+/// is a local `pane.get` and fails with `pane_not_found` as before.
+fn probe_pane(
+    request_id: String,
+    pane_id: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<PaneProbe, ErrorResponse> {
+    if pane_id.contains('/') {
+        if let Some(agent) = remote_agent(&request_id, pane_id, api_tx)? {
+            return Ok(PaneProbe {
+                event: crate::api::federation_store::agent_status_event(&agent),
+                remote: true,
+            });
+        }
+    }
+    let pane = pane_get(request_id, pane_id, api_tx)?;
+    Ok(PaneProbe {
+        event: status_event_from_pane(pane),
+        remote: false,
+    })
+}
+
+/// The federation directory's agent for an alias-qualified pane id, read from
+/// `agent.list` (the coordinator merges its peers' cached agents there).
+fn remote_agent(
+    request_id: &str,
+    pane_id: &str,
+    api_tx: &ApiRequestSender,
+) -> Result<Option<crate::api::schema::AgentInfo>, ErrorResponse> {
+    let internal_error = |message: &str| ErrorResponse {
+        id: request_id.to_string(),
+        error: ErrorBody {
+            code: "internal_error".into(),
+            message: message.into(),
+        },
+    };
+    let response = dispatch_to_app_with_timeout(
+        Request {
+            id: format!("{request_id}:agents"),
+            method: Method::AgentList(crate::api::schema::AgentListParams { local_only: false }),
+        },
+        api_tx,
+        Some(APP_RESPONSE_TIMEOUT),
+    );
+    let response = serde_json::from_str::<crate::api::schema::SuccessResponse>(&response)
+        .map_err(|_| internal_error("failed to decode agent list response"))?;
+    let crate::api::schema::ResponseResult::AgentList { agents, .. } = response.result else {
+        return Err(internal_error("unexpected agent list result"));
+    };
+    Ok(agents
+        .into_iter()
+        .find(|agent| agent.machine_id.is_some() && agent.pane_id == pane_id))
 }
 
 fn pane_list(
@@ -1173,6 +1245,7 @@ mod tests {
             last_sequence: event_hub.current_sequence(),
             initial_event: None,
             request_prefix: "test".into(),
+            remote: false,
         };
 
         event_hub.push(presentation_event(Some("short lived")));
@@ -1221,6 +1294,7 @@ mod tests {
                 turn_epoch: None,
             }),
             request_prefix: "test".into(),
+            remote: false,
         };
 
         event_hub.push(presentation_event(Some("short lived")));
@@ -1269,6 +1343,7 @@ mod tests {
                 turn_epoch: None,
             }),
             request_prefix: "test".into(),
+            remote: false,
         };
         let api_tx = tokio::sync::mpsc::unbounded_channel().0;
 
@@ -1324,6 +1399,7 @@ mod tests {
                 turn_epoch: None,
             }),
             request_prefix: "test".into(),
+            remote: false,
         };
 
         event_hub.push(presentation_event(Some("short lived")));

@@ -1282,6 +1282,7 @@ fn worktree_lifecycle_events_round_trip() {
                 Subscription::WorktreeRemoved {},
             ],
             events_v2: false,
+            local_only: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();
@@ -1641,6 +1642,7 @@ fn authority_mutation_requests_round_trip() {
                 Subscription::LayoutUpdated {},
             ],
             events_v2: false,
+            local_only: false,
         }),
     };
     let json = serde_json::to_string(&subscription).unwrap();

@@ -18,6 +18,12 @@ pub struct EventsSubscribeParams {
     /// Servers without the capability ignore this field.
     #[serde(default, skip_serializing_if = "super::is_false")]
     pub events_v2: bool,
+    /// Leave out events this server relays from its own federation peers, so a
+    /// coordinator relaying this server receives only this machine's events
+    /// and never re-exports a third machine's. Servers that relay no peers
+    /// have no such events, so older servers can ignore this field.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub local_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

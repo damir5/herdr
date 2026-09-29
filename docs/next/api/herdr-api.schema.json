@@ -2691,6 +2691,10 @@
               "description": "Opt into the stream contract a server advertises with the `events_v2`\ncapability: `control` lines (`lagged`, `heartbeat`) are interleaved with\nevents, and entries naming a pane that does not exist are reported in\nthe acknowledgement's `rejected` list instead of failing the request.\nServers without the capability ignore this field.",
               "type": "boolean"
             },
+            "local_only": {
+              "description": "Leave out events this server relays from its own federation peers, so a\ncoordinator relaying this server receives only this machine's events\nand never re-exports a third machine's. Servers that relay no peers\nhave no such events, so older servers can ignore this field.",
+              "type": "boolean"
+            },
             "subscriptions": {
               "items": {
                 "$ref": "#/schemas/request/$defs/Subscription"

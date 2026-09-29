@@ -17,7 +17,8 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::api::schema::{
-    AgentInfo, AgentStatus, FederationPollErrorClass, ServerCapabilities, WorkspaceInfo,
+    AgentInfo, AgentStatus, FederationPollErrorClass, PaneAgentStatusChangedEvent,
+    ServerCapabilities, WorkspaceInfo,
 };
 
 /// Reachability of a federation peer, derived from consecutive poll outcomes.
@@ -84,6 +85,33 @@ pub struct PeerObservation {
     pub remote_protocol: Option<u32>,
     pub remote_capabilities: Option<ServerCapabilities>,
 }
+
+/// The last status the event relay published to local subscribers for one
+/// remote pane (ids alias-qualified), and when it did.
+///
+/// This is both the relay's de-duplication baseline and the ordering fence
+/// against the 5 s poll: a poll that started before `at` carries an older view
+/// of the pane, so its status fields yield to this one.
+#[derive(Debug, Clone)]
+pub struct RelayedStatus {
+    pub event: PaneAgentStatusChangedEvent,
+    pub at: Instant,
+}
+
+/// How a relay resynchronization compares a fresh `agent.list` with what it
+/// already published.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RelayResync {
+    /// First stream of this relay: record the current state silently.
+    Seed,
+    /// Reconnect or lag: publish each pane whose state differs from the last
+    /// one published, including panes that appeared meanwhile.
+    Diff,
+    /// The peer restarted: pane ids from the old boot mean nothing, so publish
+    /// every current pane.
+    Reset,
+}
+
 /// One federation peer's cached agents plus its current reachability.
 ///
 /// `agents` are stored already alias-prefixed (see the poll thread); the honest
@@ -107,6 +135,9 @@ pub struct PeerCacheEntry {
     pub last_success_unix_ms: Option<u64>,
     pub last_error_class: Option<FederationPollErrorClass>,
     pub observation: PeerObservation,
+    /// Per remote pane (qualified id), the last status the event relay
+    /// published. Empty for peers without an event stream.
+    pub relayed: HashMap<String, RelayedStatus>,
 }
 
 impl PeerCacheEntry {
@@ -132,6 +163,7 @@ impl PeerCacheEntry {
                 .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
             last_error_class: None,
             observation,
+            relayed: HashMap::new(),
         }
     }
 }
@@ -143,16 +175,149 @@ pub struct FederationStore {
 }
 
 impl FederationStore {
-    /// Replace a peer's cached agent snapshot. Called by the poll thread after
-    /// each successful agent poll. The peer's cached workspaces are carried
-    /// over: they refresh on their own cadence through
-    /// [`Self::set_peer_workspaces`], so an agent poll never blanks them.
-    pub fn set_peer(&mut self, alias: impl Into<String>, mut entry: PeerCacheEntry) {
+    /// Replace a peer's cached agent snapshot outside the poll path (tests),
+    /// as a poll that started now.
+    #[cfg(test)]
+    pub fn set_peer(&mut self, alias: impl Into<String>, entry: PeerCacheEntry) {
+        self.set_polled_peer(alias, entry, Instant::now());
+    }
+
+    /// Replace a peer's cached agent snapshot with a poll that started at
+    /// `poll_started`. The peer's cached workspaces are carried over: they
+    /// refresh on their own cadence through [`Self::set_peer_workspaces`], so
+    /// an agent poll never blanks them.
+    ///
+    /// Ordering against the event relay: a pane whose status the relay
+    /// published after `poll_started` keeps that status (and its turn), since
+    /// this poll's answer may predate it. The relay's baselines are kept,
+    /// except for panes the peer no longer lists that nothing relayed since the
+    /// poll started.
+    pub fn set_polled_peer(
+        &mut self,
+        alias: impl Into<String>,
+        mut entry: PeerCacheEntry,
+        poll_started: Instant,
+    ) {
         let alias = alias.into();
         if let Some(previous) = self.peers.get_mut(&alias) {
             entry.workspaces = std::mem::take(&mut previous.workspaces);
+            entry.relayed = std::mem::take(&mut previous.relayed);
         }
+        for agent in &mut entry.agents {
+            if let Some(relayed) = entry.relayed.get(&agent.pane_id) {
+                if relayed.at > poll_started {
+                    apply_status_event(agent, &relayed.event);
+                }
+            }
+        }
+        let agents = &entry.agents;
+        entry.relayed.retain(|pane_id, relayed| {
+            relayed.at > poll_started || agents.iter().any(|agent| agent.pane_id == *pane_id)
+        });
         self.peers.insert(alias, entry);
+    }
+
+    /// Record one status event the relay received from `alias` (ids already
+    /// qualified) and patch the cached agent. Returns whether it should be
+    /// published: `false` when it repeats the last status published for the
+    /// pane (a transition a resync already reported) or the alias is not
+    /// cached.
+    pub fn relay_status(
+        &mut self,
+        alias: &str,
+        event: &PaneAgentStatusChangedEvent,
+        now: Instant,
+    ) -> bool {
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return false;
+        };
+        if entry
+            .relayed
+            .get(&event.pane_id)
+            .is_some_and(|last| last.event == *event)
+        {
+            return false;
+        }
+        entry.record_relayed(event.clone(), now);
+        true
+    }
+
+    /// Record a relayed `pane.turn_completed`: the pane's turn and epoch move
+    /// forward (never back) in the cache and in the relay baseline, so an older
+    /// poll cannot rewind them.
+    pub fn relay_turn(
+        &mut self,
+        alias: &str,
+        pane_id: &str,
+        turn: u64,
+        turn_epoch: u64,
+        now: Instant,
+    ) {
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return;
+        };
+        let current = entry
+            .relayed
+            .get(pane_id)
+            .map(|relayed| relayed.event.clone())
+            .or_else(|| {
+                entry
+                    .agents
+                    .iter()
+                    .find(|agent| agent.pane_id == pane_id)
+                    .map(agent_status_event)
+            });
+        let Some(mut event) = current else {
+            return;
+        };
+        if (event.turn_epoch, event.turn) >= (Some(turn_epoch), Some(turn)) {
+            return;
+        }
+        event.turn = Some(turn);
+        event.turn_epoch = Some(turn_epoch);
+        entry.record_relayed(event, now);
+    }
+
+    /// Forget a closed remote pane's relay baseline.
+    pub fn relay_pane_closed(&mut self, alias: &str, pane_id: &str) {
+        if let Some(entry) = self.peers.get_mut(alias) {
+            entry.relayed.remove(pane_id);
+        }
+    }
+
+    /// Compare a fresh `agent.list` from `alias` (as status events, ids
+    /// qualified) with what the relay published, record it as the new
+    /// baseline, and return the events to publish so each missed change is
+    /// reported exactly once. Panes the peer no longer lists lose their
+    /// baseline.
+    pub fn relay_resync(
+        &mut self,
+        alias: &str,
+        current: Vec<PaneAgentStatusChangedEvent>,
+        mode: RelayResync,
+        now: Instant,
+    ) -> Vec<PaneAgentStatusChangedEvent> {
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return Vec::new();
+        };
+        if mode == RelayResync::Reset {
+            entry.relayed.clear();
+        }
+        let mut missed = Vec::new();
+        let mut present = HashSet::with_capacity(current.len());
+        for event in current {
+            present.insert(event.pane_id.clone());
+            let changed = entry
+                .relayed
+                .get(&event.pane_id)
+                .is_none_or(|last| last.event != event);
+            if mode != RelayResync::Seed && changed {
+                missed.push(event.clone());
+            }
+            entry.record_relayed(event, now);
+        }
+        entry.relayed.retain(|pane_id, _| present.contains(pane_id));
+        missed
     }
 
     /// Workspace ids named by `alias`'s cached agents that its cached
@@ -186,10 +351,9 @@ impl FederationStore {
         }
     }
 
-    /// The cached entry for `alias`, if any. An inspection accessor exercised by
-    /// tests; the merge path reads through [`Self::merged_agents`] instead, so
-    /// this reads as unused in a non-test build.
-    #[allow(dead_code)]
+    /// The cached entry for `alias`, if any. The event relay reads a peer's
+    /// observed capabilities here; the merge path reads through
+    /// [`Self::merged_agents`] instead.
     pub fn peer(&self, alias: &str) -> Option<&PeerCacheEntry> {
         self.peers.get(alias)
     }
@@ -229,6 +393,7 @@ impl FederationStore {
                         last_success_unix_ms: None,
                         last_error_class: None,
                         observation: PeerObservation::default(),
+                        relayed: HashMap::new(),
                     },
                 );
             }
@@ -303,6 +468,51 @@ impl FederationStore {
             })
             .collect()
     }
+}
+
+impl PeerCacheEntry {
+    /// Make `event` the pane's relay baseline and patch its cached agent.
+    fn record_relayed(&mut self, event: PaneAgentStatusChangedEvent, now: Instant) {
+        if let Some(agent) = self
+            .agents
+            .iter_mut()
+            .find(|agent| agent.pane_id == event.pane_id)
+        {
+            apply_status_event(agent, &event);
+        }
+        self.relayed
+            .insert(event.pane_id.clone(), RelayedStatus { event, at: now });
+    }
+}
+
+/// The `pane.agent_status_changed` payload describing `agent`'s current state.
+pub fn agent_status_event(agent: &AgentInfo) -> PaneAgentStatusChangedEvent {
+    PaneAgentStatusChangedEvent {
+        pane_id: agent.pane_id.clone(),
+        workspace_id: agent.workspace_id.clone(),
+        agent_status: agent.agent_status,
+        input_pending: agent.input_pending,
+        input_prompt_kind: agent.input_prompt_kind,
+        agent: agent.agent.clone(),
+        title: agent.title.clone(),
+        display_agent: agent.display_agent.clone(),
+        state_labels: agent.state_labels.clone(),
+        turn: agent.turn,
+        turn_epoch: agent.turn_epoch,
+    }
+}
+
+/// Overwrite `agent`'s status fields with a status event for its pane.
+fn apply_status_event(agent: &mut AgentInfo, event: &PaneAgentStatusChangedEvent) {
+    agent.agent_status = event.agent_status;
+    agent.input_pending = event.input_pending;
+    agent.input_prompt_kind = event.input_prompt_kind;
+    agent.agent.clone_from(&event.agent);
+    agent.title.clone_from(&event.title);
+    agent.display_agent.clone_from(&event.display_agent);
+    agent.state_labels.clone_from(&event.state_labels);
+    agent.turn = event.turn;
+    agent.turn_epoch = event.turn_epoch;
 }
 
 /// Apply the honest-offline reachability stamp to one stored (already-prefixed)
@@ -405,6 +615,7 @@ mod tests {
                 last_success_unix_ms: None,
                 last_error_class: None,
                 observation: PeerObservation::default(),
+                relayed: HashMap::new(),
             },
         );
         let merged = store.merged_agents();
@@ -434,6 +645,7 @@ mod tests {
                 last_success_unix_ms: None,
                 last_error_class: None,
                 observation: PeerObservation::default(),
+                relayed: HashMap::new(),
             },
         );
         let merged = store.merged_agents();
@@ -604,5 +816,144 @@ mod tests {
             HashSet::from(["home/w2".to_string()])
         );
         assert!(store.missing_workspace_ids("absent").is_empty());
+    }
+
+    fn pane_agent(pane_id: &str, status: AgentStatus) -> AgentInfo {
+        let mut agent = agent(status, pane_id);
+        agent.pane_id = pane_id.into();
+        agent
+    }
+
+    fn status(pane_id: &str, status: AgentStatus) -> PaneAgentStatusChangedEvent {
+        agent_status_event(&pane_agent(pane_id, status))
+    }
+
+    fn cached_status(store: &FederationStore, pane_id: &str) -> AgentStatus {
+        store
+            .peer("home")
+            .expect("home cached")
+            .agents
+            .iter()
+            .find(|agent| agent.pane_id == pane_id)
+            .expect("pane cached")
+            .agent_status
+    }
+
+    #[test]
+    fn a_poll_older_than_a_relayed_event_keeps_the_event_status() {
+        use std::time::Duration;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], t0),
+            t0,
+        );
+
+        // The poll request goes out, then the stream reports `blocked`, then the
+        // poll's (older) `working` answer lands.
+        let poll_started = Instant::now();
+        let mut blocked = status("home/p1", AgentStatus::Blocked);
+        blocked.turn = Some(4);
+        blocked.turn_epoch = Some(2);
+        assert!(store.relay_status("home", &blocked, poll_started + Duration::from_millis(1)));
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Blocked);
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], t0),
+            poll_started,
+        );
+        assert_eq!(
+            cached_status(&store, "home/p1"),
+            AgentStatus::Blocked,
+            "an older poll must not overwrite a newer relayed status"
+        );
+        assert_eq!(store.peer("home").unwrap().agents[0].turn, Some(4));
+
+        // A poll that started after the event is authoritative again.
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Idle)], t0),
+            Instant::now() + Duration::from_millis(5),
+        );
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn relay_resync_reports_each_missed_change_once() {
+        let mut store = FederationStore::default();
+        let now = Instant::now();
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(
+                vec![
+                    pane_agent("home/p1", AgentStatus::Working),
+                    pane_agent("home/p2", AgentStatus::Idle),
+                ],
+                now,
+            ),
+        );
+        let seeded = store.relay_resync(
+            "home",
+            vec![
+                status("home/p1", AgentStatus::Working),
+                status("home/p2", AgentStatus::Idle),
+            ],
+            RelayResync::Seed,
+            now,
+        );
+        assert!(seeded.is_empty(), "the first stream seeds silently");
+
+        // While disconnected p1 blocked and p3 appeared; p2 did not change.
+        let missed = store.relay_resync(
+            "home",
+            vec![
+                status("home/p1", AgentStatus::Blocked),
+                status("home/p2", AgentStatus::Idle),
+                status("home/p3", AgentStatus::Working),
+            ],
+            RelayResync::Diff,
+            now,
+        );
+        assert_eq!(
+            missed
+                .iter()
+                .map(|event| (event.pane_id.as_str(), event.agent_status))
+                .collect::<Vec<_>>(),
+            vec![
+                ("home/p1", AgentStatus::Blocked),
+                ("home/p3", AgentStatus::Working)
+            ]
+        );
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Blocked);
+        // The stream then delivers the same transition: it is not repeated,
+        // while a genuinely new one is.
+        assert!(!store.relay_status("home", &status("home/p1", AgentStatus::Blocked), now));
+        assert!(store.relay_status("home", &status("home/p1", AgentStatus::Working), now));
+        // A second resync with nothing new reports nothing.
+        assert!(store
+            .relay_resync(
+                "home",
+                vec![
+                    status("home/p1", AgentStatus::Working),
+                    status("home/p2", AgentStatus::Idle),
+                    status("home/p3", AgentStatus::Working),
+                ],
+                RelayResync::Diff,
+                now,
+            )
+            .is_empty());
+        // After a peer restart every current pane is reported.
+        assert_eq!(
+            store
+                .relay_resync(
+                    "home",
+                    vec![status("home/p1", AgentStatus::Working)],
+                    RelayResync::Reset,
+                    now,
+                )
+                .len(),
+            1
+        );
     }
 }

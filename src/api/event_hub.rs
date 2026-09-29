@@ -13,7 +13,17 @@ struct EventHubState {
     next_sequence: u64,
     /// Sequence number of the newest event evicted from the ring.
     evicted_through: u64,
-    events: VecDeque<(u64, EventEnvelope)>,
+    events: VecDeque<HubEvent>,
+}
+
+struct HubEvent {
+    sequence: u64,
+    envelope: EventEnvelope,
+    /// Pushed by the federation event relay from a peer rather than raised by
+    /// this server. Local subscribers see it like any other event; a
+    /// `local_only` subscription (a coordinator relaying this server) does not,
+    /// so relayed events are never re-exported to another coordinator.
+    relayed: bool,
 }
 
 /// Events retained after a cursor, read under one lock.
@@ -44,15 +54,29 @@ impl EventHub {
     pub(crate) const MAX_EVENTS: usize = 4096;
 
     pub fn push(&self, event: EventEnvelope) {
+        self.push_marked(event, false);
+    }
+
+    /// Push an event the federation relay received from a peer; see
+    /// [`HubEvent::relayed`].
+    pub fn push_relayed(&self, event: EventEnvelope) {
+        self.push_marked(event, true);
+    }
+
+    fn push_marked(&self, envelope: EventEnvelope, relayed: bool) {
         let Ok(mut state) = self.inner.lock() else {
             return;
         };
         state.next_sequence += 1;
         let sequence = state.next_sequence;
-        state.events.push_back((sequence, event));
+        state.events.push_back(HubEvent {
+            sequence,
+            envelope,
+            relayed,
+        });
         while state.events.len() > Self::MAX_EVENTS {
-            if let Some((evicted, _)) = state.events.pop_front() {
-                state.evicted_through = evicted;
+            if let Some(evicted) = state.events.pop_front() {
+                state.evicted_through = evicted.sequence;
             }
         }
     }
@@ -67,6 +91,16 @@ impl EventHub {
     /// Events after `cursor` together with the head to resume from and whether
     /// the ring dropped anything the reader had not seen yet.
     pub fn read_after(&self, cursor: u64) -> EventBatch {
+        self.read_batch(cursor, true)
+    }
+
+    /// [`Self::read_after`] without the events the federation relay pushed:
+    /// what this server serves to a coordinator that relays it.
+    pub fn read_local_after(&self, cursor: u64) -> EventBatch {
+        self.read_batch(cursor, false)
+    }
+
+    fn read_batch(&self, cursor: u64, include_relayed: bool) -> EventBatch {
         let Ok(state) = self.inner.lock() else {
             return EventBatch {
                 head: cursor,
@@ -74,7 +108,7 @@ impl EventHub {
                 events: Vec::new(),
             };
         };
-        state.batch_after(cursor)
+        state.batch_after(cursor, include_relayed)
     }
 
     pub fn current_sequence(&self) -> u64 {
@@ -86,21 +120,31 @@ impl EventHub {
 }
 
 impl EventHubState {
-    fn events_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
+    fn retained_after(&self, sequence: u64) -> impl Iterator<Item = &HubEvent> {
         let start = self
             .events
-            .partition_point(|(event_sequence, _)| *event_sequence <= sequence);
-        self.events.range(start..).cloned().collect()
+            .partition_point(|event| event.sequence <= sequence);
+        self.events.range(start..)
     }
 
-    fn batch_after(&self, cursor: u64) -> EventBatch {
+    fn events_after(&self, sequence: u64) -> Vec<(u64, EventEnvelope)> {
+        self.retained_after(sequence)
+            .map(|event| (event.sequence, event.envelope.clone()))
+            .collect()
+    }
+
+    fn batch_after(&self, cursor: u64, include_relayed: bool) -> EventBatch {
         EventBatch {
             head: self.next_sequence,
             missed: (self.evicted_through > cursor).then_some(MissedEvents {
                 first: cursor + 1,
                 last: self.evicted_through,
             }),
-            events: self.events_after(cursor),
+            events: self
+                .retained_after(cursor)
+                .filter(|event| include_relayed || !event.relayed)
+                .map(|event| (event.sequence, event.envelope.clone()))
+                .collect(),
         }
     }
 }
@@ -138,5 +182,26 @@ mod tests {
         assert_eq!(current.missed, None);
         assert_eq!(current.events.len(), EventHub::MAX_EVENTS);
         assert_eq!(current.head, (EventHub::MAX_EVENTS + 3) as u64);
+    }
+
+    #[test]
+    fn local_reads_skip_relayed_events_but_keep_the_shared_sequence() {
+        let hub = EventHub::default();
+        hub.push(focused("local-1"));
+        hub.push_relayed(focused("peer/w1"));
+        hub.push(focused("local-2"));
+
+        let local = hub.read_local_after(0);
+        assert_eq!(local.head, 3);
+        assert_eq!(
+            local
+                .events
+                .iter()
+                .map(|(sequence, _)| *sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 3],
+            "a relayed event must never be served to a relaying coordinator"
+        );
+        assert_eq!(hub.read_after(0).events.len(), 3);
     }
 }

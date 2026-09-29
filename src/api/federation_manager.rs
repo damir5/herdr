@@ -5,7 +5,9 @@
 //! and a lightweight saved-profile watcher. It owns:
 //! - the coordinator source: explicit peers plus last-good saved profiles and
 //!   immutable-profile trust policy;
-//! - one poll thread and one proxy route per resolved outbound peer;
+//! - one poll thread, one event relay thread (see
+//!   [`federation_relay`](crate::api::federation_relay)) and one proxy route per
+//!   resolved outbound peer;
 //! - retiring poll joins, kept off the single-threaded app path.
 //!
 //! `reconcile_config` and the watcher serialize source changes under the
@@ -18,9 +20,11 @@
 //! Source-driven updates take **C** (`coordinator`) before **H** (`handles`).
 //! Reconcile then takes **S** (`store`) only briefly per eviction, **P**
 //! (`reaper`) after releasing S, and finally **R** (`registry`): **C → H → S /
-//! P → R**. Poll threads take S only; proxy threads take R only; bridge workers
-//! take none of these locks. Shutdown joins the catalog watcher before draining
-//! H, so it never waits for C while holding a downstream lock.
+//! P → R**. Poll and relay threads take S only (the relay inside a route
+//! lifecycle read, which is never taken while S is held); proxy threads take
+//! R only; bridge workers take none of these locks. Shutdown joins the catalog
+//! watcher before draining H, so it never waits for C while holding a
+//! downstream lock.
 //!
 //! ## Default-off byte-identical
 //! With no peer configured (or none with an `endpoint`), reconcile spawns zero
@@ -38,9 +42,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info};
 
 use crate::api::client::ConnectionTarget;
+use crate::api::federation_relay::{PeerRelay, RelayTiming};
 use crate::api::federation_store::FederationStore;
 use crate::api::schema::{CoordinatorMachineStatus, MachineEndpointStatus, SavedMachineState};
 use crate::api::server::{read_peer_token, run_federation_peer_poll};
+use crate::api::EventHub;
 use crate::config::{FederationConfig, FederationPeer, FederationSavedMachinePolicy};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,6 +336,8 @@ pub struct FederationPeerManager {
     reaper: Mutex<Vec<JoinHandle<()>>>,
     /// Shared cache the poll threads write and `agent.list` reads.
     store: Arc<Mutex<FederationStore>>,
+    /// The server's event hub, which each peer's relay thread feeds.
+    event_hub: EventHub,
     /// Starts Gram reverse gateway attempts; set once the API sender exists.
     #[cfg(unix)]
     gram_spawner: Mutex<Option<Arc<dyn crate::api::gram_gateway::GramGatewaySpawner>>>,
@@ -350,12 +358,18 @@ pub struct FederationPeerManager {
 }
 
 impl FederationPeerManager {
-    /// Build an empty manager sharing `store` and the global `running` flag. A
-    /// lightweight watcher observes saved-profile catalog changes; it is inert
-    /// until coordinator mode is enabled by [`Self::reconcile_config`].
-    pub fn new(store: Arc<Mutex<FederationStore>>, running: Arc<AtomicBool>) -> Arc<Self> {
+    /// Build an empty manager sharing `store`, the server's `event_hub` and the
+    /// global `running` flag. A lightweight watcher observes saved-profile
+    /// catalog changes; it is inert until coordinator mode is enabled by
+    /// [`Self::reconcile_config`].
+    pub fn new(
+        store: Arc<Mutex<FederationStore>>,
+        event_hub: EventHub,
+        running: Arc<AtomicBool>,
+    ) -> Arc<Self> {
         Self::build(
             store,
+            event_hub,
             running,
             #[cfg(unix)]
             GramGatewayHooks {
@@ -368,6 +382,7 @@ impl FederationPeerManager {
 
     fn build(
         store: Arc<Mutex<FederationStore>>,
+        event_hub: EventHub,
         running: Arc<AtomicBool>,
         #[cfg(unix)] gram: GramGatewayHooks,
     ) -> Arc<Self> {
@@ -378,6 +393,7 @@ impl FederationPeerManager {
             registry: RwLock::new(Arc::new(HashMap::new())),
             reaper: Mutex::new(Vec::new()),
             store,
+            event_hub,
             #[cfg(unix)]
             gram_spawner: Mutex::new(gram.spawner),
             #[cfg(unix)]
@@ -431,6 +447,7 @@ impl FederationPeerManager {
     ) -> Arc<Self> {
         Self::build(
             store,
+            EventHub::default(),
             running,
             GramGatewayHooks {
                 spawner: Some(spawner),
@@ -874,9 +891,10 @@ impl FederationPeerManager {
         drop(detached_gram_relays);
     }
 
-    /// Resolve one outbound route and spawn its poll thread. SSH peers use the
-    /// upstream saved-machine `remote-api-bridge`; the manager owns that bridge
-    /// and shares its local socket with polling and proxying.
+    /// Resolve one outbound route and spawn its poll and event relay threads.
+    /// SSH peers use the upstream saved-machine `remote-api-bridge`; the
+    /// manager owns that bridge and shares its local socket with polling,
+    /// relaying and proxying.
     fn spawn_peer_poll(
         &self,
         peer: FederationPeer,
@@ -981,7 +999,23 @@ impl FederationPeerManager {
         let thread_stop = Arc::clone(&stop);
         let poll_route = route.clone();
         let poll_presentation = Arc::clone(&presentation);
+        // The relay idles until the peer is identity-validated and advertises
+        // `events_v2`, so a peer without the capability keeps the poll alone.
+        let relay = PeerRelay {
+            alias: peer.alias.clone(),
+            expected_node_id: peer.expected_node_id.clone(),
+            route: route.clone(),
+            presentation: Arc::clone(&presentation),
+            store: Arc::clone(&self.store),
+            event_hub: self.event_hub.clone(),
+            running: Arc::clone(&self.running),
+            stop: Arc::clone(&stop),
+            timing: RelayTiming::default(),
+        };
+        // One join covers both threads: the poll returns on the same stop and
+        // shutdown flags the relay watches, then waits for the relay.
         let join = std::thread::spawn(move || {
+            let relay = std::thread::spawn(move || relay.run());
             run_federation_peer_poll(
                 peer,
                 poll_route,
@@ -990,6 +1024,7 @@ impl FederationPeerManager {
                 running,
                 thread_stop,
             );
+            let _ = relay.join();
         });
         Some(PeerHandle {
             stop,
@@ -1469,6 +1504,7 @@ mod tests {
         let running = Arc::new(AtomicBool::new(true));
         let manager = FederationPeerManager::new(
             Arc::new(Mutex::new(FederationStore::default())),
+            EventHub::default(),
             Arc::clone(&running),
         );
 
@@ -1596,8 +1632,11 @@ mod tests {
         let profile_id = profile.id.clone();
         let profile_text = profile_id.to_string();
         let store = Arc::new(Mutex::new(FederationStore::default()));
-        let manager =
-            FederationPeerManager::new(Arc::clone(&store), Arc::new(AtomicBool::new(true)));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&store),
+            EventHub::default(),
+            Arc::new(AtomicBool::new(true)),
+        );
         manager.stop_catalog_watcher_for_test();
         *manager
             .coordinator
@@ -1713,8 +1752,11 @@ mod tests {
             &alias,
             crate::api::federation_store::Reachability::Unreachable,
         );
-        let manager =
-            FederationPeerManager::new(Arc::clone(&store), Arc::new(AtomicBool::new(true)));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&store),
+            EventHub::default(),
+            Arc::new(AtomicBool::new(true)),
+        );
         manager.stop_catalog_watcher_for_test();
         *manager
             .coordinator

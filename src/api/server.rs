@@ -71,7 +71,7 @@ const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 /// (or connect-flooding) peer; connections beyond the cap are refused and closed.
 const MAX_FEDERATION_CONNECTIONS: usize = 32;
 /// How often each configured peer is polled for its agent list.
-const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub(super) const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// Cadence of the extra `workspace.list` fetch that rides on a reachable
 /// peer's agent poll (see [`WorkspaceRefresh`]): workspaces change rarely, so
 /// this is a multiple of [`FEDERATION_POLL_INTERVAL`], not every agent poll.
@@ -107,7 +107,7 @@ const FEDERATION_PROXY_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// generous; a peer sending a single frame larger than this degrades that stream
 /// (it is closed) rather than driving unbounded allocation — an OOM — on the home.
 /// The idle-timeout companion is [`FEDERATION_STREAM_IDLE_TIMEOUT`].
-const FEDERATION_MAX_STREAM_FRAME_BYTES: usize = FEDERATION_MAX_RESPONSE_BYTES;
+pub(super) const FEDERATION_MAX_STREAM_FRAME_BYTES: usize = FEDERATION_MAX_RESPONSE_BYTES;
 
 pub struct ServerHandle {
     _thread: JoinHandle<()>,
@@ -227,8 +227,11 @@ fn start_server_inner(
     // an empty registry, so the router never matches and local behavior is
     // byte-identical. Shared (as an `Arc`) with the `App` so `reload-config` can
     // add/remove/change peers live.
-    let federation_manager =
-        FederationPeerManager::new(Arc::clone(&federation_store), Arc::clone(&running));
+    let federation_manager = FederationPeerManager::new(
+        Arc::clone(&federation_store),
+        event_hub.clone(),
+        Arc::clone(&running),
+    );
     #[cfg(unix)]
     federation_manager.set_gram_api_sender(api_tx.clone());
     federation_manager.reconcile_config(federation);
@@ -709,9 +712,9 @@ fn poll_peer_workspace_list(
     }
 }
 
-struct PeerPollSnapshot {
-    agents: Vec<crate::api::schema::AgentInfo>,
-    remote_boot_id: Option<String>,
+pub(super) struct PeerPollSnapshot {
+    pub(super) agents: Vec<crate::api::schema::AgentInfo>,
+    pub(super) remote_boot_id: Option<String>,
     observation: PeerObservation,
 }
 
@@ -750,6 +753,9 @@ fn poll_once_into_cache(
     running: &Arc<AtomicBool>,
     peer_stop: &Arc<AtomicBool>,
 ) -> Reachability {
+    // Taken before the request: any status the event relay publishes after
+    // this instant is newer than this poll's answer and wins over it.
+    let poll_started = Instant::now();
     match poll_peer_agent_list(client, running, expected_machine_id) {
         Ok(snapshot) => {
             if let Some(route) = route {
@@ -793,9 +799,10 @@ fn poll_once_into_cache(
             if let Some(route) = route {
                 route.set_identity_validated(true);
             }
-            store.set_peer(
+            store.set_polled_peer(
                 alias.to_string(),
                 PeerCacheEntry::reachable_observed(prefixed, Instant::now(), snapshot.observation),
+                poll_started,
             );
             drop(presentation);
             reachability
@@ -855,7 +862,7 @@ pub(crate) fn read_peer_token(peer: &FederationPeer) -> Option<String> {
 /// so a malicious peer cannot drive unbounded allocation or an unbounded-time
 /// read; `running` lets the read abort promptly on shutdown so [`ServerHandle`]'s
 /// drop, which joins the poll threads, does not hang.
-fn poll_peer_agent_list(
+pub(super) fn poll_peer_agent_list(
     client: &ApiClient,
     running: &Arc<AtomicBool>,
     expected_machine_id: Option<&str>,
@@ -926,7 +933,7 @@ fn poll_peer_agent_list(
 /// an optional pin. An already-qualified target is rejected rather than prefixed
 /// twice. [`FederationStore::merged_agents`] is the only code that sets
 /// `reachability`/`last_known_status`, from the home's poll-outcome tracking.
-fn prefix_remote_agent(
+pub(super) fn prefix_remote_agent(
     alias: &str,
     presentation: &PeerPresentation,
     mut agent: crate::api::schema::AgentInfo,
@@ -954,7 +961,7 @@ fn prefix_remote_agent(
 /// Give one peer-local id exactly one `<alias>/` prefix. An empty id is kept
 /// empty when `allow_empty`; an id that already contains `/` (already
 /// qualified, or a malformed peer) is rejected rather than prefixed twice.
-fn qualify_remote_id(alias: &str, value: String, allow_empty: bool) -> Option<String> {
+pub(super) fn qualify_remote_id(alias: &str, value: String, allow_empty: bool) -> Option<String> {
     if value.is_empty() {
         return allow_empty.then_some(value);
     }
@@ -969,7 +976,7 @@ fn qualify_remote_id(alias: &str, value: String, allow_empty: bool) -> Option<St
 /// are stamped. `number`, `label`, `focused` and position are the peer's own so
 /// a client can reproduce that machine's sidebar. `reachability` and
 /// `last_known_status` are set only by [`FederationStore::merged_workspaces`].
-fn qualify_remote_workspace(
+pub(super) fn qualify_remote_workspace(
     alias: &str,
     presentation: &PeerPresentation,
     mut workspace: crate::api::schema::WorkspaceInfo,
@@ -988,7 +995,7 @@ fn qualify_remote_workspace(
 
 /// Rewrite a peer's tab: `tab_id` and `workspace_id` gain one `<alias>/` prefix
 /// and the home-owned machine fields are stamped.
-fn qualify_remote_tab(
+pub(super) fn qualify_remote_tab(
     alias: &str,
     presentation: &PeerPresentation,
     mut tab: crate::api::schema::TabInfo,
@@ -1042,7 +1049,11 @@ fn qualify_routed_response(alias: &str, presentation: &PeerPresentation, line: S
 /// stop flags, so neither a shutdown nor a `reload-config` peer retirement is
 /// delayed by the poll interval. Returns early the moment EITHER `running`
 /// clears (daemon shutdown) OR `peer_stop` is set (this peer removed/changed).
-fn sleep_interruptible(running: &Arc<AtomicBool>, peer_stop: &Arc<AtomicBool>, total: Duration) {
+pub(super) fn sleep_interruptible(
+    running: &Arc<AtomicBool>,
+    peer_stop: &Arc<AtomicBool>,
+    total: Duration,
+) {
     let mut elapsed = Duration::ZERO;
     while elapsed < total {
         if !running.load(Ordering::Relaxed) || peer_stop.load(Ordering::Relaxed) {
@@ -2550,6 +2561,7 @@ fn stream_subscriptions_with_heartbeat(
     heartbeat_interval: Duration,
 ) -> std::io::Result<()> {
     let events_v2 = params.events_v2;
+    let local_only = params.local_only;
     let event_start_sequence = event_hub.current_sequence();
     let mut subscriptions = Vec::with_capacity(params.subscriptions.len());
     let mut rejected = Vec::new();
@@ -2596,7 +2608,11 @@ fn stream_subscriptions_with_heartbeat(
             return Ok(());
         }
 
-        let batch = event_hub.read_after(cursor);
+        let batch = if local_only {
+            event_hub.read_local_after(cursor)
+        } else {
+            event_hub.read_after(cursor)
+        };
         cursor = batch.head;
         for (index, subscription) in subscriptions.iter_mut().enumerate() {
             lines.extend(
@@ -3987,6 +4003,7 @@ mod pane_graphics_request_tests {
 mod federation_tests {
     use super::*;
     use crate::api::client::{ApiClient, ConnectionTarget};
+    use crate::api::federation_relay::{PeerRelay, RelayTiming};
     use crate::api::schema::{
         AgentInfo, AgentPromptDelivery, AgentPromptParams, AgentRenameParams, AgentStartParams,
         AgentStatus, EmptyParams, EventData, EventEnvelope, EventKind, EventsSubscribeParams,
@@ -4283,6 +4300,7 @@ mod federation_tests {
                 method: Method::EventsSubscribe(EventsSubscribeParams {
                     subscriptions: vec![Subscription::PaneClosed {}],
                     events_v2: false,
+                    local_only: false,
                 }),
             })
             .expect("open subscription stream");
@@ -5210,7 +5228,11 @@ mod federation_tests {
         let peer_srv = SeededPeer::spawn("builder");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
         let mut peer = reachable_peer_on(peer_srv.addr, "home", &peer_srv.token_path);
         peer.expected_node_id = Some("machine-peer".into());
         manager.reconcile(&[peer]);
@@ -5288,7 +5310,11 @@ mod federation_tests {
         let peer_srv = SeededPeer::spawn("builder");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
         let mut peer = reachable_peer_on(peer_srv.addr, "home", &peer_srv.token_path);
         peer.display_label = Some("Before".into());
         manager.reconcile(std::slice::from_ref(&peer));
@@ -5508,7 +5534,11 @@ mod federation_tests {
     fn reconcile_ignores_inbound_only_peer() {
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
         manager.reconcile(&[FederationPeer {
             alias: "listen-only".into(),
             display_label: None,
@@ -5615,7 +5645,11 @@ mod federation_tests {
 
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
         let mut config = FederationConfig {
             coordinator: true,
             ..FederationConfig::default()
@@ -5774,7 +5808,11 @@ mod federation_tests {
     fn reconcile_empty_is_byte_identical() {
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
 
         // From empty.
         manager.reconcile(&[]);
@@ -5818,7 +5856,11 @@ mod federation_tests {
         let peer_b = SeededPeer::spawn("b-agent");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
 
         // First reconcile: only A.
         manager.reconcile(&[reachable_peer_on(peer_a.addr, "A", &peer_a.token_path)]);
@@ -5863,7 +5905,11 @@ mod federation_tests {
         let peer_b = SeededPeer::spawn("b-agent");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
 
         manager.reconcile(&[
             reachable_peer_on(peer_a.addr, "A", &peer_a.token_path),
@@ -5919,7 +5965,11 @@ mod federation_tests {
         let peer_new = SeededPeer::spawn("new-agent");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
 
         // Alias A points at the OLD addr.
         manager.reconcile(&[reachable_peer_on(peer_old.addr, "A", &peer_old.token_path)]);
@@ -5975,7 +6025,11 @@ mod federation_tests {
         let peer_srv = SeededPeer::spawn("builder");
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
 
         let mut trusted = reachable_peer_on(peer_srv.addr, "A", &peer_srv.token_path);
         trusted.expected_node_id = Some("machine-peer".into());
@@ -6207,7 +6261,11 @@ mod federation_tests {
         let peer = reachable_peer_on(addr, "home", &token_path);
         let cache = Arc::new(Mutex::new(FederationStore::default()));
         let running = Arc::new(AtomicBool::new(true));
-        let manager = FederationPeerManager::new(Arc::clone(&cache), Arc::clone(&running));
+        let manager = FederationPeerManager::new(
+            Arc::clone(&cache),
+            EventHub::default(),
+            Arc::clone(&running),
+        );
         manager.reconcile(&[peer]);
         assert_eq!(manager.live_aliases(), vec!["home".to_string()]);
 
@@ -7876,5 +7934,676 @@ mod federation_tests {
             "an unknown alias reaches local dispatch with its id untouched"
         );
         assert!(peer.seen.lock().unwrap().is_empty());
+    }
+
+    // ---- Peer event relay (#245) ----
+
+    /// What a [`StreamingPeer`]'s app answers, shared across restarts of the
+    /// peer at the same address.
+    struct StreamingPeerState {
+        agents: Mutex<Vec<AgentInfo>>,
+        boot_id: Mutex<String>,
+        events_v2: bool,
+        /// Every `pane.list` id with its arrival: a subscribe probe
+        /// (`…:sub:0:probe`) marks a new stream, the all-pane snapshot a live
+        /// stream takes about once a second (`…:sub:0:panes`) marks a live one.
+        pane_lists: Mutex<Vec<(Instant, String)>>,
+    }
+
+    fn streaming_state(
+        agents: Vec<AgentInfo>,
+        boot_id: &str,
+        events_v2: bool,
+    ) -> Arc<StreamingPeerState> {
+        Arc::new(StreamingPeerState {
+            agents: Mutex::new(agents),
+            boot_id: Mutex::new(boot_id.into()),
+            events_v2,
+            pane_lists: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A loopback federation peer with a real event hub behind the real
+    /// `events.subscribe` stream, so a test pushes peer events and the relay
+    /// reads them exactly as a daemon serves them.
+    struct StreamingPeer {
+        addr: SocketAddr,
+        event_hub: EventHub,
+        running: Arc<AtomicBool>,
+        listener: JoinHandle<()>,
+        responder: JoinHandle<()>,
+        state: Arc<StreamingPeerState>,
+    }
+
+    impl StreamingPeer {
+        fn spawn(state: Arc<StreamingPeerState>) -> Self {
+            Self::spawn_on("127.0.0.1:0".parse().unwrap(), state)
+        }
+
+        fn spawn_on(addr: SocketAddr, state: Arc<StreamingPeerState>) -> Self {
+            let listener = TcpListener::bind(addr).expect("bind streaming peer");
+            let addr = listener.local_addr().expect("streaming peer addr");
+            let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+            let event_hub = EventHub::default();
+            let running = Arc::new(AtomicBool::new(true));
+            let listener_thread = spawn_federation_listener(
+                listener,
+                one_peer(SEEDED_PEER_TOKEN, CapabilityTier::Observe),
+                api_tx,
+                event_hub.clone(),
+                None,
+                Arc::clone(&running),
+                None,
+            )
+            .expect("spawn streaming peer listener");
+            let app = Arc::clone(&state);
+            let responder = std::thread::spawn(move || {
+                while let Some(msg) = api_rx.blocking_recv() {
+                    let id = msg.request.id;
+                    let result = match msg.request.method {
+                        Method::AgentList(params) => {
+                            assert!(params.local_only, "the relay must poll local-only state");
+                            ResponseResult::AgentList {
+                                agents: app.agents.lock().unwrap().clone(),
+                                origin_machine_id: Some("machine-peer".into()),
+                                origin_boot_id: Some(app.boot_id.lock().unwrap().clone()),
+                                origin_version: Some("test".into()),
+                                origin_protocol: Some(crate::protocol::PROTOCOL_VERSION),
+                                origin_capabilities: Some(ServerCapabilities {
+                                    events_v2: app.events_v2,
+                                    ..default_capabilities().unwrap()
+                                }),
+                            }
+                        }
+                        Method::PaneList(_) => {
+                            app.pane_lists
+                                .lock()
+                                .unwrap()
+                                .push((Instant::now(), id.clone()));
+                            ResponseResult::PaneList { panes: Vec::new() }
+                        }
+                        Method::WorkspaceList(_) => ResponseResult::WorkspaceList {
+                            workspaces: Vec::new(),
+                        },
+                        other => {
+                            let _ = msg.respond_to.send(error_response_json(
+                                id,
+                                "unexpected_dispatch",
+                                format!("streaming peer does not answer {other:?}"),
+                            ));
+                            continue;
+                        }
+                    };
+                    let _ = msg
+                        .respond_to
+                        .send(serde_json::to_string(&SuccessResponse { id, result }).unwrap());
+                }
+            });
+            Self {
+                addr,
+                event_hub,
+                running,
+                listener: listener_thread,
+                responder,
+                state,
+            }
+        }
+
+        /// `events.subscribe` streams opened so far.
+        fn subscribes(&self) -> usize {
+            self.state
+                .pane_lists
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, id)| id.ends_with(":sub:0:probe"))
+                .count()
+        }
+
+        /// Streams that took an all-pane snapshot within `window`.
+        fn live_streams(&self, window: Duration) -> HashSet<String> {
+            let since = Instant::now() - window;
+            self.state
+                .pane_lists
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(at, _)| *at >= since)
+                .filter_map(|(_, id)| id.strip_suffix(":sub:0:panes").map(str::to_owned))
+                .collect()
+        }
+
+        /// Stop the peer, dropping every stream, and return its address so a
+        /// restarted peer can take it over.
+        fn shutdown(self) -> SocketAddr {
+            self.running.store(false, Ordering::Relaxed);
+            let _ = self.listener.join();
+            let _ = self.responder.join();
+            self.addr
+        }
+    }
+
+    fn peer_agent(pane_id: &str, status: AgentStatus) -> AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "terminal_id": format!("t-{pane_id}"),
+            "name": pane_id,
+            "agent_status": status,
+            "workspace_id": "w1",
+            "tab_id": "w1:t1",
+            "pane_id": pane_id,
+            "focused": false,
+            "revision": 1,
+        }))
+        .expect("peer agent deserializes")
+    }
+
+    fn peer_status(pane_id: &str, agent_status: AgentStatus) -> EventEnvelope {
+        EventEnvelope {
+            event: EventKind::PaneAgentStatusChanged,
+            data: EventData::PaneAgentStatusChanged {
+                pane_id: pane_id.into(),
+                workspace_id: "w1".into(),
+                agent_status,
+                input_pending: false,
+                input_prompt_kind: None,
+                agent: None,
+                title: None,
+                display_agent: None,
+                state_labels: HashMap::new(),
+                turn: None,
+                turn_epoch: None,
+            },
+        }
+    }
+
+    fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if done() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        done()
+    }
+
+    /// Status events in `hub` as `(pane_id, status)`, in hub order.
+    fn hub_statuses(hub: &EventHub) -> Vec<(String, AgentStatus)> {
+        hub.events_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::PaneAgentStatusChanged {
+                    pane_id,
+                    agent_status,
+                    ..
+                } => Some((pane_id, agent_status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn status_pairs(pairs: &[(&str, AgentStatus)]) -> Vec<(String, AgentStatus)> {
+        pairs
+            .iter()
+            .map(|(pane_id, status)| ((*pane_id).to_owned(), *status))
+            .collect()
+    }
+
+    fn relay_baseline_has(store: &Mutex<FederationStore>, pane_id: &str) -> bool {
+        store
+            .lock()
+            .unwrap()
+            .peer("box")
+            .is_some_and(|entry| entry.relayed.contains_key(pane_id))
+    }
+
+    /// One relay thread for alias `box` against `addr`, driven directly (no
+    /// poll thread) with fast retries. Its store already holds the peer's
+    /// poll observation advertising `events_v2`.
+    struct RelayFixture {
+        hub: EventHub,
+        store: Arc<Mutex<FederationStore>>,
+        route: PeerRoute,
+        stop: Arc<AtomicBool>,
+        join: JoinHandle<()>,
+    }
+
+    fn start_relay(addr: SocketAddr) -> RelayFixture {
+        let hub = EventHub::default();
+        let store = Arc::new(Mutex::new(FederationStore::default()));
+        store.lock().unwrap().set_peer(
+            "box",
+            PeerCacheEntry::reachable_observed(
+                Vec::new(),
+                Instant::now(),
+                PeerObservation {
+                    remote_capabilities: default_capabilities(),
+                    ..PeerObservation::default()
+                },
+            ),
+        );
+        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+        let relay = PeerRelay {
+            alias: "box".into(),
+            expected_node_id: None,
+            route: route.clone(),
+            presentation: shared_presentation("box"),
+            store: Arc::clone(&store),
+            event_hub: hub.clone(),
+            running: Arc::new(AtomicBool::new(true)),
+            stop: Arc::clone(&stop),
+            timing: RelayTiming {
+                eligibility_step: Duration::from_millis(20),
+                reconnect_base: Duration::from_millis(50),
+                read_slice: Duration::from_millis(50),
+            },
+        };
+        RelayFixture {
+            hub,
+            store,
+            route,
+            stop,
+            join: std::thread::spawn(move || relay.run()),
+        }
+    }
+
+    impl RelayFixture {
+        fn stop(self) {
+            self.stop.store(true, Ordering::Relaxed);
+            self.join.join().expect("relay thread exits");
+        }
+    }
+
+    /// A coordinator's API surface over loopback federation TCP: the real
+    /// subscription stream on `hub`, with an app that has no local panes and
+    /// merges `cache` into `agent.list` like the real one.
+    struct CoordinatorFixture {
+        addr: SocketAddr,
+        running: Arc<AtomicBool>,
+        listener: JoinHandle<()>,
+        responder: JoinHandle<()>,
+    }
+
+    fn start_coordinator(hub: EventHub, cache: Arc<Mutex<FederationStore>>) -> CoordinatorFixture {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind coordinator");
+        let addr = listener.local_addr().expect("coordinator addr");
+        let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
+        let running = Arc::new(AtomicBool::new(true));
+        let listener = spawn_federation_listener(
+            listener,
+            one_peer(SEEDED_PEER_TOKEN, CapabilityTier::Observe),
+            api_tx,
+            hub,
+            None,
+            Arc::clone(&running),
+            None,
+        )
+        .expect("spawn coordinator listener");
+        let responder = std::thread::spawn(move || {
+            while let Some(msg) = api_rx.blocking_recv() {
+                let id = msg.request.id;
+                let result = match msg.request.method {
+                    Method::PaneList(_) => ResponseResult::PaneList { panes: Vec::new() },
+                    Method::AgentList(_) => ResponseResult::AgentList {
+                        agents: cache.lock().unwrap().merged_agents(),
+                        origin_machine_id: None,
+                        origin_boot_id: None,
+                        origin_version: None,
+                        origin_protocol: None,
+                        origin_capabilities: None,
+                    },
+                    Method::PaneGet(params) => {
+                        let _ = msg.respond_to.send(error_response_json(
+                            id,
+                            "pane_not_found",
+                            format!("pane {} not found", params.pane_id),
+                        ));
+                        continue;
+                    }
+                    other => panic!("coordinator app got {other:?}"),
+                };
+                let _ = msg
+                    .respond_to
+                    .send(serde_json::to_string(&SuccessResponse { id, result }).unwrap());
+            }
+        });
+        CoordinatorFixture {
+            addr,
+            running,
+            listener,
+            responder,
+        }
+    }
+
+    impl CoordinatorFixture {
+        /// Open `events.subscribe` with `params`; every line arrives on the
+        /// returned channel.
+        fn subscribe(
+            &self,
+            params: serde_json::Value,
+        ) -> std::sync::mpsc::Receiver<serde_json::Value> {
+            let request: Request = serde_json::from_value(serde_json::json!({
+                "id": "coordinator_sub",
+                "method": "events.subscribe",
+                "params": params,
+            }))
+            .unwrap();
+            let client = tcp_client(self.addr, Some(SEEDED_PEER_TOKEN));
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let lines = client.request_stream(&request).expect("open subscription");
+                for line in lines {
+                    let Ok(line) = line else { return };
+                    if tx.send(line).is_err() {
+                        return;
+                    }
+                }
+            });
+            rx
+        }
+
+        fn shutdown(self) {
+            self.running.store(false, Ordering::Relaxed);
+            let _ = self.listener.join();
+            let _ = self.responder.join();
+        }
+    }
+
+    /// End to end through the peer manager: the poll discovers `events_v2`,
+    /// the relay streams the peer, and a status change reaches a coordinator
+    /// all-pane subscriber and an `<alias>/<pane>` subscriber qualified well
+    /// within a second; the store follows the event.
+    #[test]
+    fn peer_status_reaches_coordinator_subscribers_qualified_within_a_second() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let token_path = unique_token_file(SEEDED_PEER_TOKEN);
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let hub = EventHub::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let coordinator = start_coordinator(hub.clone(), Arc::clone(&cache));
+        let manager =
+            FederationPeerManager::new(Arc::clone(&cache), hub.clone(), Arc::clone(&running));
+        manager.reconcile(&[reachable_peer_on(peer.addr, "box", &token_path)]);
+        assert!(
+            wait_until(Duration::from_secs(10), || peer.subscribes() == 1
+                && relay_baseline_has(&cache, "box/w1:p1")),
+            "the relay did not open and seed its stream"
+        );
+
+        let lines = coordinator.subscribe(serde_json::json!({
+            "subscriptions": [
+                {"type": "pane.agent_status_changed"},
+                {"type": "pane.agent_status_changed", "pane_id": "box/w1:p1"},
+                {"type": "pane.agent_status_changed", "pane_id": "box/w9:p9"},
+                {"type": "pane.turn_completed", "pane_id": "box/w1:p1"},
+            ],
+            "events_v2": true,
+        }));
+        let ack = lines.recv_timeout(Duration::from_secs(5)).expect("ack");
+        assert_eq!(ack["result"]["type"], "subscription_started");
+        assert_eq!(
+            ack["result"]["rejected"],
+            serde_json::json!([{"index": 2, "error": {"code": "pane_not_found", "message": "pane box/w9:p9 not found"}}]),
+            "an unknown remote pane is rejected, a cached one is accepted"
+        );
+
+        let pushed = Instant::now();
+        peer.event_hub
+            .push(peer_status("w1:p1", AgentStatus::Blocked));
+        let all_panes = lines
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relayed event");
+        let latency = pushed.elapsed();
+        let single_pane = lines
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relayed event");
+        assert!(
+            latency < Duration::from_secs(1),
+            "relay latency {latency:?}"
+        );
+        for line in [&all_panes, &single_pane] {
+            assert_eq!(line["event"], "pane.agent_status_changed");
+            assert_eq!(line["data"]["pane_id"], "box/w1:p1");
+            assert_eq!(line["data"]["workspace_id"], "box/w1");
+            assert_eq!(line["data"]["agent_status"], "blocked");
+        }
+        assert_eq!(
+            cache.lock().unwrap().merged_agents()[0].agent_status,
+            AgentStatus::Blocked,
+            "the relayed event patches the cached agent before the next poll"
+        );
+
+        let pane: crate::api::schema::PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": "w1:p1", "terminal_id": "t-w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            "focused": false, "agent_status": "idle", "revision": 2,
+        }))
+        .unwrap();
+        peer.event_hub.push(EventEnvelope {
+            event: EventKind::PaneTurnCompleted,
+            data: EventData::PaneTurnCompleted {
+                pane,
+                turn: 3,
+                turn_epoch: 1,
+                outcome: crate::terminal::TurnOutcome::Completed,
+                message: None,
+                message_truncated: false,
+                agent_session_path: None,
+                completed_unix_ms: 1,
+            },
+        });
+        let turn = lines
+            .recv_timeout(Duration::from_secs(2))
+            .expect("relayed turn");
+        assert_eq!(turn["event"], "pane.turn_completed");
+        assert_eq!(turn["data"]["pane"]["pane_id"], "box/w1:p1");
+        let agent = cache.lock().unwrap().merged_agents().remove(0);
+        assert_eq!((agent.turn, agent.turn_epoch), (Some(3), Some(1)));
+
+        manager.join_all();
+        coordinator.shutdown();
+        peer.shutdown();
+        let _ = std::fs::remove_file(&token_path);
+    }
+
+    /// A peer that relays its own peers marks those events in its hub and
+    /// leaves them out of the `local_only` stream a coordinator reads, so a
+    /// third machine's events are never re-exported (even with ids the
+    /// coordinator could otherwise qualify).
+    #[test]
+    fn relayed_events_of_a_coordinator_peer_are_not_reexported() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let relay = start_relay(peer.addr);
+        assert!(wait_until(Duration::from_secs(5), || relay_baseline_has(
+            &relay.store,
+            "box/w1:p1"
+        )));
+
+        peer.event_hub
+            .push_relayed(peer_status("w7:p7", AgentStatus::Idle));
+        peer.event_hub
+            .push(peer_status("w1:p1", AgentStatus::Blocked));
+        assert!(wait_until(Duration::from_secs(5), || !hub_statuses(
+            &relay.hub
+        )
+        .is_empty()));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            hub_statuses(&relay.hub),
+            status_pairs(&[("box/w1:p1", AgentStatus::Blocked)])
+        );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A lost connection and a `lagged` peer stream both resync from
+    /// `agent.list`: each transition missed meanwhile is published once, and
+    /// the stream repeating one of them publishes nothing more.
+    #[test]
+    fn relay_resyncs_after_reconnect_and_lag_without_duplicates() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let relay = start_relay(peer.addr);
+        assert!(wait_until(Duration::from_secs(5), || relay_baseline_has(
+            &relay.store,
+            "box/w1:p1"
+        )));
+        assert!(
+            relay.hub.events_after(0).is_empty(),
+            "the first stream seeds silently"
+        );
+        peer.event_hub
+            .push(peer_status("w1:p1", AgentStatus::Blocked));
+        assert!(wait_until(Duration::from_secs(5), || hub_statuses(
+            &relay.hub
+        )
+        .len()
+            == 1));
+
+        // The connection drops; meanwhile p1 goes idle and p2 appears.
+        let addr = peer.shutdown();
+        *state.agents.lock().unwrap() = vec![
+            peer_agent("w1:p1", AgentStatus::Idle),
+            peer_agent("w1:p2", AgentStatus::Working),
+        ];
+        let peer = StreamingPeer::spawn_on(addr, Arc::clone(&state));
+        assert!(wait_until(Duration::from_secs(10), || hub_statuses(
+            &relay.hub
+        )
+        .len()
+            == 3));
+        // The restored stream repeats p1's idle transition late.
+        peer.event_hub.push(peer_status("w1:p1", AgentStatus::Idle));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(hub_statuses(&relay.hub).len(), 3);
+
+        // p2 blocks with its event lost to a ring overrun on the peer.
+        state.agents.lock().unwrap()[1] = peer_agent("w1:p2", AgentStatus::Blocked);
+        for index in 0..3 * EventHub::MAX_EVENTS {
+            peer.event_hub.push(EventEnvelope {
+                event: EventKind::WorkspaceFocused,
+                data: EventData::WorkspaceFocused {
+                    workspace_id: format!("w{index}"),
+                },
+            });
+        }
+        assert!(wait_until(Duration::from_secs(5), || hub_statuses(
+            &relay.hub
+        )
+        .len()
+            == 4));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            hub_statuses(&relay.hub),
+            status_pairs(&[
+                ("box/w1:p1", AgentStatus::Blocked),
+                ("box/w1:p1", AgentStatus::Idle),
+                ("box/w1:p2", AgentStatus::Working),
+                ("box/w1:p2", AgentStatus::Blocked),
+            ])
+        );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A route generation change drops the stream and reconnects it, leaving
+    /// exactly one live upstream stream; a peer restart with a new boot id is
+    /// a full resync that publishes every pane even when its status is
+    /// unchanged, since the old boot's pane ids mean nothing.
+    #[test]
+    fn relay_reconnects_on_stale_route_or_new_boot_with_one_stream() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let relay = start_relay(peer.addr);
+        assert!(wait_until(Duration::from_secs(5), || peer.subscribes()
+            == 1
+            && relay_baseline_has(&relay.store, "box/w1:p1")));
+
+        for round in 0..3 {
+            let before = peer.subscribes();
+            relay
+                .route
+                .force_remote_boot_for_test(&format!("boot-elsewhere-{round}"));
+            assert!(
+                wait_until(Duration::from_secs(5), || peer.subscribes() > before),
+                "a stale route stamp must reconnect"
+            );
+        }
+        std::thread::sleep(Duration::from_millis(2500));
+        assert_eq!(
+            peer.live_streams(Duration::from_millis(1500)).len(),
+            1,
+            "exactly one upstream stream survives the reconnects"
+        );
+        assert!(
+            relay.hub.events_after(0).is_empty(),
+            "reconnecting to the same boot publishes nothing new"
+        );
+
+        let addr = peer.shutdown();
+        *state.boot_id.lock().unwrap() = "boot-2".into();
+        let peer = StreamingPeer::spawn_on(addr, Arc::clone(&state));
+        assert!(wait_until(Duration::from_secs(10), || !hub_statuses(
+            &relay.hub
+        )
+        .is_empty()));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(
+            hub_statuses(&relay.hub),
+            status_pairs(&[("box/w1:p1", AgentStatus::Working)])
+        );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A peer that does not advertise `events_v2` keeps the poll alone: its
+    /// agents are cached but no event stream is ever opened.
+    #[test]
+    fn peer_without_events_v2_is_polled_but_never_streamed() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            false,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let token_path = unique_token_file(SEEDED_PEER_TOKEN);
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let hub = EventHub::default();
+        let running = Arc::new(AtomicBool::new(true));
+        let manager =
+            FederationPeerManager::new(Arc::clone(&cache), hub.clone(), Arc::clone(&running));
+        manager.reconcile(&[reachable_peer_on(peer.addr, "box", &token_path)]);
+        assert!(wait_for_cached(&cache, "box", "box/w1:p1"));
+        std::thread::sleep(Duration::from_secs(1));
+        assert_eq!(peer.subscribes(), 0, "no stream without the capability");
+        assert!(hub.events_after(0).is_empty());
+
+        manager.join_all();
+        peer.shutdown();
+        let _ = std::fs::remove_file(&token_path);
     }
 }

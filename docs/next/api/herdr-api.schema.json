@@ -10465,6 +10465,26 @@
           ],
           "type": "object"
         },
+        "Reachability": {
+          "description": "Reachability of a federation peer, derived from consecutive poll outcomes.\n\nSerialized onto remote [`AgentInfo`]s so a client can tell a live peer from\none that has gone quiet. A C-like enum, so it derives `Eq`.",
+          "oneOf": [
+            {
+              "const": "reachable",
+              "description": "The last poll succeeded.",
+              "type": "string"
+            },
+            {
+              "const": "degraded",
+              "description": "One or two consecutive polls have failed; last-known agents are retained.",
+              "type": "string"
+            },
+            {
+              "const": "unreachable",
+              "description": "At least [`UNREACHABLE_MISS_THRESHOLD`] consecutive polls have failed; the\npeer is treated as offline and its agents are stamped `unknown`.",
+              "type": "string"
+            }
+          ]
+        },
         "ReadFormat": {
           "enum": [
             "text",
@@ -10539,6 +10559,27 @@
             "label": {
               "type": "string"
             },
+            "machine_id": {
+              "description": "Federation: the home-chosen routing alias of the peer that owns this\ntab. `None` for a local tab.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_label": {
+              "description": "Federation: display label of the owning peer. Never used for routing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_profile_id": {
+              "description": "Federation: saved-machine profile id of the owning peer, when it has one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "number": {
               "format": "uint",
               "minimum": 0,
@@ -10595,6 +10636,38 @@
             "label": {
               "type": "string"
             },
+            "last_known_status": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/AgentStatus"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Federation: the workspace's last-known aggregate status, preserved when\nthe peer is not reachable and `agent_status` is surfaced as `unknown`."
+            },
+            "machine_id": {
+              "description": "Federation: the home-chosen routing alias of the peer that owns this\nworkspace. `None` for a local workspace.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_label": {
+              "description": "Federation: display label of the owning peer. Never used for routing.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "machine_profile_id": {
+              "description": "Federation: saved-machine profile id of the owning peer, when it has one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "number": {
               "format": "uint",
               "minimum": 0,
@@ -10604,6 +10677,17 @@
               "format": "uint",
               "minimum": 0,
               "type": "integer"
+            },
+            "reachability": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/subscription_stream_event/$defs/Reachability"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Federation: reachability of the owning peer as of the last poll. `None`\nfor a local workspace."
             },
             "tab_count": {
               "format": "uint",

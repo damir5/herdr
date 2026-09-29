@@ -329,6 +329,10 @@ impl RemotePushTracker {
         if agent.status == AgentStatus::Working {
             seen.left = false;
         }
+        // A held finish no longer stands once the agent is busy again.
+        if matches!(agent.status, AgentStatus::Working | AgentStatus::Blocked) {
+            self.held.retain(|(_, held)| held.pane_id != agent.pane_id);
+        }
         seen.status = agent.status;
         seen.agent = agent.agent;
         // Keep naming the agent after it releases the pane, for its exit.
@@ -740,6 +744,20 @@ mod tests {
         let alerts = capture.take().alerts;
         assert_eq!(alerts.len(), 1);
         assert_eq!(alerts[0].kind, PushKind::Finished);
+    }
+
+    #[test]
+    fn held_finish_is_cancelled_when_the_agent_resumes() {
+        let (mut app, capture, agent) = seeded(direct_push(), "llm-opt");
+        pane_event(&app, RemotePaneEvent::AgentReleased);
+        relay(&app, &agent, AgentStatus::Done);
+        assert!(sync(&mut app, &capture).is_empty());
+        relay(&app, &agent, AgentStatus::Working);
+        assert!(sync(&mut app, &capture).is_empty());
+
+        app.sync_remote_agent_notifications(Instant::now() + Duration::from_secs(5));
+        let alerts = capture.take().alerts;
+        assert!(alerts.is_empty(), "{alerts:?}");
     }
 
     #[test]

@@ -939,6 +939,16 @@ peers. A coordinator sets it on its relay stream, so a peer that is itself a
 coordinator never re-exports a third machine's events. Older servers ignore
 the field; they have no relayed events to leave out.
 
+Devices registered with `notifications.register_device` also get push
+notifications for remote agents, per their needs-you, finished and exited
+preferences. The title names the machine, for example `llm-opt on Jerry's Mac
+Studio needs attention`, and the alert carries the `<alias>/`-qualified pane
+id, so `muted_panes` mutes a remote pane by that id. Each transition is pushed
+once: a repeated relayed event, a resync, or a poll that repeats a known
+status sends nothing. Peers without `events_v2` notify from the 5-second poll,
+and only relaying peers report an exited agent. The Live Activity counts the
+agents on reachable peers with the local ones.
+
 ## Reading panes
 
 Use `pane.read` through the CLI unless you are writing a protocol client.

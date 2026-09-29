@@ -13,6 +13,9 @@ struct EventHubState {
     next_sequence: u64,
     /// Sequence number of the newest event evicted from the ring.
     evicted_through: u64,
+    /// Sequence number of the newest non-relayed event evicted from the ring:
+    /// all a `local_only` reader can have missed.
+    local_evicted_through: u64,
     events: VecDeque<HubEvent>,
 }
 
@@ -77,6 +80,9 @@ impl EventHub {
         while state.events.len() > Self::MAX_EVENTS {
             if let Some(evicted) = state.events.pop_front() {
                 state.evicted_through = evicted.sequence;
+                if !evicted.relayed {
+                    state.local_evicted_through = evicted.sequence;
+                }
             }
         }
     }
@@ -134,11 +140,18 @@ impl EventHubState {
     }
 
     fn batch_after(&self, cursor: u64, include_relayed: bool) -> EventBatch {
+        // A local reader never sees relayed events, so losing only those is no
+        // gap for it.
+        let evicted_through = if include_relayed {
+            self.evicted_through
+        } else {
+            self.local_evicted_through
+        };
         EventBatch {
             head: self.next_sequence,
-            missed: (self.evicted_through > cursor).then_some(MissedEvents {
+            missed: (evicted_through > cursor).then_some(MissedEvents {
                 first: cursor + 1,
-                last: self.evicted_through,
+                last: evicted_through,
             }),
             events: self
                 .retained_after(cursor)
@@ -203,5 +216,26 @@ mod tests {
             "a relayed event must never be served to a relaying coordinator"
         );
         assert_eq!(hub.read_after(0).events.len(), 3);
+    }
+
+    #[test]
+    fn local_reads_lag_only_when_a_local_event_was_evicted() {
+        let hub = EventHub::default();
+        hub.push(focused("local-1"));
+        for index in 0..EventHub::MAX_EVENTS + 2 {
+            hub.push_relayed(focused(&format!("peer/w{index}")));
+        }
+
+        // Seen through the local event; only relayed events were lost since.
+        assert_eq!(hub.read_local_after(1).missed, None);
+        assert_eq!(
+            hub.read_after(1).missed,
+            Some(MissedEvents { first: 2, last: 3 })
+        );
+        // A local reader that had not seen the local event did miss it.
+        assert_eq!(
+            hub.read_local_after(0).missed,
+            Some(MissedEvents { first: 1, last: 1 })
+        );
     }
 }

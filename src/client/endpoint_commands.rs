@@ -493,7 +493,7 @@ mod tests {
                 request: Box::new(Request {
                     id: "queued-source".into(),
                     method: crate::api::schema::Method::WorkspaceList(
-                        crate::api::schema::EmptyParams::default(),
+                        crate::api::schema::WorkspaceListParams::default(),
                     ),
                 }),
             });
@@ -506,7 +506,7 @@ mod tests {
                     request: Box::new(Request {
                         id: "request-b".into(),
                         method: crate::api::schema::Method::WorkspaceList(
-                            crate::api::schema::EmptyParams::default(),
+                            crate::api::schema::WorkspaceListParams::default(),
                         ),
                     }),
                 }]),
@@ -553,7 +553,7 @@ mod tests {
                 request: Box::new(Request {
                     id: "queued-a".into(),
                     method: crate::api::schema::Method::WorkspaceList(
-                        crate::api::schema::EmptyParams::default(),
+                        crate::api::schema::WorkspaceListParams::default(),
                     ),
                 }),
             });

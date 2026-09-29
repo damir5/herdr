@@ -140,8 +140,10 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
     use FederationAccess::AllowedAt;
     let (access, outbound_routable) = match method_wire_name {
         // Observe methods whose target can be owned by a remote peer.
+        // `workspace.get`/`tab.get`/`tab.list` route an `<alias>/…` workspace or
+        // tab id to its owning peer; a bare `tab.list` stays local.
         "agent.get" | "agent.read" | "agent.explain" | "pane.read" | "pane.turns"
-        | "pane.stream" => (AllowedAt(Observe), true),
+        | "pane.stream" | "workspace.get" | "tab.list" | "tab.get" => (AllowedAt(Observe), true),
         // Other read-only inspection stays local when called at the home.
         "ping"
         | "agent.list"
@@ -160,10 +162,7 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         | "events.wait"
         | "session.snapshot"
         | "workspace.list"
-        | "workspace.get"
         | "worktree.list"
-        | "tab.list"
-        | "tab.get"
         | "layout.export" => (AllowedAt(Observe), false),
         // Interact methods with an explicit remote-owned target.
         "agent.prompt" | "agent.send_keys" | "pane.send_text" | "pane.send_keys" => {

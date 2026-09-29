@@ -1,4 +1,4 @@
-//! In-memory cache of remote federation peers' agents.
+//! In-memory cache of remote federation peers' agents and workspaces.
 //!
 //! The outbound federation client (see `crate::api::server`) polls each
 //! configured peer's `agent.list` on a timer and writes the result here. The
@@ -11,12 +11,14 @@
 //! ever spawned, so the store stays empty and the merge is a no-op — the local
 //! `agent.list` path is byte-identical to a build without federation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::schema::{AgentInfo, AgentStatus, FederationPollErrorClass, ServerCapabilities};
+use crate::api::schema::{
+    AgentInfo, AgentStatus, FederationPollErrorClass, ServerCapabilities, WorkspaceInfo,
+};
 
 /// Reachability of a federation peer, derived from consecutive poll outcomes.
 ///
@@ -92,6 +94,11 @@ pub struct PeerCacheEntry {
     pub reachability: Reachability,
     /// Last-known agents from this peer, alias-prefixed at write time.
     pub agents: Vec<AgentInfo>,
+    /// Last-known workspaces from this peer, alias-qualified at write time and
+    /// in the peer's own order. Refreshed on a slower cadence than `agents`
+    /// (see [`FederationStore::set_peer_workspaces`]) and kept across agent
+    /// polls and misses.
+    pub workspaces: Vec<WorkspaceInfo>,
     /// When the last successful poll landed, if any. Recorded now for a later
     /// staleness surface (e.g. a `last_seen` age in `agent.list`); not yet read
     /// on the merge path, so it reads as unused in a non-test build.
@@ -117,6 +124,7 @@ impl PeerCacheEntry {
         Self {
             reachability: Reachability::Reachable,
             agents,
+            workspaces: Vec::new(),
             last_seen: Some(last_seen),
             last_success_unix_ms: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -135,9 +143,47 @@ pub struct FederationStore {
 }
 
 impl FederationStore {
-    /// Replace a peer's cached entry. Called by the poll thread after each poll.
-    pub fn set_peer(&mut self, alias: impl Into<String>, entry: PeerCacheEntry) {
-        self.peers.insert(alias.into(), entry);
+    /// Replace a peer's cached agent snapshot. Called by the poll thread after
+    /// each successful agent poll. The peer's cached workspaces are carried
+    /// over: they refresh on their own cadence through
+    /// [`Self::set_peer_workspaces`], so an agent poll never blanks them.
+    pub fn set_peer(&mut self, alias: impl Into<String>, mut entry: PeerCacheEntry) {
+        let alias = alias.into();
+        if let Some(previous) = self.peers.get_mut(&alias) {
+            entry.workspaces = std::mem::take(&mut previous.workspaces);
+        }
+        self.peers.insert(alias, entry);
+    }
+
+    /// Workspace ids named by `alias`'s cached agents that its cached
+    /// workspaces do not contain: the poll's trigger for an early
+    /// `workspace.list` refresh. Archived agents (empty workspace id) never count.
+    pub fn missing_workspace_ids(&self, alias: &str) -> HashSet<String> {
+        let Some(entry) = self.peers.get(alias) else {
+            return HashSet::new();
+        };
+        entry
+            .agents
+            .iter()
+            .map(|agent| agent.workspace_id.as_str())
+            .filter(|id| {
+                !id.is_empty()
+                    && !entry
+                        .workspaces
+                        .iter()
+                        .any(|workspace| workspace.workspace_id == *id)
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Replace a peer's cached workspaces (already alias-qualified). A no-op
+    /// for an alias with no entry: the agent poll creates the entry first, and
+    /// an evicted alias must not reappear.
+    pub fn set_peer_workspaces(&mut self, alias: &str, workspaces: Vec<WorkspaceInfo>) {
+        if let Some(entry) = self.peers.get_mut(alias) {
+            entry.workspaces = workspaces;
+        }
     }
 
     /// The cached entry for `alias`, if any. An inspection accessor exercised by
@@ -158,6 +204,10 @@ impl FederationStore {
             agent.machine_profile_id = profile_id.map(str::to_owned);
             agent.machine_label = Some(label.to_owned());
         }
+        for workspace in &mut entry.workspaces {
+            workspace.machine_profile_id = profile_id.map(str::to_owned);
+            workspace.machine_label = Some(label.to_owned());
+        }
     }
 
     /// Mark a peer's reachability without disturbing its last-known agents.
@@ -174,6 +224,7 @@ impl FederationStore {
                     PeerCacheEntry {
                         reachability,
                         agents: Vec::new(),
+                        workspaces: Vec::new(),
                         last_seen: None,
                         last_success_unix_ms: None,
                         last_error_class: None,
@@ -224,6 +275,31 @@ impl FederationStore {
                     .agents
                     .iter()
                     .map(|agent| stamp_agent(agent, entry.reachability))
+            })
+            .collect()
+    }
+
+    /// Every cached peer's workspaces for merge into the local
+    /// `workspace.list`, grouped by peer alias (sorted, so the order is stable)
+    /// and in each peer's own order, so `number` and position reproduce that
+    /// machine's sidebar. Stamped like [`Self::merged_agents`]: a peer that is
+    /// not `Reachable` keeps its last-known workspaces, surfaces `agent_status`
+    /// as `unknown`, and preserves the real value in `last_known_status`.
+    pub fn merged_workspaces(&self) -> Vec<WorkspaceInfo> {
+        let mut peers: Vec<_> = self.peers.iter().collect();
+        peers.sort_unstable_by_key(|(alias, _)| *alias);
+        peers
+            .into_iter()
+            .flat_map(|(_, entry)| {
+                entry.workspaces.iter().map(|workspace| {
+                    let mut stamped = workspace.clone();
+                    stamped.reachability = Some(entry.reachability);
+                    if entry.reachability != Reachability::Reachable {
+                        stamped.last_known_status = Some(workspace.agent_status);
+                        stamped.agent_status = AgentStatus::Unknown;
+                    }
+                    stamped
+                })
             })
             .collect()
     }
@@ -324,6 +400,7 @@ mod tests {
             PeerCacheEntry {
                 reachability: Reachability::Degraded,
                 agents: vec![agent(AgentStatus::Blocked, "home/reviewer")],
+                workspaces: Vec::new(),
                 last_seen: Some(Instant::now()),
                 last_success_unix_ms: None,
                 last_error_class: None,
@@ -352,6 +429,7 @@ mod tests {
             PeerCacheEntry {
                 reachability: Reachability::Unreachable,
                 agents: vec![agent(AgentStatus::Idle, "home/idler")],
+                workspaces: Vec::new(),
                 last_seen: Some(Instant::now()),
                 last_success_unix_ms: None,
                 last_error_class: None,
@@ -424,5 +502,107 @@ mod tests {
         // Removing an absent alias is a no-op, not a panic.
         store.remove_peer("home");
         assert!(store.is_empty());
+    }
+
+    fn workspace(workspace_id: &str, number: usize, status: AgentStatus) -> WorkspaceInfo {
+        serde_json::from_value(serde_json::json!({
+            "workspace_id": workspace_id,
+            "number": number,
+            "label": format!("label-{number}"),
+            "focused": false,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": format!("{workspace_id}:t1"),
+            "agent_status": status,
+        }))
+        .expect("workspace info deserializes")
+    }
+
+    #[test]
+    fn cached_workspaces_survive_agent_polls_and_go_stale_with_the_peer() {
+        let mut store = FederationStore::default();
+        store.set_peer_workspaces("home", vec![workspace("home/w0", 1, AgentStatus::Idle)]);
+        assert!(
+            store.merged_workspaces().is_empty(),
+            "an alias without an agent-poll entry must not gain workspaces"
+        );
+
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![agent(AgentStatus::Working, "a")], Instant::now()),
+        );
+        store.set_peer_workspaces(
+            "home",
+            vec![
+                workspace("home/w2", 1, AgentStatus::Working),
+                workspace("home/w1", 2, AgentStatus::Done),
+            ],
+        );
+        store.set_peer(
+            "alpha",
+            PeerCacheEntry::reachable(Vec::new(), Instant::now()),
+        );
+        store.set_peer_workspaces("alpha", vec![workspace("alpha/w1", 1, AgentStatus::Idle)]);
+        // The next 5 s agent poll replaces the entry; workspaces are kept.
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![agent(AgentStatus::Working, "a")], Instant::now()),
+        );
+
+        let merged = store.merged_workspaces();
+        let ids: Vec<_> = merged.iter().map(|ws| ws.workspace_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["alpha/w1", "home/w2", "home/w1"],
+            "peers sorted by alias, each in its own order"
+        );
+        assert!(merged
+            .iter()
+            .all(|ws| ws.reachability == Some(Reachability::Reachable)));
+        assert_eq!(merged[1].agent_status, AgentStatus::Working);
+        assert_eq!(merged[1].last_known_status, None);
+
+        store.degrade_peer("home", Reachability::Unreachable);
+        let merged = store.merged_workspaces();
+        let home: Vec<_> = merged
+            .iter()
+            .filter(|ws| ws.workspace_id.starts_with("home/"))
+            .collect();
+        assert_eq!(
+            home.len(),
+            2,
+            "an unreachable peer keeps its last-known workspaces"
+        );
+        assert!(home.iter().all(|ws| {
+            ws.reachability == Some(Reachability::Unreachable)
+                && ws.agent_status == AgentStatus::Unknown
+        }));
+        assert_eq!(home[0].last_known_status, Some(AgentStatus::Working));
+        assert_eq!(home[1].last_known_status, Some(AgentStatus::Done));
+
+        store.remove_peer("home");
+        assert_eq!(store.merged_workspaces().len(), 1);
+    }
+
+    #[test]
+    fn missing_workspace_ids_names_only_uncached_live_workspaces() {
+        let mut store = FederationStore::default();
+        let mut archived = agent(AgentStatus::Idle, "archived");
+        archived.workspace_id = String::new();
+        let mut known = agent(AgentStatus::Idle, "known");
+        known.workspace_id = "home/w1".into();
+        let mut new = agent(AgentStatus::Idle, "new");
+        new.workspace_id = "home/w2".into();
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![archived, known, new], Instant::now()),
+        );
+        store.set_peer_workspaces("home", vec![workspace("home/w1", 1, AgentStatus::Idle)]);
+
+        assert_eq!(
+            store.missing_workspace_ids("home"),
+            HashSet::from(["home/w2".to_string()])
+        );
+        assert!(store.missing_workspace_ids("absent").is_empty());
     }
 }

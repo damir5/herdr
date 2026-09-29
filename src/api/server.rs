@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
@@ -72,6 +72,10 @@ const MAX_INITIAL_REQUEST_BYTES: usize = 1024 * 1024;
 const MAX_FEDERATION_CONNECTIONS: usize = 32;
 /// How often each configured peer is polled for its agent list.
 const FEDERATION_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Cadence of the extra `workspace.list` fetch that rides on a reachable
+/// peer's agent poll (see [`WorkspaceRefresh`]): workspaces change rarely, so
+/// this is a multiple of [`FEDERATION_POLL_INTERVAL`], not every agent poll.
+const FEDERATION_WORKSPACE_POLL_INTERVAL: Duration = Duration::from_secs(30);
 /// Granularity at which the poll sleep re-checks `running`, so a shutdown is not
 /// held up for a whole poll interval.
 const FEDERATION_POLL_STEP: Duration = Duration::from_millis(100);
@@ -552,6 +556,7 @@ pub(crate) fn run_federation_peer_poll(
 ) {
     let client = ApiClient::for_target(route.target().clone());
     let mut tracker = ReachabilityTracker::default();
+    let mut workspace_refresh = WorkspaceRefresh::default();
 
     while running.load(Ordering::Relaxed) && !peer_stop.load(Ordering::Relaxed) {
         let reachability = poll_once_into_cache(
@@ -565,6 +570,18 @@ pub(crate) fn run_federation_peer_poll(
             &running,
             &peer_stop,
         );
+        if reachability == Reachability::Reachable {
+            refresh_workspaces_into_cache(
+                &client,
+                &peer.alias,
+                &presentation,
+                &cache,
+                &mut workspace_refresh,
+                Instant::now(),
+                &running,
+                &peer_stop,
+            );
+        }
         let interval = if reachability == Reachability::Reachable {
             FEDERATION_POLL_INTERVAL
         } else {
@@ -573,6 +590,122 @@ pub(crate) fn run_federation_peer_poll(
         sleep_interruptible(&running, &peer_stop, interval);
     }
     debug!(alias = %peer.alias, "federation peer poll thread exiting");
+}
+
+/// Schedule for the slower `workspace.list` fetch that rides on the agent poll.
+///
+/// Workspaces change far less often than agent status, so a reachable peer's
+/// workspaces are fetched on the first successful agent poll, then every
+/// [`FEDERATION_WORKSPACE_POLL_INTERVAL`]; the agent poll keeps its 5 s cadence
+/// and adds no request in between. One early fetch is allowed when a polled
+/// agent names a workspace the cache does not have (a workspace created on the
+/// peer), bounded to ids that were not already missing after the last fetch so
+/// an id the peer does not list cannot turn every agent poll into a fetch.
+#[derive(Debug, Default)]
+struct WorkspaceRefresh {
+    last_attempt: Option<Instant>,
+    missing_after_last_attempt: HashSet<String>,
+}
+
+impl WorkspaceRefresh {
+    fn due(&self, now: Instant, missing: &HashSet<String>) -> bool {
+        let Some(last_attempt) = self.last_attempt else {
+            return true;
+        };
+        now.saturating_duration_since(last_attempt) >= FEDERATION_WORKSPACE_POLL_INTERVAL
+            || !missing.is_subset(&self.missing_after_last_attempt)
+    }
+}
+
+/// Fetch the peer's `workspace.list` into `cache` when [`WorkspaceRefresh`]
+/// says it is due. Called only after a successful agent poll, which owns the
+/// peer's reachability: a failed workspace fetch keeps the last-known
+/// workspaces, logs, and waits for the next slow tick instead of retrying on
+/// every agent poll.
+#[allow(clippy::too_many_arguments)]
+fn refresh_workspaces_into_cache(
+    client: &ApiClient,
+    alias: &str,
+    presentation: &Arc<RwLock<PeerPresentation>>,
+    cache: &Mutex<FederationStore>,
+    refresh: &mut WorkspaceRefresh,
+    now: Instant,
+    running: &Arc<AtomicBool>,
+    peer_stop: &Arc<AtomicBool>,
+) {
+    let missing = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .missing_workspace_ids(alias);
+    if !refresh.due(now, &missing) {
+        return;
+    }
+    refresh.last_attempt = Some(now);
+    let workspaces = match poll_peer_workspace_list(client, running) {
+        Ok(workspaces) => workspaces,
+        Err(err) => {
+            warn!(alias = %alias, err = %err, "federation peer workspace poll failed");
+            refresh.missing_after_last_attempt = missing;
+            return;
+        }
+    };
+    let presentation = presentation
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mut rejected = 0usize;
+    let qualified = workspaces
+        .into_iter()
+        .filter_map(|workspace| {
+            let workspace = qualify_remote_workspace(alias, &presentation, workspace);
+            rejected += usize::from(workspace.is_none());
+            workspace
+        })
+        .collect();
+    if rejected != 0 {
+        warn!(
+            alias = %alias,
+            rejected,
+            "federation peer returned already-qualified or invalid workspace identities"
+        );
+    }
+    let mut store = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // Same under-lock stop guard as `poll_once_into_cache`.
+    if peer_stop.load(Ordering::Relaxed) {
+        return;
+    }
+    store.set_peer_workspaces(alias, qualified);
+    refresh.missing_after_last_attempt = store.missing_workspace_ids(alias);
+}
+
+/// Fetch one peer's own workspaces with `workspace.list{local_only:true}`, so a
+/// peer that is itself a coordinator never re-exports its peers' workspaces.
+/// Bounded exactly like [`poll_peer_agent_list`].
+fn poll_peer_workspace_list(
+    client: &ApiClient,
+    running: &Arc<AtomicBool>,
+) -> Result<Vec<crate::api::schema::WorkspaceInfo>, ApiClientError> {
+    let request = Request {
+        id: "federation:workspace.list".into(),
+        method: Method::WorkspaceList(crate::api::schema::WorkspaceListParams { local_only: true }),
+    };
+    let value = client.request_value_bounded(
+        &request,
+        FEDERATION_MAX_RESPONSE_BYTES,
+        FEDERATION_POLL_REQUEST_TIMEOUT,
+        Some(running),
+    )?;
+    match parse_response_value(value)?.result {
+        ResponseResult::WorkspaceList { mut workspaces } => {
+            // Fail-safe for a peer that ignores `local_only`: a local workspace
+            // never carries federation machine identity.
+            workspaces.retain(|workspace| workspace.machine_id.is_none());
+            Ok(workspaces)
+        }
+        other => Err(ApiClientError::UnexpectedResult(format!("{other:?}"))),
+    }
 }
 
 struct PeerPollSnapshot {
@@ -797,16 +930,7 @@ fn prefix_remote_agent(
     presentation: &PeerPresentation,
     mut agent: crate::api::schema::AgentInfo,
 ) -> Option<crate::api::schema::AgentInfo> {
-    fn qualify(alias: &str, value: String, allow_empty: bool) -> Option<String> {
-        if value.is_empty() {
-            return allow_empty.then_some(value);
-        }
-        if value.contains('/') {
-            return None;
-        }
-        Some(format!("{alias}/{value}"))
-    }
-
+    let qualify = qualify_remote_id;
     let archived = agent.archived.is_some();
     agent.name = agent.name.map(|name| format!("{alias}/{name}"));
     agent.terminal_id = qualify(alias, agent.terminal_id, false)?;
@@ -824,6 +948,93 @@ fn prefix_remote_agent(
     agent.reachability = None;
     agent.last_known_status = None;
     Some(agent)
+}
+
+/// Give one peer-local id exactly one `<alias>/` prefix. An empty id is kept
+/// empty when `allow_empty`; an id that already contains `/` (already
+/// qualified, or a malformed peer) is rejected rather than prefixed twice.
+fn qualify_remote_id(alias: &str, value: String, allow_empty: bool) -> Option<String> {
+    if value.is_empty() {
+        return allow_empty.then_some(value);
+    }
+    if value.contains('/') {
+        return None;
+    }
+    Some(format!("{alias}/{value}"))
+}
+
+/// Rewrite a peer's workspace for the home's directory: `workspace_id` and
+/// `active_tab_id` gain one `<alias>/` prefix and the home-owned machine fields
+/// are stamped. `number`, `label`, `focused` and position are the peer's own so
+/// a client can reproduce that machine's sidebar. `reachability` and
+/// `last_known_status` are set only by [`FederationStore::merged_workspaces`].
+fn qualify_remote_workspace(
+    alias: &str,
+    presentation: &PeerPresentation,
+    mut workspace: crate::api::schema::WorkspaceInfo,
+) -> Option<crate::api::schema::WorkspaceInfo> {
+    workspace.workspace_id = qualify_remote_id(alias, workspace.workspace_id, false)?;
+    workspace.active_tab_id = qualify_remote_id(alias, workspace.active_tab_id, true)?;
+    workspace.machine_id = Some(alias.to_owned());
+    workspace
+        .machine_profile_id
+        .clone_from(&presentation.profile_id);
+    workspace.machine_label = Some(presentation.label.clone());
+    workspace.reachability = None;
+    workspace.last_known_status = None;
+    Some(workspace)
+}
+
+/// Rewrite a peer's tab: `tab_id` and `workspace_id` gain one `<alias>/` prefix
+/// and the home-owned machine fields are stamped.
+fn qualify_remote_tab(
+    alias: &str,
+    presentation: &PeerPresentation,
+    mut tab: crate::api::schema::TabInfo,
+) -> Option<crate::api::schema::TabInfo> {
+    tab.tab_id = qualify_remote_id(alias, tab.tab_id, false)?;
+    tab.workspace_id = qualify_remote_id(alias, tab.workspace_id, false)?;
+    tab.machine_id = Some(alias.to_owned());
+    tab.machine_profile_id.clone_from(&presentation.profile_id);
+    tab.machine_label = Some(presentation.label.clone());
+    Some(tab)
+}
+
+/// Qualify the ids in a routed `workspace.get`/`tab.get`/`tab.list` reply so the
+/// client keeps seeing federated identities it can route again. Every other
+/// line (errors, other methods' results) passes through verbatim. A peer reply
+/// whose ids are already qualified is refused as `peer_invalid_response`
+/// instead of being prefixed twice.
+fn qualify_routed_response(alias: &str, presentation: &PeerPresentation, line: String) -> String {
+    let Ok(response) = serde_json::from_str::<SuccessResponse>(&line) else {
+        return line;
+    };
+    let SuccessResponse { id, result } = response;
+    let result = match result {
+        ResponseResult::WorkspaceInfo { workspace } => {
+            qualify_remote_workspace(alias, presentation, workspace)
+                .map(|workspace| ResponseResult::WorkspaceInfo { workspace })
+        }
+        ResponseResult::TabInfo { tab } => {
+            qualify_remote_tab(alias, presentation, tab).map(|tab| ResponseResult::TabInfo { tab })
+        }
+        ResponseResult::TabList { tabs } => tabs
+            .into_iter()
+            .map(|tab| qualify_remote_tab(alias, presentation, tab))
+            .collect::<Option<Vec<_>>>()
+            .map(|tabs| ResponseResult::TabList { tabs }),
+        _ => return line,
+    };
+    match result {
+        Some(result) => {
+            serde_json::to_string(&SuccessResponse { id, result }).unwrap_or_else(|_| line.clone())
+        }
+        None => error_response_json(
+            id,
+            "peer_invalid_response",
+            format!("federation peer {alias:?} returned already-qualified ids"),
+        ),
+    }
 }
 
 /// Sleep up to `total`, waking every [`FEDERATION_POLL_STEP`] to re-check the
@@ -1472,6 +1683,12 @@ fn routable_target_mut(method: &mut Method) -> Option<&mut String> {
         // federated `<alias>/pane` routes to the owning peer, where the width
         // arbiter runs (#137).
         Method::PaneSetPtySize(params) => params.pane_id.as_mut(),
+        // Workspace/tab reads for a federated `<alias>/…` id run on the owning
+        // peer; the reply's ids are re-qualified by `qualify_routed_response`.
+        // A `tab.list` without a workspace id stays local.
+        Method::WorkspaceGet(params) => Some(&mut params.workspace_id),
+        Method::TabGet(params) => Some(&mut params.tab_id),
+        Method::TabList(params) => params.workspace_id.as_mut(),
         _ => None,
     }
 }
@@ -1543,6 +1760,11 @@ fn maybe_route_to_peer(
 
     let stamp = peer_target.stamp();
     let response = proxy_federated_response(&peer_target, &stamp, request, running);
+    let response = if matches!(method, "workspace.get" | "tab.get" | "tab.list") {
+        qualify_routed_response(&alias, &peer_target.presentation(&alias), response)
+    } else {
+        response
+    };
     let result = match peer_target.with_current(&stamp, || {
         write_text_line_allow_disconnect(stream, &response)
     }) {
@@ -2791,7 +3013,7 @@ mod tests {
         let rejected = handle_request(
             Request {
                 id: "after_stop".into(),
-                method: Method::WorkspaceList(crate::api::schema::EmptyParams::default()),
+                method: Method::WorkspaceList(crate::api::schema::WorkspaceListParams::default()),
             },
             &tx,
             None,
@@ -2808,7 +3030,7 @@ mod tests {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let request = Request {
             id: "req_2".into(),
-            method: Method::WorkspaceList(crate::api::schema::EmptyParams::default()),
+            method: Method::WorkspaceList(crate::api::schema::WorkspaceListParams::default()),
         };
 
         let request_for_thread = request.clone();
@@ -4329,6 +4551,31 @@ mod federation_tests {
         running: Arc<AtomicBool>,
         listener: JoinHandle<()>,
         responder: JoinHandle<()>,
+        /// The peer's own workspaces, answered (after one re-exported entry) to
+        /// every `workspace.list`; tests may change them between polls.
+        workspaces: Arc<Mutex<Vec<crate::api::schema::WorkspaceInfo>>>,
+        /// How many `workspace.list` requests the peer has answered.
+        workspace_list_requests: Arc<AtomicUsize>,
+    }
+
+    /// A peer-local workspace as `workspace.list` reports it.
+    fn peer_workspace(
+        workspace_id: &str,
+        number: usize,
+        label: &str,
+        status: AgentStatus,
+    ) -> crate::api::schema::WorkspaceInfo {
+        serde_json::from_value(serde_json::json!({
+            "workspace_id": workspace_id,
+            "number": number,
+            "label": label,
+            "focused": number == 1,
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": format!("{workspace_id}:t1"),
+            "agent_status": status,
+        }))
+        .expect("peer workspace deserializes")
     }
 
     impl SeededPeer {
@@ -4342,6 +4589,13 @@ mod federation_tests {
             let (api_tx, mut api_rx) = mpsc::unbounded_channel::<ApiRequestMessage>();
             let event_hub = EventHub::default();
             let running = Arc::new(AtomicBool::new(true));
+            let workspaces = Arc::new(Mutex::new(vec![
+                peer_workspace("ws-remote", 1, "api", AgentStatus::Working),
+                peer_workspace("ws-docs", 2, "docs", AgentStatus::Idle),
+            ]));
+            let workspace_list_requests = Arc::new(AtomicUsize::new(0));
+            let responder_workspaces = Arc::clone(&workspaces);
+            let responder_requests = Arc::clone(&workspace_list_requests);
             let listener_thread = spawn_federation_listener(
                 listener,
                 one_peer(SEEDED_PEER_TOKEN, CapabilityTier::Observe),
@@ -4378,10 +4632,32 @@ mod federation_tests {
                             })
                             .expect("encode agent.list response")
                         }
+                        Method::WorkspaceList(params) => {
+                            assert!(
+                                params.local_only,
+                                "federation polls must not request aggregated workspaces"
+                            );
+                            responder_requests.fetch_add(1, Ordering::SeqCst);
+                            // What an older coordinator that ignores `local_only`
+                            // would add: a workspace it caches from its own peer.
+                            let mut reexported =
+                                peer_workspace("nested-ws", 9, "nested", AgentStatus::Idle);
+                            reexported.machine_id = Some("other-peer".into());
+                            let mut workspaces = responder_workspaces
+                                .lock()
+                                .expect("workspaces lock")
+                                .clone();
+                            workspaces.push(reexported);
+                            serde_json::to_string(&SuccessResponse {
+                                id: msg.request.id,
+                                result: ResponseResult::WorkspaceList { workspaces },
+                            })
+                            .expect("encode workspace.list response")
+                        }
                         _ => error_response_json(
                             msg.request.id,
                             "unexpected_dispatch",
-                            "only agent.list is expected in this test".into(),
+                            "only agent.list and workspace.list are expected in this test".into(),
                         ),
                     };
                     let _ = msg.respond_to.send(response);
@@ -4394,6 +4670,8 @@ mod federation_tests {
                 running,
                 listener: listener_thread,
                 responder,
+                workspaces,
+                workspace_list_requests,
             }
         }
 
@@ -4508,6 +4786,23 @@ mod federation_tests {
 
         // The outbound proxy registry has a route for the peer.
         assert!(manager.registry_snapshot().contains_key("home"));
+
+        // The live poll thread also fills the peer's workspaces after its first
+        // successful agent poll (#243).
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let workspaces = cache.lock().expect("cache lock").merged_workspaces();
+            if workspaces.len() == 2 {
+                assert_eq!(workspaces[0].workspace_id, "home/ws-remote");
+                assert_eq!(workspaces[1].workspace_id, "home/ws-docs");
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "poll thread did not cache the peer's workspaces"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
 
         // Teardown: join the poll thread (its in-flight poll completes against the
         // still-up listener), then stop the listener + responder.
@@ -5560,6 +5855,15 @@ mod federation_tests {
             (
                 "pane.send_text",
                 serde_json::json!({ "pane_id": "remote/w1:p1", "text": "hi" }),
+            ),
+            (
+                "workspace.get",
+                serde_json::json!({ "workspace_id": "remote/w1:p1" }),
+            ),
+            ("tab.get", serde_json::json!({ "tab_id": "remote/w1:p1" })),
+            (
+                "tab.list",
+                serde_json::json!({ "workspace_id": "remote/w1:p1" }),
             ),
         ];
 
@@ -6625,5 +6929,479 @@ mod federation_tests {
             peer.seen.lock().expect("seen lock").is_empty(),
             "a local pane.stream was proxied to the peer"
         );
+    }
+
+    // ---- #243: federated workspaces ------------------------------------------
+
+    fn build_box_presentation() -> Arc<RwLock<PeerPresentation>> {
+        Arc::new(RwLock::new(PeerPresentation {
+            profile_id: Some("profile-1".into()),
+            label: "Build Box".into(),
+        }))
+    }
+
+    fn peer_tab(tab_id: &str, workspace_id: &str, number: usize) -> crate::api::schema::TabInfo {
+        serde_json::from_value(serde_json::json!({
+            "tab_id": tab_id,
+            "workspace_id": workspace_id,
+            "number": number,
+            "label": format!("tab-{number}"),
+            "focused": number == 1,
+            "pane_count": 1,
+            "agent_status": "idle",
+        }))
+        .expect("peer tab deserializes")
+    }
+
+    fn seeded_peer_client(peer: &SeededPeer) -> ApiClient {
+        ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        })
+    }
+
+    #[test]
+    fn qualify_remote_workspace_and_tab_prefix_every_id_field() {
+        let presentation = build_box_presentation().read().unwrap().clone();
+        let mut workspace = peer_workspace("w1", 3, "api", AgentStatus::Working);
+        // Peer-supplied federation fields are home-owned and must be replaced.
+        workspace.machine_id = Some("spoofed".into());
+        workspace.reachability = Some(Reachability::Reachable);
+        workspace.last_known_status = Some(AgentStatus::Idle);
+        let workspace =
+            qualify_remote_workspace("home", &presentation, workspace).expect("qualifies");
+        assert_eq!(workspace.workspace_id, "home/w1");
+        assert_eq!(workspace.active_tab_id, "home/w1:t1");
+        assert_eq!((workspace.number, workspace.label.as_str()), (3, "api"));
+        assert_eq!(workspace.agent_status, AgentStatus::Working);
+        assert_eq!(workspace.machine_id.as_deref(), Some("home"));
+        assert_eq!(workspace.machine_label.as_deref(), Some("Build Box"));
+        assert_eq!(workspace.machine_profile_id.as_deref(), Some("profile-1"));
+        assert_eq!(workspace.reachability, None);
+        assert_eq!(workspace.last_known_status, None);
+
+        let tab = qualify_remote_tab("home", &presentation, peer_tab("w1:t2", "w1", 2))
+            .expect("qualifies");
+        assert_eq!(tab.tab_id, "home/w1:t2");
+        assert_eq!(tab.workspace_id, "home/w1");
+        assert_eq!((tab.number, tab.label.as_str()), (2, "tab-2"));
+        assert_eq!(tab.machine_id.as_deref(), Some("home"));
+        assert_eq!(tab.machine_label.as_deref(), Some("Build Box"));
+        assert_eq!(tab.machine_profile_id.as_deref(), Some("profile-1"));
+
+        // Already-qualified ids are refused, never prefixed twice.
+        assert!(qualify_remote_workspace(
+            "home",
+            &presentation,
+            peer_workspace("x/w1", 1, "a", AgentStatus::Idle)
+        )
+        .is_none());
+        let mut nested_tab = peer_workspace("w1", 1, "a", AgentStatus::Idle);
+        nested_tab.active_tab_id = "x/w1:t1".into();
+        assert!(qualify_remote_workspace("home", &presentation, nested_tab).is_none());
+        assert!(qualify_remote_tab("home", &presentation, peer_tab("x/t", "w1", 1)).is_none());
+        assert!(qualify_remote_tab("home", &presentation, peer_tab("t", "x/w1", 1)).is_none());
+    }
+
+    #[test]
+    fn federation_poll_caches_peer_workspaces_with_their_own_number_label_and_order() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let client = seeded_peer_client(&peer_srv);
+        let running = Arc::new(AtomicBool::new(true));
+        let peer_stop = Arc::new(AtomicBool::new(false));
+        let mut tracker = ReachabilityTracker::default();
+        let mut refresh = WorkspaceRefresh::default();
+        let presentation = build_box_presentation();
+
+        assert_eq!(
+            poll_once_into_cache(
+                &client,
+                "home",
+                None,
+                None,
+                &presentation,
+                &cache,
+                &mut tracker,
+                &running,
+                &peer_stop,
+            ),
+            Reachability::Reachable
+        );
+        refresh_workspaces_into_cache(
+            &client,
+            "home",
+            &presentation,
+            &cache,
+            &mut refresh,
+            Instant::now(),
+            &running,
+            &peer_stop,
+        );
+
+        let merged = cache.lock().expect("cache lock").merged_workspaces();
+        let summary: Vec<_> = merged
+            .iter()
+            .map(|ws| {
+                (
+                    ws.workspace_id.as_str(),
+                    ws.number,
+                    ws.label.as_str(),
+                    ws.focused,
+                    ws.active_tab_id.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                ("home/ws-remote", 1, "api", true, "home/ws-remote:t1"),
+                ("home/ws-docs", 2, "docs", false, "home/ws-docs:t1"),
+            ],
+            "the peer's own workspaces, in its order; its re-exported one is dropped"
+        );
+        assert!(merged.iter().all(|ws| {
+            ws.machine_id.as_deref() == Some("home")
+                && ws.machine_label.as_deref() == Some("Build Box")
+                && ws.reachability == Some(Reachability::Reachable)
+        }));
+
+        running.store(false, Ordering::Relaxed);
+        peer_srv.shutdown();
+    }
+
+    #[test]
+    fn federation_workspace_fetch_runs_at_the_slow_cadence_not_every_agent_poll() {
+        let peer_srv = SeededPeer::spawn("builder");
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        let client = seeded_peer_client(&peer_srv);
+        let running = Arc::new(AtomicBool::new(true));
+        let peer_stop = Arc::new(AtomicBool::new(false));
+        let mut tracker = ReachabilityTracker::default();
+        let mut refresh = WorkspaceRefresh::default();
+        let shared = shared_presentation("home");
+        let fetches = || peer_srv.workspace_list_requests.load(Ordering::SeqCst);
+        let t0 = Instant::now();
+        let refresh_at = |refresh: &mut WorkspaceRefresh, at: Duration| {
+            refresh_workspaces_into_cache(
+                &client,
+                "home",
+                &shared,
+                &cache,
+                refresh,
+                t0 + at,
+                &running,
+                &peer_stop,
+            );
+        };
+
+        // Six 5 s agent polls spanning 25 s fetch workspaces exactly once.
+        for tick in 0..6u32 {
+            assert_eq!(
+                poll_once_into_cache(
+                    &client,
+                    "home",
+                    None,
+                    None,
+                    &shared,
+                    &cache,
+                    &mut tracker,
+                    &running,
+                    &peer_stop,
+                ),
+                Reachability::Reachable
+            );
+            refresh_at(&mut refresh, FEDERATION_POLL_INTERVAL * tick);
+        }
+        assert_eq!(
+            fetches(),
+            1,
+            "agent polls inside the slow interval must not refetch"
+        );
+        refresh_at(&mut refresh, FEDERATION_WORKSPACE_POLL_INTERVAL);
+        assert_eq!(fetches(), 2, "the slow interval elapsed");
+
+        // The peer creates a workspace and a polled agent names it: one early fetch.
+        peer_srv.workspaces.lock().unwrap().push(peer_workspace(
+            "ws-new",
+            3,
+            "new",
+            AgentStatus::Idle,
+        ));
+        let mut agent = prefix_remote_agent(
+            "home",
+            &presentation("home"),
+            seeded_agent(AgentStatus::Working, "builder"),
+        )
+        .unwrap();
+        agent.workspace_id = "home/ws-new".into();
+        cache
+            .lock()
+            .unwrap()
+            .set_peer("home", PeerCacheEntry::reachable(vec![agent.clone()], t0));
+        refresh_at(&mut refresh, Duration::from_secs(35));
+        assert_eq!(
+            fetches(),
+            3,
+            "an uncached workspace id refreshes immediately"
+        );
+        assert!(cache
+            .lock()
+            .unwrap()
+            .merged_workspaces()
+            .iter()
+            .any(|ws| ws.workspace_id == "home/ws-new" && ws.number == 3));
+        refresh_at(&mut refresh, Duration::from_secs(40));
+        assert_eq!(fetches(), 3);
+
+        // An id the peer never lists triggers one early fetch, not one per poll.
+        agent.workspace_id = "home/ws-ghost".into();
+        cache
+            .lock()
+            .unwrap()
+            .set_peer("home", PeerCacheEntry::reachable(vec![agent], t0));
+        refresh_at(&mut refresh, Duration::from_secs(45));
+        assert_eq!(fetches(), 4);
+        refresh_at(&mut refresh, Duration::from_secs(50));
+        refresh_at(&mut refresh, Duration::from_secs(55));
+        assert_eq!(
+            fetches(),
+            4,
+            "a still-missing id must not refetch every agent poll"
+        );
+        refresh_at(&mut refresh, Duration::from_secs(75));
+        assert_eq!(fetches(), 5);
+
+        running.store(false, Ordering::Relaxed);
+        peer_srv.shutdown();
+    }
+
+    #[test]
+    fn unreachable_peer_keeps_cached_workspaces_marked_stale() {
+        let cache = Arc::new(Mutex::new(FederationStore::default()));
+        {
+            let mut store = cache.lock().expect("cache lock");
+            store.set_peer(
+                "home",
+                PeerCacheEntry::reachable(Vec::new(), Instant::now()),
+            );
+            store.set_peer_workspaces(
+                "home",
+                vec![qualify_remote_workspace(
+                    "home",
+                    &presentation("home"),
+                    peer_workspace("ws-remote", 4, "api", AgentStatus::Working),
+                )
+                .unwrap()],
+            );
+        }
+        let dead_addr = {
+            let probe = TcpListener::bind("127.0.0.1:0").expect("probe bind");
+            probe.local_addr().expect("probe addr")
+        };
+        let client = ApiClient::for_target(ConnectionTarget::Tcp {
+            addr: dead_addr,
+            token: Some("t".into()),
+        });
+        let running = Arc::new(AtomicBool::new(true));
+        let peer_stop = Arc::new(AtomicBool::new(false));
+        let mut tracker = ReachabilityTracker::default();
+        let mut last = Reachability::Reachable;
+        for _ in 0..3 {
+            last = poll_once_into_cache(
+                &client,
+                "home",
+                None,
+                None,
+                &shared_presentation("home"),
+                &cache,
+                &mut tracker,
+                &running,
+                &peer_stop,
+            );
+        }
+        assert_eq!(last, Reachability::Unreachable);
+
+        let merged = cache.lock().expect("cache lock").merged_workspaces();
+        assert_eq!(merged.len(), 1, "last-known workspaces survive the outage");
+        let ws = &merged[0];
+        assert_eq!(ws.workspace_id, "home/ws-remote");
+        assert_eq!((ws.number, ws.label.as_str()), (4, "api"));
+        assert_eq!(ws.reachability, Some(Reachability::Unreachable));
+        assert_eq!(ws.agent_status, AgentStatus::Unknown);
+        assert_eq!(ws.last_known_status, Some(AgentStatus::Working));
+    }
+
+    /// A proxy peer answering the routed workspace/tab reads with peer-local ids.
+    fn start_workspace_proxy_peer() -> ProxyPeer {
+        start_proxy_peer(|request, mut sock| {
+            let parsed: serde_json::Value =
+                serde_json::from_str(request).expect("peer request is json");
+            let params = &parsed["params"];
+            let result = match parsed["method"].as_str() {
+                Some("workspace.get") if params["workspace_id"] == "bad" => {
+                    ResponseResult::WorkspaceInfo {
+                        workspace: peer_workspace("x/bad", 1, "bad", AgentStatus::Idle),
+                    }
+                }
+                Some("workspace.get") => {
+                    assert_eq!(params["workspace_id"], "w1", "alias prefix stripped");
+                    ResponseResult::WorkspaceInfo {
+                        workspace: peer_workspace("w1", 2, "api", AgentStatus::Working),
+                    }
+                }
+                Some("tab.get") => {
+                    assert_eq!(params["tab_id"], "w1:t1");
+                    ResponseResult::TabInfo {
+                        tab: peer_tab("w1:t1", "w1", 1),
+                    }
+                }
+                Some("tab.list") => {
+                    assert_eq!(params["workspace_id"], "w1");
+                    ResponseResult::TabList {
+                        tabs: vec![peer_tab("w1:t1", "w1", 1), peer_tab("w1:t2", "w1", 2)],
+                    }
+                }
+                other => panic!("unexpected proxied method {other:?}"),
+            };
+            let line = serde_json::to_string(&SuccessResponse {
+                id: parsed["id"].as_str().expect("request id").into(),
+                result,
+            })
+            .unwrap();
+            writeln!(sock, "{line}").expect("peer writes response");
+            let _ = sock.flush();
+        })
+    }
+
+    fn workspace_home(peer: &ProxyPeer) -> HomeConn {
+        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some("tok".into()),
+        })
+        .with_presentation(build_box_presentation());
+        drive_home_routes(HashMap::from([("remote".to_string(), route)]))
+    }
+
+    #[test]
+    fn workspace_and_tab_reads_route_to_the_peer_with_qualified_replies() {
+        let peer = start_workspace_proxy_peer();
+        let roundtrip = |request: serde_json::Value| -> serde_json::Value {
+            let mut home = workspace_home(&peer);
+            // A request that wrongly dispatches locally gets no reply here;
+            // fail instead of hanging.
+            home.client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let response = home_roundtrip(&mut home, request);
+            assert!(
+                home.api_rx.try_recv().is_err(),
+                "a federated workspace/tab read reached the local app"
+            );
+            serde_json::from_str(&response).unwrap()
+        };
+
+        let value = roundtrip(serde_json::json!({
+            "id": "g1",
+            "method": "workspace.get",
+            "params": { "workspace_id": "remote/w1" },
+        }));
+        assert_eq!(value["id"], "g1");
+        let workspace = &value["result"]["workspace"];
+        assert_eq!(workspace["workspace_id"], "remote/w1");
+        assert_eq!(workspace["active_tab_id"], "remote/w1:t1");
+        assert_eq!(workspace["number"], 2);
+        assert_eq!(workspace["label"], "api");
+        assert_eq!(workspace["machine_id"], "remote");
+        assert_eq!(workspace["machine_label"], "Build Box");
+        assert_eq!(workspace["machine_profile_id"], "profile-1");
+
+        let value = roundtrip(serde_json::json!({
+            "id": "t1",
+            "method": "tab.get",
+            "params": { "tab_id": "remote/w1:t1" },
+        }));
+        assert_eq!(value["result"]["tab"]["tab_id"], "remote/w1:t1");
+        assert_eq!(value["result"]["tab"]["workspace_id"], "remote/w1");
+        assert_eq!(value["result"]["tab"]["machine_id"], "remote");
+
+        let value = roundtrip(serde_json::json!({
+            "id": "l1",
+            "method": "tab.list",
+            "params": { "workspace_id": "remote/w1" },
+        }));
+        let tabs: Vec<_> = value["result"]["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tab| {
+                (
+                    tab["tab_id"].clone(),
+                    tab["workspace_id"].clone(),
+                    tab["number"].clone(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            tabs,
+            [
+                ("remote/w1:t1".into(), "remote/w1".into(), 1.into()),
+                ("remote/w1:t2".into(), "remote/w1".into(), 2.into()),
+            ]
+        );
+
+        let value = roundtrip(serde_json::json!({
+            "id": "b1",
+            "method": "workspace.get",
+            "params": { "workspace_id": "remote/bad" },
+        }));
+        assert_eq!(value["id"], "b1");
+        assert_eq!(value["error"]["code"], "peer_invalid_response");
+
+        assert_eq!(peer.seen.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn workspace_get_with_an_unknown_alias_dispatches_locally_unrewritten() {
+        let peer = start_proxy_peer(|_request, _sock| {
+            panic!("an unknown alias must never reach a peer");
+        });
+        let mut home = workspace_home(&peer);
+        let mut api_rx = std::mem::replace(&mut home.api_rx, mpsc::unbounded_channel().1);
+        let responder = std::thread::spawn(move || {
+            for _ in 0..300 {
+                if let Ok(msg) = api_rx.try_recv() {
+                    let Method::WorkspaceGet(target) = &msg.request.method else {
+                        panic!("unexpected local method: {:?}", msg.request.method);
+                    };
+                    let target = target.workspace_id.clone();
+                    let _ = msg.respond_to.send(error_response_json(
+                        msg.request.id.clone(),
+                        "workspace_not_found",
+                        format!("workspace {target} not found"),
+                    ));
+                    return Some(target);
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            None
+        });
+
+        let response = home_roundtrip(
+            &mut home,
+            serde_json::json!({
+                "id": "u1",
+                "method": "workspace.get",
+                "params": { "workspace_id": "nope/w1" },
+            }),
+        );
+        let value: serde_json::Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(value["error"]["code"], "workspace_not_found");
+        assert_eq!(
+            responder.join().unwrap().as_deref(),
+            Some("nope/w1"),
+            "an unknown alias reaches local dispatch with its id untouched"
+        );
+        assert!(peer.seen.lock().unwrap().is_empty());
     }
 }

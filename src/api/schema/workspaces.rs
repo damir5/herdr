@@ -4,6 +4,15 @@ use serde::{Deserialize, Serialize};
 
 use super::common::AgentStatus;
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct WorkspaceListParams {
+    /// Return only this daemon's own workspaces, without the coordinator's
+    /// cached federated workspaces. Federation pollers always set it so a peer
+    /// that is itself a coordinator never re-exports its peers' workspaces.
+    #[serde(default, skip_serializing_if = "super::is_false")]
+    pub local_only: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct WorkspaceCreateParams {
     /// Workspace whose focused pane supplies the `follow` cwd policy.
@@ -73,6 +82,24 @@ pub struct WorkspaceInfo {
     pub tokens: HashMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorkspaceWorktreeInfo>,
+    /// Federation: the home-chosen routing alias of the peer that owns this
+    /// workspace. `None` for a local workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// Federation: saved-machine profile id of the owning peer, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_profile_id: Option<String>,
+    /// Federation: display label of the owning peer. Never used for routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
+    /// Federation: reachability of the owning peer as of the last poll. `None`
+    /// for a local workspace.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reachability: Option<crate::api::federation_store::Reachability>,
+    /// Federation: the workspace's last-known aggregate status, preserved when
+    /// the peer is not reachable and `agent_status` is surfaced as `unknown`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_known_status: Option<AgentStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

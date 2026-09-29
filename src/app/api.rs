@@ -1575,7 +1575,7 @@ impl App {
                 );
             }
             Method::SessionSnapshot(_) => return self.handle_session_snapshot(request.id),
-            Method::WorkspaceList(_) => return self.handle_workspace_list(request.id),
+            Method::WorkspaceList(params) => return self.handle_workspace_list(request.id, params),
             Method::WorkspaceGet(target) => return self.handle_workspace_get(request.id, target),
             Method::WorkspaceCreate(params) => {
                 return self.handle_workspace_create(request.id, params);

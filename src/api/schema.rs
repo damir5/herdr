@@ -139,7 +139,7 @@ pub enum Method {
     #[serde(rename = "workspace.create")]
     WorkspaceCreate(WorkspaceCreateParams),
     #[serde(rename = "workspace.list")]
-    WorkspaceList(EmptyParams),
+    WorkspaceList(WorkspaceListParams),
     #[serde(rename = "workspace.get")]
     WorkspaceGet(WorkspaceTarget),
     #[serde(rename = "workspace.focus")]

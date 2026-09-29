@@ -95,6 +95,10 @@ pub(crate) struct PeerRouteStamp {
 pub(crate) struct PeerRoute {
     target: ConnectionTarget,
     state: Arc<PeerRouteState>,
+    /// Live label/profile presentation shared with the poll thread, used to
+    /// stamp routed replies (`workspace.get`, `tab.*`) the same way polled
+    /// entries are. `None` for routes without a poll thread.
+    presentation: Option<Arc<RwLock<PeerPresentation>>>,
 }
 
 #[derive(Debug)]
@@ -125,6 +129,29 @@ impl PeerRoute {
                 identity_validated: AtomicBool::new(!requires_identity_validation),
                 identity_validation_required: requires_identity_validation,
             }),
+            presentation: None,
+        }
+    }
+
+    /// Attach the live presentation the poll thread also reads, so routed
+    /// replies carry the peer's current label and saved-profile id.
+    pub(crate) fn with_presentation(mut self, presentation: Arc<RwLock<PeerPresentation>>) -> Self {
+        self.presentation = Some(presentation);
+        self
+    }
+
+    /// The peer's current presentation, or the bare alias as its label when the
+    /// route has none attached.
+    pub(crate) fn presentation(&self, alias: &str) -> PeerPresentation {
+        match &self.presentation {
+            Some(presentation) => presentation
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+            None => PeerPresentation {
+                profile_id: None,
+                label: alias.to_owned(),
+            },
         }
     }
 
@@ -901,11 +928,13 @@ impl FederationPeerManager {
             }
             crate::api::client::FederationEndpoint::Target(target) => (target, None),
         };
+        let presentation = Arc::new(RwLock::new(PeerPresentation::from_peer(&peer)));
         let route = PeerRoute::new(
             route,
             Arc::clone(&self.generation_clock),
             peer.expected_node_id.is_some(),
-        );
+        )
+        .with_presentation(Arc::clone(&presentation));
         // The gateway itself is supervised by `sync_gram_relays`, independently
         // of this bridge, so a failed attempt is retried without a respawn.
         #[cfg(unix)]
@@ -947,7 +976,6 @@ impl FederationPeerManager {
         let expected_node_id = peer.expected_node_id.clone();
         let profile_id = peer.profile_id.clone();
         let remote_session = peer.remote_session.clone();
-        let presentation = Arc::new(RwLock::new(PeerPresentation::from_peer(&peer)));
         let cache = Arc::clone(&self.store);
         let running = Arc::clone(&self.running);
         let thread_stop = Arc::clone(&stop);

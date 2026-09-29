@@ -1196,6 +1196,11 @@ fn worktree_request_and_response_round_trip() {
                 active_tab_id: "w_1:1".into(),
                 agent_status: AgentStatus::Unknown,
                 tokens: HashMap::new(),
+                machine_id: None,
+                machine_profile_id: None,
+                machine_label: None,
+                reachability: None,
+                last_known_status: None,
                 worktree: Some(WorkspaceWorktreeInfo {
                     repo_key: "/repo/herdr/.git".into(),
                     repo_name: "herdr".into(),
@@ -1212,6 +1217,9 @@ fn worktree_request_and_response_round_trip() {
                 focused: true,
                 pane_count: 1,
                 agent_status: AgentStatus::Unknown,
+                machine_id: None,
+                machine_profile_id: None,
+                machine_label: None,
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-1".into(),
@@ -1289,6 +1297,11 @@ fn worktree_lifecycle_events_round_trip() {
         active_tab_id: "w_2:1".into(),
         agent_status: AgentStatus::Unknown,
         tokens: HashMap::new(),
+        machine_id: None,
+        machine_profile_id: None,
+        machine_label: None,
+        reachability: None,
+        last_known_status: None,
         worktree: Some(WorkspaceWorktreeInfo {
             repo_key: "/repo/herdr/.git".into(),
             repo_name: "herdr".into(),
@@ -1647,6 +1660,9 @@ fn create_response_round_trips_with_root_pane() {
                 focused: false,
                 pane_count: 1,
                 agent_status: AgentStatus::Unknown,
+                machine_id: None,
+                machine_profile_id: None,
+                machine_label: None,
             },
             root_pane: PaneInfo {
                 pane_id: "w_1-3".into(),

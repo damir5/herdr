@@ -2287,7 +2287,7 @@ mod tests {
         let read_only = crate::api::schema::Request {
             id: "req_1".into(),
             method: crate::api::schema::Method::WorkspaceList(
-                crate::api::schema::EmptyParams::default(),
+                crate::api::schema::WorkspaceListParams::default(),
             ),
         };
         let mutating = crate::api::schema::Request {

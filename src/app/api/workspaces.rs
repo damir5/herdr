@@ -2,8 +2,8 @@ use std::path::PathBuf;
 
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, ResponseResult, WorkspaceCloseParams,
-    WorkspaceCreateParams, WorkspaceMoveBlockParams, WorkspaceMoveParams, WorkspaceRenameParams,
-    WorkspaceReportMetadataParams, WorkspaceTarget,
+    WorkspaceCreateParams, WorkspaceListParams, WorkspaceMoveBlockParams, WorkspaceMoveParams,
+    WorkspaceRenameParams, WorkspaceReportMetadataParams, WorkspaceTarget,
 };
 use crate::app::App;
 
@@ -11,13 +11,24 @@ use super::super::api_helpers::{normalize_metadata_source, normalize_metadata_tt
 use super::responses::{encode_error, encode_success};
 
 impl App {
-    pub(super) fn handle_workspace_list(&mut self, id: String) -> String {
-        encode_success(
-            id,
-            ResponseResult::WorkspaceList {
-                workspaces: self.workspace_list_info(),
-            },
-        )
+    pub(super) fn handle_workspace_list(
+        &mut self,
+        id: String,
+        params: WorkspaceListParams,
+    ) -> String {
+        // Local workspaces first, in sidebar order. Ordinary callers also get
+        // the coordinator's cached federated workspaces (alias-qualified, each
+        // peer in its own order); federation pollers ask for local-only so a
+        // peer that is itself a coordinator never re-exports its peers.
+        let mut workspaces = self.workspace_list_info();
+        if !params.local_only {
+            let store = self
+                .federation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            workspaces.extend(store.merged_workspaces());
+        }
+        encode_success(id, ResponseResult::WorkspaceList { workspaces })
     }
 
     pub(super) fn handle_workspace_get(&mut self, id: String, target: WorkspaceTarget) -> String {
@@ -985,5 +996,94 @@ mod tests {
         };
         assert_eq!(workspaces[0].workspace_id, moved_id);
         assert!(event_hub.events_after(0).is_empty());
+    }
+
+    fn app_with_federated_workspaces() -> App {
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.workspaces = vec![Workspace::test_new("one"), Workspace::test_new("two")];
+        let remote = |workspace_id: &str, number: usize, label: &str| {
+            serde_json::from_value::<crate::api::schema::WorkspaceInfo>(serde_json::json!({
+                "workspace_id": workspace_id,
+                "number": number,
+                "label": label,
+                "focused": false,
+                "pane_count": 1,
+                "tab_count": 1,
+                "active_tab_id": format!("{workspace_id}:t1"),
+                "agent_status": "idle",
+                "machine_id": "peer",
+                "machine_label": "Peer Box",
+            }))
+            .expect("valid remote workspace")
+        };
+        let mut store = app.federation.lock().unwrap();
+        store.set_peer(
+            "peer",
+            crate::api::federation_store::PeerCacheEntry::reachable(
+                Vec::new(),
+                std::time::Instant::now(),
+            ),
+        );
+        store.set_peer_workspaces(
+            "peer",
+            vec![remote("peer/w9", 1, "api"), remote("peer/w3", 2, "docs")],
+        );
+        drop(store);
+        app
+    }
+
+    fn listed(response: &str) -> Vec<crate::api::schema::WorkspaceInfo> {
+        let success: SuccessResponse = serde_json::from_str(response).unwrap();
+        let ResponseResult::WorkspaceList { workspaces } = success.result else {
+            panic!("expected workspace list");
+        };
+        workspaces
+    }
+
+    #[test]
+    fn workspace_list_appends_federated_workspaces_unless_local_only() {
+        let mut app = app_with_federated_workspaces();
+        let local_ids = [app.public_workspace_id(0), app.public_workspace_id(1)];
+
+        let aggregate =
+            listed(&app.handle_workspace_list("all".into(), WorkspaceListParams::default()));
+        let summary: Vec<_> = aggregate
+            .iter()
+            .map(|ws| (ws.workspace_id.clone(), ws.number, ws.machine_id.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (local_ids[0].clone(), 1, None),
+                (local_ids[1].clone(), 2, None),
+                ("peer/w9".to_string(), 1, Some("peer".to_string())),
+                ("peer/w3".to_string(), 2, Some("peer".to_string())),
+            ],
+            "local sidebar first, then each peer in its own order and numbering"
+        );
+        assert_eq!(aggregate[2].label, "api");
+        assert_eq!(
+            aggregate[2].reachability,
+            Some(crate::api::federation_store::Reachability::Reachable)
+        );
+
+        let local = listed(
+            &app.handle_workspace_list("local".into(), WorkspaceListParams { local_only: true }),
+        );
+        assert_eq!(
+            local
+                .iter()
+                .map(|ws| ws.workspace_id.clone())
+                .collect::<Vec<_>>(),
+            local_ids,
+            "local_only must never re-export cached peer workspaces"
+        );
     }
 }

@@ -45,4 +45,14 @@ pub struct TabInfo {
     pub focused: bool,
     pub pane_count: usize,
     pub agent_status: AgentStatus,
+    /// Federation: the home-chosen routing alias of the peer that owns this
+    /// tab. `None` for a local tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    /// Federation: saved-machine profile id of the owning peer, when it has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_profile_id: Option<String>,
+    /// Federation: display label of the owning peer. Never used for routing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
 }

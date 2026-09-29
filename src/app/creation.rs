@@ -365,6 +365,9 @@ impl App {
             focused: self.state.active == Some(ws_idx) && ws.active_tab == tab_idx,
             pane_count: tab.panes.len(),
             agent_status: pane_agent_status(agg_state, seen),
+            machine_id: None,
+            machine_profile_id: None,
+            machine_label: None,
         })
     }
 
@@ -618,6 +621,11 @@ impl App {
                     checkout_path: space.checkout_path.display().to_string(),
                     is_linked_worktree: space.is_linked_worktree,
                 }),
+            machine_id: None,
+            machine_profile_id: None,
+            machine_label: None,
+            reachability: None,
+            last_known_status: None,
         }
     }
 }

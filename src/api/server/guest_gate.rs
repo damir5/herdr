@@ -1,7 +1,8 @@
 //! Guest principal gate: an explicit allowlist bound to one agent grant.
 //! Everything else answers `guest_forbidden`. Prompts are labeled, the
-//! terminal is view-only, and streams close with `guest_paused` when the
-//! agent leaves the foreground or `guest_revoked` on revoke.
+//! terminal is view-only (a guest may watch it and read its scrollback), and
+//! streams close with `guest_paused` when the agent leaves the foreground or
+//! `guest_revoked` on revoke.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -15,8 +16,8 @@ use super::{
 };
 use crate::api::schema::{
     AgentInfo, ErrorResponse, GramPostParams, GramUploadChunkParams, GuestAgentProbeParams,
-    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, Request, ResponseResult,
-    SuccessResponse,
+    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, PaneReadParams, ReadIntent,
+    ReadSource, Request, ResponseResult, SuccessResponse,
 };
 use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
@@ -26,6 +27,28 @@ const PROMPT_MAX_BYTES: usize = 32 * 1024;
 /// How often a guest stream re-checks revocation and the live-agent check.
 pub(super) const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Most scrollback lines one guest `agent.read` returns.
+const READ_MAX_LINES: u32 = 1000;
+/// A guest's reads are audited at most once per interval: the app reads the
+/// scrollback again on every stream reseed and reconnect.
+const READ_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+
+/// When each guest's last `read` was audited.
+static READ_AUDITED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+
+/// Whether this guest's read should be audited now; records it if so.
+fn read_audit_due(guest_id: &str) -> bool {
+    let now = Instant::now();
+    let mut audited = READ_AUDITED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    audited.retain(|(_, at)| now.duration_since(*at) < READ_AUDIT_INTERVAL);
+    if audited.iter().any(|(id, _)| id == guest_id) {
+        return false;
+    }
+    audited.push((guest_id.to_string(), now));
+    true
+}
 
 #[derive(Clone)]
 struct GuestContext {
@@ -347,6 +370,24 @@ fn project_ok(result: ResponseResult) -> Option<serde_json::Value> {
     matches!(result, ResponseResult::Ok {}).then(|| serde_json::json!({"type": "ok"}))
 }
 
+/// The rendered scrollback and the fields the app decodes; the workspace,
+/// tab and revision stay with the owner.
+fn project_read(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::PaneRead { read } = result else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "type": "pane_read",
+        "read": {
+            "pane_id": read.pane_id,
+            "source": read.source,
+            "format": read.format,
+            "text": read.text,
+            "truncated": read.truncated,
+        },
+    }))
+}
+
 fn project_gram_sent(result: ResponseResult) -> Option<serde_json::Value> {
     let ResponseResult::GramSent { message, .. } = result else {
         return None;
@@ -424,6 +465,38 @@ pub(super) fn serve_request(
             };
             let result = serde_json::json!({"type": "agent_info", "agent": agent});
             write_text_line_allow_disconnect(&mut stream, &success_value(&id, result))
+        }
+        Method::AgentRead(params) => {
+            let state = grant_state(guest, api_tx);
+            if !names_grant(&params.target, guest, state.pane_id())
+                || !matches!(params.source, ReadSource::Recent | ReadSource::Visible)
+            {
+                return forbidden(&mut stream);
+            }
+            let GrantState::Live(agent) = state else {
+                return paused(&mut stream);
+            };
+            if read_audit_due(&guest.guest_id) {
+                guest.audit(GuestAuditEvent::Read, Some(method), None, None);
+            }
+            // A passive pane read of the grant: the snapshot only, never the
+            // idle alternate-screen capture that scrolls the agent's TUI.
+            let request = Request {
+                id: id.clone(),
+                method: Method::PaneRead(PaneReadParams {
+                    pane_id: agent.pane_id,
+                    source: params.source,
+                    lines: params.lines.map(|lines| lines.min(READ_MAX_LINES)),
+                    format: params.format,
+                    strip_ansi: params.strip_ansi,
+                    intent: ReadIntent::Passive,
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_read),
+            )
         }
         Method::PaneStream(mut params) => {
             let state = grant_state(guest, api_tx);
@@ -670,7 +743,14 @@ mod tests {
                     ))
                     .unwrap(),
                 });
-                let (runtime, rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+                let (runtime, rx) =
+                    crate::terminal::TerminalRuntime::test_with_channel_and_scrollback_bytes(
+                        80,
+                        24,
+                        1024 * 1024,
+                        &[],
+                        4,
+                    );
                 app.state.insert_test_runtime(pane, runtime);
                 ptys.push(rx);
                 ids.push(app.public_pane_id(ws_idx, pane).unwrap());
@@ -831,6 +911,22 @@ mod tests {
                     session_ref: crate::agent_resume::AgentSessionRef::id(session).unwrap(),
                 });
             });
+        }
+
+        /// Print `count` numbered lines (`<prefix>-0` ...) into agent `index`'s
+        /// terminal.
+        fn print_lines(&self, index: usize, prefix: &str, count: usize) {
+            let text: String = (0..count).map(|n| format!("{prefix}-{n}\r\n")).collect();
+            let (done_tx, done_rx) = std_mpsc::channel();
+            self.control
+                .send(Box::new(move |app: &mut App| {
+                    let workspace = &app.state.workspaces[index];
+                    let pane = workspace.tabs[0].root_pane;
+                    workspace.test_runtimes[&pane].test_process_pty_bytes(text.as_bytes());
+                    let _ = done_tx.send(());
+                }))
+                .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
 
         fn agent_exits(&self) {
@@ -1133,6 +1229,138 @@ mod tests {
             assert_eq!(agent["name"], "llm-opt");
             assert_eq!(agent["pane_id"], harness.pane_ids[0].as_str());
         }
+    }
+
+    fn read(target: &str, lines: u32) -> Value {
+        json!({"id": "r", "method": "agent.read", "params": {"target": target, "source": "recent", "format": "ansi", "lines": lines}})
+    }
+
+    #[test]
+    fn a_guest_reads_the_granted_scrollback_with_only_the_rendered_fields() {
+        let harness = start("read");
+        let guest = harness.admit();
+        harness.print_lines(0, "history", 60);
+        harness.print_lines(1, "owner-secret", 5);
+        for target in [
+            "llm-opt",
+            guest.grant.terminal_id.as_str(),
+            harness.pane_ids[0].as_str(),
+        ] {
+            let lines = harness.call(&guest, read(target, 1000));
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(keys(&lines[0]), set(&["id", "result"]), "{lines:?}");
+            let result = &lines[0]["result"];
+            assert_eq!(keys(result), set(&["type", "read"]));
+            assert_eq!(result["type"], "pane_read");
+            let read = &result["read"];
+            assert_eq!(
+                keys(read),
+                set(&["pane_id", "source", "format", "text", "truncated"])
+            );
+            assert_eq!(read["pane_id"], harness.pane_ids[0].as_str());
+            assert_eq!(read["source"], "recent");
+            assert_eq!(read["format"], "ansi");
+            let text = read["text"].as_str().unwrap();
+            // Scrolled past the 24-row screen: the oldest line is history.
+            assert!(text.contains("history-0\r\n"), "{text:?}");
+            assert!(text.contains("history-59"), "{text:?}");
+            assert!(!text.contains("owner-secret"), "{text:?}");
+        }
+        let visible = harness.call(
+            &guest,
+            json!({"id": "v", "method": "agent.read", "params": {"target": "llm-opt", "source": "visible", "format": "text"}}),
+        );
+        let text = visible[0]["result"]["read"]["text"].as_str().unwrap();
+        assert!(text.contains("history-59"), "{visible:?}");
+        assert!(
+            !text.lines().any(|line| line.trim_end() == "history-0"),
+            "{visible:?}"
+        );
+        // Every reseed reads again; the audit records one `read` a minute.
+        let reads: Vec<_> = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 50)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| entry.event == GuestAuditEvent::Read)
+            .collect();
+        assert_eq!(reads.len(), 1, "{reads:?}");
+        assert_eq!(reads[0].method.as_deref(), Some("agent.read"));
+        assert_eq!(reads[0].text, None);
+    }
+
+    #[test]
+    fn agent_read_is_bound_to_the_grant() {
+        let harness = start("read-forged");
+        let guest = harness.admit();
+        harness.print_lines(1, "owner-secret", 5);
+        assert_eq!(
+            code(&harness.call(&guest, read("llm-opt", 80))),
+            "<success>"
+        );
+        let other = harness.pane_ids[1].clone();
+        for target in [
+            other.clone(),
+            "other-agent".to_string(),
+            format!("studio/{}", harness.pane_ids[0]),
+            format!("studio/{}", guest.grant.terminal_id),
+            "studio/llm-opt".to_string(),
+            "w99:p99".to_string(),
+        ] {
+            let lines = harness.call(&guest, read(&target, 80));
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+        // Only the rendered sources a terminal view needs.
+        for source in ["recent_unwrapped", "detection"] {
+            let lines = harness.call(
+                &guest,
+                json!({"id": "r", "method": "agent.read", "params": {"target": "llm-opt", "source": source}}),
+            );
+            assert_eq!(code(&lines), "guest_forbidden", "{source} -> {lines:?}");
+        }
+    }
+
+    #[test]
+    fn agent_read_returns_at_most_a_thousand_lines() {
+        let harness = start("read-clamp");
+        let guest = harness.admit();
+        harness.print_lines(0, "row", 1500);
+        let lines = harness.call(
+            &guest,
+            json!({"id": "r", "method": "agent.read", "params": {"target": "llm-opt", "source": "recent", "format": "text", "lines": 5000}}),
+        );
+        let text = lines[0]["result"]["read"]["text"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a read: {lines:?}"));
+        assert!(
+            text.lines().count() <= 1000,
+            "{} lines",
+            text.lines().count()
+        );
+        assert!(text.contains("row-1499"), "the newest line is kept");
+        let rows: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert!(!rows.contains(&"row-400"), "older lines are dropped");
+        assert!(rows.contains(&"row-600"), "a full 1000 lines: {}", rows[0]);
+    }
+
+    #[test]
+    fn agent_read_needs_a_running_agent_and_an_active_grant() {
+        let harness = start("read-state");
+        let guest = harness.admit();
+        assert_eq!(
+            code(&harness.call(&guest, read("llm-opt", 80))),
+            "<success>"
+        );
+        harness.agent_exits();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            code(&harness.call(&guest, read("llm-opt", 80))),
+            "guest_paused"
+        );
+        crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+            .unwrap();
+        assert_eq!(
+            code(&harness.call(&guest, read("llm-opt", 80))),
+            "guest_revoked"
+        );
     }
 
     /// Open the granted stream and read past the ack and the reset seed, so

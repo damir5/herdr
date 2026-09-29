@@ -13058,6 +13058,11 @@
               "const": "resumed",
               "description": "The granted agent came back under a new harness session.",
               "type": "string"
+            },
+            {
+              "const": "read",
+              "description": "The guest read the granted agent's scrollback (at most once a minute).",
+              "type": "string"
             }
           ]
         },

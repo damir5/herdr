@@ -147,6 +147,8 @@ pub enum GuestAuditEvent {
     Revoked,
     /// The granted agent came back under a new harness session.
     Resumed,
+    /// The guest read the granted agent's scrollback (at most once a minute).
+    Read,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

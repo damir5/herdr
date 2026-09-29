@@ -466,12 +466,23 @@ fn api_schema_json_prints_bundled_schema() {
         .get("protocol")
         .and_then(serde_json::Value::as_u64)
         .is_some_and(|protocol| protocol > 0));
+    let mut names: Vec<&str> = schema
+        .get("schemas")
+        .and_then(serde_json::Value::as_object)
+        .map(|schemas| schemas.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    names.sort_unstable();
     assert_eq!(
-        schema
-            .get("schemas")
-            .and_then(serde_json::Value::as_object)
-            .map(serde_json::Map::len),
-        Some(5)
+        names,
+        [
+            "error_response",
+            "event",
+            "request",
+            "subscription_control",
+            "subscription_event",
+            "subscription_stream_event",
+            "success_response",
+        ]
     );
 }
 

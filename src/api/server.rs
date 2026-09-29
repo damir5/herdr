@@ -8715,6 +8715,81 @@ mod federation_tests {
         peer.shutdown();
     }
 
+    /// A status that arrives after a newer completed turn still reports the
+    /// status change, but neither the published event nor the relay baseline
+    /// goes back to its older turn.
+    #[test]
+    fn relay_never_publishes_or_records_a_rewound_turn() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let relay = start_relay(peer.addr);
+        assert!(wait_until(Duration::from_secs(5), || peer.subscribes()
+            == 1
+            && relay_baseline_has(&relay.store, "box/w1:p1")));
+
+        let pane: crate::api::schema::PaneInfo = serde_json::from_value(serde_json::json!({
+            "pane_id": "w1:p1", "terminal_id": "t-w1:p1", "workspace_id": "w1", "tab_id": "w1:t1",
+            "focused": false, "agent_status": "idle", "revision": 2,
+        }))
+        .unwrap();
+        peer.event_hub.push(EventEnvelope {
+            event: EventKind::PaneTurnCompleted,
+            data: EventData::PaneTurnCompleted {
+                pane,
+                turn: 5,
+                turn_epoch: 2,
+                outcome: crate::terminal::TurnOutcome::Completed,
+                message: None,
+                message_truncated: false,
+                agent_session_path: None,
+                completed_unix_ms: 1,
+            },
+        });
+        let mut late = peer_status("w1:p1", AgentStatus::Idle);
+        if let EventData::PaneAgentStatusChanged {
+            turn, turn_epoch, ..
+        } = &mut late.data
+        {
+            (*turn, *turn_epoch) = (Some(4), Some(2));
+        }
+        peer.event_hub.push(late);
+        assert!(wait_until(Duration::from_secs(5), || !hub_statuses(
+            &relay.hub
+        )
+        .is_empty()));
+
+        let published: Vec<_> = relay
+            .hub
+            .events_after(0)
+            .into_iter()
+            .filter_map(|(_, event)| match event.data {
+                EventData::PaneAgentStatusChanged {
+                    agent_status,
+                    turn,
+                    turn_epoch,
+                    ..
+                } => Some((agent_status, turn_epoch, turn)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            published,
+            [(AgentStatus::Idle, Some(2), Some(5))],
+            "the status change is published without rewinding the turn"
+        );
+        let baseline = relay.store.lock().unwrap().peer("box").unwrap().relayed["box/w1:p1"]
+            .event
+            .clone();
+        assert_eq!((baseline.turn_epoch, baseline.turn), (Some(2), Some(5)));
+
+        relay.stop();
+        peer.shutdown();
+    }
+
     /// A route generation change drops the stream and reconnects it, leaving
     /// exactly one live upstream stream; a peer restart with a new boot id is
     /// a full resync that publishes every pane even when its status is

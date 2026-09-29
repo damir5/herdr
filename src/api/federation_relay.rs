@@ -431,8 +431,16 @@ impl PeerRelay {
             }
             let now = Instant::now();
             let publish = match &envelope.data {
-                EventData::PaneAgentStatusChanged { .. } => status_event_from_hub(&envelope)
-                    .is_some_and(|status| store.relay_status(&self.alias, &status, now)),
+                EventData::PaneAgentStatusChanged { .. } => {
+                    // Publish what was recorded: its turn never runs behind
+                    // one already relayed for the pane.
+                    if let Some(mut status) = status_event_from_hub(&envelope) {
+                        if store.relay_status(&self.alias, &mut status, now) {
+                            self.event_hub.push_relayed(status_envelope(status));
+                        }
+                    }
+                    false
+                }
                 EventData::PaneTurnCompleted {
                     pane,
                     turn,

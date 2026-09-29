@@ -516,7 +516,7 @@ mod tests {
         app.federation
             .lock()
             .unwrap()
-            .relay_status(PEER, &event, Instant::now())
+            .relay_status(PEER, &mut event, Instant::now())
     }
 
     fn sync(app: &mut App, capture: &Capture) -> Vec<PushNotification> {

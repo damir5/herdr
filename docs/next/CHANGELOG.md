@@ -3,6 +3,7 @@
 ## Unreleased
 
 ### Added
+- A federation coordinator now lists its peers' workspaces: `workspace.list` returns each remote machine's workspaces after the local ones, with that machine's own number, label, and order, `<alias>/`-qualified ids, and the peer's reachability (last-known workspaces stay listed while a peer is offline). `workspace.get`, `tab.get`, and `tab.list` accept `<alias>/…` ids and are answered by the owning peer. The coordinator refreshes remote workspaces every 30 seconds rather than on every 5-second agent poll; `local_only: true` returns only local workspaces. (#243)
 - Share one running agent with someone outside your machines through the HerdrUp app, with no SSH and no open ports. `herdr guest invite` creates a one-time invite; the guest can prompt the agent (labeled `<name> (via HerdrUp): `), attach files, and watch its terminal, but not type into it. The server reaches guests through the HerdrUp guest relay over an end-to-end encrypted (Noise IK) connection that it keeps open only while guests or invites exist. Unix only.
 
 ## [0.9.1] - 2026-09-16

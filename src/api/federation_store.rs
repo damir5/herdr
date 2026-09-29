@@ -11,7 +11,8 @@
 //! ever spawned, so the store stays empty and the merge is a no-op — the local
 //! `agent.list` path is byte-identical to a build without federation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
@@ -168,10 +169,34 @@ impl PeerCacheEntry {
     }
 }
 
+/// Most relayed pane lifecycle events held for the app loop at once; older
+/// ones are dropped first.
+const MAX_PENDING_PANE_EVENTS: usize = 64;
+
+/// A remote pane lifecycle event the relay hands to the app loop, which tells
+/// an agent that died from one that finished (see [`FederationStore::relay_pane_event`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemotePaneEvent {
+    /// `pane.agent_detected` with `released: true`: the agent left the pane.
+    AgentReleased,
+    /// `pane.exited`: the pane's process exited.
+    Exited,
+}
+
 /// Cache of every configured federation peer's agents, keyed by peer alias.
 #[derive(Debug, Default)]
 pub struct FederationStore {
     peers: HashMap<String, PeerCacheEntry>,
+    /// Bumped by every write that can change a remote agent's status, label,
+    /// presence or reachability, so the app loop re-reads the store only after
+    /// one (see [`Self::revision`]).
+    revision: u64,
+    /// Wakes the app loop after such a write, so a remote transition reaches
+    /// push notifications without waiting for the loop's idle tick.
+    changed: Arc<tokio::sync::Notify>,
+    /// Relayed lifecycle events of remote panes (ids alias-qualified), oldest
+    /// first, until the app loop takes them.
+    pane_events: VecDeque<(String, RemotePaneEvent)>,
 }
 
 impl FederationStore {
@@ -215,6 +240,7 @@ impl FederationStore {
             relayed.at > poll_started || agents.iter().any(|agent| agent.pane_id == *pane_id)
         });
         self.peers.insert(alias, entry);
+        self.touch();
     }
 
     /// Record one status event the relay received from `alias` (ids already
@@ -239,6 +265,7 @@ impl FederationStore {
             return false;
         }
         entry.record_relayed(event.clone(), now);
+        self.touch();
         true
     }
 
@@ -285,6 +312,26 @@ impl FederationStore {
         }
     }
 
+    /// Queue a relayed pane lifecycle event (pane id qualified) for the app
+    /// loop: an exit is pushed as a died alert when the pane was an agent, and
+    /// holds back the finished alert of the release that precedes it. Unknown
+    /// aliases are ignored, like every other relay write.
+    pub fn relay_pane_event(&mut self, alias: &str, pane_id: &str, event: RemotePaneEvent) {
+        if !self.peers.contains_key(alias) {
+            return;
+        }
+        if self.pane_events.len() == MAX_PENDING_PANE_EVENTS {
+            self.pane_events.pop_front();
+        }
+        self.pane_events.push_back((pane_id.to_owned(), event));
+        self.touch();
+    }
+
+    /// Take every queued remote pane lifecycle event, oldest first.
+    pub fn take_pane_events(&mut self) -> Vec<(String, RemotePaneEvent)> {
+        self.pane_events.drain(..).collect()
+    }
+
     /// Compare a fresh `agent.list` from `alias` (as status events, ids
     /// qualified) with what the relay published, record it as the new
     /// baseline, and return the events to publish so each missed change is
@@ -317,6 +364,7 @@ impl FederationStore {
             entry.record_relayed(event, now);
         }
         entry.relayed.retain(|pane_id, _| present.contains(pane_id));
+        self.touch();
         missed
     }
 
@@ -356,6 +404,30 @@ impl FederationStore {
     /// [`Self::merged_agents`] instead.
     pub fn peer(&self, alias: &str) -> Option<&PeerCacheEntry> {
         self.peers.get(alias)
+    }
+
+    /// Every cached peer with its alias, for readers that need a peer's
+    /// reachability and workspaces next to its agents.
+    pub fn peers(&self) -> impl Iterator<Item = (&str, &PeerCacheEntry)> {
+        self.peers
+            .iter()
+            .map(|(alias, entry)| (alias.as_str(), entry))
+    }
+
+    /// Counter bumped by every write that can change a remote agent's status,
+    /// label, presence or reachability, and by every queued pane exit.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Notified after every write that bumps [`Self::revision`].
+    pub fn change_notify(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.changed)
+    }
+
+    fn touch(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.changed.notify_one();
     }
 
     /// Update mutable saved-profile presentation on cached agents without
@@ -398,6 +470,7 @@ impl FederationStore {
                 );
             }
         }
+        self.touch();
     }
 
     pub fn record_poll_error(&mut self, alias: &str, class: FederationPollErrorClass) {
@@ -411,7 +484,9 @@ impl FederationStore {
     /// manager's `reconcile` when a peer is dropped or re-pointed, so a removed
     /// peer's last-known agents never linger past the reload.
     pub fn remove_peer(&mut self, alias: &str) {
-        self.peers.remove(alias);
+        if self.peers.remove(alias).is_some() {
+            self.touch();
+        }
     }
 
     /// Whether any peer is cached. Empty means federation contributed nothing.

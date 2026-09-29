@@ -28,7 +28,9 @@ use tracing::{debug, info, warn};
 
 use crate::api::client::{ApiClient, FederatedStream, FEDERATION_STREAM_IDLE_TIMEOUT};
 use crate::api::federation_manager::{PeerPresentation, PeerRoute, PeerRouteStamp};
-use crate::api::federation_store::{agent_status_event, FederationStore, RelayResync};
+use crate::api::federation_store::{
+    agent_status_event, FederationStore, RelayResync, RemotePaneEvent,
+};
 use crate::api::schema::{
     EventData, EventEnvelope, EventKind, EventsSubscribeParams, Method,
     PaneAgentStatusChangedEvent, PaneInfo, PaneLayoutSnapshot, Request, ResponseResult,
@@ -421,6 +423,18 @@ impl PeerRelay {
                 }
                 EventData::PaneClosed { pane_id, .. } => {
                     store.relay_pane_closed(&self.alias, pane_id);
+                    true
+                }
+                EventData::PaneExited { pane_id, .. } => {
+                    store.relay_pane_event(&self.alias, pane_id, RemotePaneEvent::Exited);
+                    true
+                }
+                EventData::PaneAgentDetected {
+                    pane_id,
+                    released: true,
+                    ..
+                } => {
+                    store.relay_pane_event(&self.alias, pane_id, RemotePaneEvent::AgentReleased);
                     true
                 }
                 _ => true,

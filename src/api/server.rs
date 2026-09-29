@@ -8525,6 +8525,64 @@ mod federation_tests {
         peer.shutdown();
     }
 
+    /// The relay hands a remote agent's release and pane exit to the app loop
+    /// (qualified, in order), which tells an agent that died from one that
+    /// finished; a plain agent detection is not a release.
+    #[test]
+    fn relay_queues_remote_release_and_exit_for_push() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let relay = start_relay(peer.addr);
+        assert!(wait_until(Duration::from_secs(5), || relay_baseline_has(
+            &relay.store,
+            "box/w1:p1"
+        )));
+        let detected = |released| EventEnvelope {
+            event: EventKind::PaneAgentDetected,
+            data: EventData::PaneAgentDetected {
+                pane_id: "w1:p1".into(),
+                workspace_id: "w1".into(),
+                agent: Some("claude".into()),
+                released,
+                final_status: None,
+            },
+        };
+        peer.event_hub.push(detected(false));
+        peer.event_hub.push(detected(true));
+        peer.event_hub.push(EventEnvelope {
+            event: EventKind::PaneExited,
+            data: EventData::PaneExited {
+                pane_id: "w1:p1".into(),
+                workspace_id: "w1".into(),
+            },
+        });
+        assert!(wait_until(Duration::from_secs(5), || relay
+            .hub
+            .events_after(0)
+            .iter()
+            .any(|(_, event)| event.event == EventKind::PaneExited)));
+        assert_eq!(
+            relay.store.lock().unwrap().take_pane_events(),
+            [
+                (
+                    "box/w1:p1".to_owned(),
+                    crate::api::federation_store::RemotePaneEvent::AgentReleased
+                ),
+                (
+                    "box/w1:p1".to_owned(),
+                    crate::api::federation_store::RemotePaneEvent::Exited
+                ),
+            ]
+        );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
     /// A route generation change drops the stream and reconnects it, leaving
     /// exactly one live upstream stream; a peer restart with a new boot id is
     /// a full resync that publishes every pane even when its status is

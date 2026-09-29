@@ -951,13 +951,7 @@ impl App {
             workspace_id: String::new(),
             kind: crate::push::PushKind::Gram,
         };
-        let cfg = self.state.push_config.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("herdr-push-gram".to_string())
-            .spawn(move || crate::push::deliver(cfg, vec![notification]))
-        {
-            tracing::warn!(error = %err, "failed to spawn gram push sender thread; dropping message");
-        }
+        crate::push::dispatch(self.state.push_config.clone(), vec![notification]);
     }
 }
 

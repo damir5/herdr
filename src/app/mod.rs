@@ -120,6 +120,9 @@ pub struct App {
     /// no-op.
     pub(crate) federation_manager:
         Option<Arc<crate::api::federation_manager::FederationPeerManager>>,
+    /// What the app loop last saw of remote agents, so each remote transition
+    /// is pushed once (see `sync_remote_agent_notifications`).
+    pub(crate) remote_push: api::remote_push::RemotePushTracker,
     client_endpoint_statuses:
         HashMap<u64, HashMap<String, crate::api::schema::MachineEndpointStatus>>,
     pub(crate) no_session: bool,
@@ -627,6 +630,7 @@ impl App {
             // Shared in on production startup via `set_federation_manager`; the
             // no-federation path and every test keep this `None`.
             federation_manager: None,
+            remote_push: api::remote_push::RemotePushTracker::default(),
             client_endpoint_statuses: HashMap::new(),
 
             no_session: false,

@@ -408,6 +408,14 @@ impl HeadlessServer {
         let mut needs_render = true;
         let mut needs_full_render = true;
         let mut needs_graphics_render = false;
+        // Remote agent changes wake the loop so their push notifications go
+        // out at once (see `sync_remote_agent_notifications`).
+        let federation_changed = self
+            .app
+            .federation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .change_notify();
 
         loop {
             crate::render_prof::event("loop.tick");
@@ -645,6 +653,7 @@ impl HeadlessServer {
                         None => LoopEvent::Timer,
                     },
                     _ = sleep_until_or_pending(next_deadline) => LoopEvent::Timer,
+                    _ = federation_changed.notified() => LoopEvent::Timer,
                     _ = self.app.render_notify.notified() => LoopEvent::RenderRequested,
                 }
             };
@@ -3532,6 +3541,10 @@ impl HeadlessServer {
 
         // No resize polling needed — server has no terminal.
         // Client resize messages drive size changes instead.
+
+        // Remote agent transitions push without a render; a no-op unless the
+        // federation store changed or a held finish is due.
+        self.app.sync_remote_agent_notifications(now);
 
         if self
             .app

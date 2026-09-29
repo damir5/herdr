@@ -182,6 +182,100 @@ fn unix_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Hand a batch of alerts to a detached sender thread, so the app loop never
+/// waits on curl or disk. Every alert (agent transitions, remote or local, and
+/// gram messages) leaves through here; [`deliver`] then routes each device to
+/// direct APNs or the relay with the same payload.
+pub(crate) fn dispatch(cfg: PushConfig, notifications: Vec<PushNotification>) {
+    if notifications.is_empty() {
+        return;
+    }
+    #[cfg(test)]
+    if test_sink::capture(|sink| sink.alerts.extend(notifications.iter().cloned())) {
+        return;
+    }
+    // A named Builder means a thread-creation failure (EAGAIN) is handled
+    // instead of panicking the app-loop thread.
+    if let Err(err) = std::thread::Builder::new()
+        .name("herdr-push".to_string())
+        .spawn(move || deliver(cfg, notifications))
+    {
+        tracing::warn!(error = %err, "failed to spawn push sender thread; dropping batch");
+    }
+}
+
+/// Hand one Live Activity content-state to a detached sender thread; see
+/// [`dispatch`].
+pub(crate) fn dispatch_live_activity(
+    cfg: PushConfig,
+    content_state: serde_json::Value,
+    timestamp: u64,
+) {
+    #[cfg(test)]
+    if test_sink::capture(|sink| sink.live_activities.push(content_state.clone())) {
+        return;
+    }
+    if let Err(err) = std::thread::Builder::new()
+        .name("herdr-liveactivity".to_string())
+        .spawn(move || deliver_live_activity(cfg, content_state, timestamp))
+    {
+        tracing::warn!(error = %err, "failed to spawn live-activity sender thread; dropping update");
+    }
+}
+
+/// Test-only stand-in for the sender threads: while a [`test_sink::Capture`]
+/// is alive on the current thread, [`dispatch`] and [`dispatch_live_activity`]
+/// record what they would send instead of spawning curl.
+#[cfg(test)]
+pub(crate) mod test_sink {
+    use std::cell::RefCell;
+
+    use super::PushNotification;
+
+    #[derive(Default)]
+    pub(crate) struct Sent {
+        pub alerts: Vec<PushNotification>,
+        pub live_activities: Vec<serde_json::Value>,
+    }
+
+    thread_local! {
+        static SINK: RefCell<Option<Sent>> = const { RefCell::new(None) };
+    }
+
+    /// Records into the installed sink; `false` when none is installed.
+    pub(super) fn capture(record: impl FnOnce(&mut Sent)) -> bool {
+        SINK.with(|sink| match sink.borrow_mut().as_mut() {
+            Some(sent) => {
+                record(sent);
+                true
+            }
+            None => false,
+        })
+    }
+
+    /// Captures this thread's dispatches until dropped.
+    pub(crate) struct Capture(());
+
+    impl Capture {
+        pub(crate) fn install() -> Self {
+            SINK.with(|sink| *sink.borrow_mut() = Some(Sent::default()));
+            Self(())
+        }
+
+        /// Everything dispatched since the last call.
+        pub(crate) fn take(&self) -> Sent {
+            SINK.with(|sink| sink.borrow_mut().as_mut().map(std::mem::take))
+                .unwrap_or_default()
+        }
+    }
+
+    impl Drop for Capture {
+        fn drop(&mut self) {
+            SINK.with(|sink| *sink.borrow_mut() = None);
+        }
+    }
+}
+
 /// Deliver a batch of agent transitions to every registered device that opted
 /// into the matching notification kind, each over the path [`route`] picks
 /// (direct APNs or the relay). Intended to be called on a detached thread: it
@@ -195,23 +289,55 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
         return;
     }
     let devices = crate::persist::devices::load();
+    let plan = plan_alerts(&cfg, &notifications, &devices);
+    if !plan.direct.is_empty() {
+        deliver_direct(&cfg, &plan.payloads, &plan.direct);
+    }
+    if !plan.relayed.is_empty() {
+        deliver_relay(&cfg.relay_url, &plan.payloads, &plan.relayed);
+    }
+}
+
+/// Every alert one batch sends: each notification's payload once, and each
+/// `(payload index, device)` send on each route, notification by notification.
+/// Direct APNs and the relay share this one payload and device filter (kind
+/// preference and muted panes), so both modes deliver the same alerts.
+pub(crate) struct AlertPlan<'a> {
+    pub payloads: Vec<String>,
+    pub direct: Vec<(usize, &'a RegisteredDevice)>,
+    pub relayed: Vec<(usize, &'a RegisteredDevice)>,
+}
+
+pub(crate) fn plan_alerts<'a>(
+    cfg: &PushConfig,
+    notifications: &[PushNotification],
+    devices: &'a [RegisteredDevice],
+) -> AlertPlan<'a> {
     let (direct, relayed) =
-        split_by_route(&cfg, &devices, |device| device.relay_capability.as_deref());
-    if !direct.is_empty() {
-        deliver_direct(&cfg, &notifications, &direct);
+        split_by_route(cfg, devices, |device| device.relay_capability.as_deref());
+    let mut plan = AlertPlan {
+        payloads: Vec::with_capacity(notifications.len()),
+        direct: Vec::new(),
+        relayed: Vec::new(),
+    };
+    for (index, notification) in notifications.iter().enumerate() {
+        plan.payloads.push(apns::payload_body(notification));
+        let accepting = |devices: &[&'a RegisteredDevice]| {
+            devices
+                .iter()
+                .filter(|device| device_accepts(device, notification))
+                .map(|device| (index, *device))
+                .collect::<Vec<_>>()
+        };
+        plan.direct.extend(accepting(&direct));
+        plan.relayed.extend(accepting(&relayed));
     }
-    if !relayed.is_empty() {
-        deliver_relay(&cfg.relay_url, &notifications, &relayed);
-    }
+    plan
 }
 
 /// Direct APNs delivery: mint/reuse one JWT from the host's `.p8` key and send
 /// each alert straight to Apple.
-fn deliver_direct(
-    cfg: &PushConfig,
-    notifications: &[PushNotification],
-    devices: &[&RegisteredDevice],
-) {
+fn deliver_direct(cfg: &PushConfig, payloads: &[String], sends: &[(usize, &RegisteredDevice)]) {
     // Direct routing implies `enabled`, which guarantees these are all `Some`.
     let (Some(key_path), Some(key_id), Some(team_id), Some(topic)) = (
         cfg.key_path.as_deref(),
@@ -250,86 +376,68 @@ fn deliver_direct(
     let mut reminted = false;
 
     let mut tokens_to_prune: HashSet<String> = HashSet::new();
-    'batch: for notification in notifications {
-        let payload = apns::payload_body(notification);
-        for device in devices {
-            // A token already flagged for pruning gets no further sends.
-            if tokens_to_prune.contains(&device.device_token) {
-                continue;
-            }
-            if !device_accepts(device, notification) {
-                continue;
-            }
-            let mut outcome =
-                apns::deliver_one(&device.device_token, &jwt, topic, cfg.sandbox, &payload);
-            if outcome == DeliveryOutcome::AuthExpired && !reminted {
-                reminted = true;
-                jwt::clear_cache();
-                match jwt::auth_token(&pem, key_id, team_id, unix_secs_now()) {
-                    Ok(fresh) => {
-                        jwt = fresh;
-                        outcome = apns::deliver_one(
-                            &device.device_token,
-                            &jwt,
-                            topic,
-                            cfg.sandbox,
-                            &payload,
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(error = %err, "failed to re-mint APNs auth token after 403; aborting push batch");
-                        break 'batch;
-                    }
+    for (index, device) in sends {
+        let payload = &payloads[*index];
+        // A token already flagged for pruning gets no further sends.
+        if tokens_to_prune.contains(&device.device_token) {
+            continue;
+        }
+        let mut outcome =
+            apns::deliver_one(&device.device_token, &jwt, topic, cfg.sandbox, payload);
+        if outcome == DeliveryOutcome::AuthExpired && !reminted {
+            reminted = true;
+            jwt::clear_cache();
+            match jwt::auth_token(&pem, key_id, team_id, unix_secs_now()) {
+                Ok(fresh) => {
+                    jwt = fresh;
+                    outcome =
+                        apns::deliver_one(&device.device_token, &jwt, topic, cfg.sandbox, payload);
                 }
-            }
-            match outcome {
-                DeliveryOutcome::Delivered => {}
-                DeliveryOutcome::PruneToken => {
-                    tokens_to_prune.insert(device.device_token.clone());
-                }
-                DeliveryOutcome::AuthExpired => {
-                    // Still 403 after re-mint (or a repeat): credentials are
-                    // wrong, not transient. Stop the batch (deliver_one already
-                    // logged the status and reason).
-                    tracing::warn!(
-                        "apns auth token rejected (403) after re-mint; aborting push batch"
-                    );
-                    break 'batch;
-                }
-                DeliveryOutcome::Failed => {
-                    // deliver_one already logged the status and APNs reason.
+                Err(err) => {
+                    tracing::warn!(error = %err, "failed to re-mint APNs auth token after 403; aborting push batch");
+                    break;
                 }
             }
         }
+        match outcome {
+            DeliveryOutcome::Delivered => {}
+            DeliveryOutcome::PruneToken => {
+                tokens_to_prune.insert(device.device_token.clone());
+            }
+            DeliveryOutcome::AuthExpired => {
+                // Still 403 after re-mint (or a repeat): credentials are
+                // wrong, not transient. Stop the batch (deliver_one already
+                // logged the status and reason).
+                tracing::warn!("apns auth token rejected (403) after re-mint; aborting push batch");
+                break;
+            }
+            DeliveryOutcome::Failed => {
+                // deliver_one already logged the status and APNs reason.
+            }
+        }
     }
-
     prune_device_tokens(tokens_to_prune);
 }
 
 /// Relay delivery of alerts to capability-bearing devices. The payload is the
 /// same JSON the direct path sends.
-fn deliver_relay(
-    relay_url: &str,
-    notifications: &[PushNotification],
-    devices: &[&RegisteredDevice],
-) {
+fn deliver_relay(relay_url: &str, payloads: &[String], sends: &[(usize, &RegisteredDevice)]) {
     let mut tokens_to_prune: HashSet<String> = HashSet::new();
-    for notification in notifications {
-        let payload = apns::payload_body(notification);
-        for device in devices {
-            if tokens_to_prune.contains(&device.device_token)
-                || !device_accepts(device, notification)
-            {
-                continue;
-            }
-            let Some(capability) = device.relay_capability.as_deref() else {
-                continue;
-            };
-            if relay::send(relay_url, capability, RelayPushType::Alert, &payload)
-                == RelayOutcome::PruneToken
-            {
-                tokens_to_prune.insert(device.device_token.clone());
-            }
+    for (index, device) in sends {
+        if tokens_to_prune.contains(&device.device_token) {
+            continue;
+        }
+        let Some(capability) = device.relay_capability.as_deref() else {
+            continue;
+        };
+        if relay::send(
+            relay_url,
+            capability,
+            RelayPushType::Alert,
+            &payloads[*index],
+        ) == RelayOutcome::PruneToken
+        {
+            tokens_to_prune.insert(device.device_token.clone());
         }
     }
     prune_device_tokens(tokens_to_prune);

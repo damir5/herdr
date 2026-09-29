@@ -11,6 +11,7 @@ mod machines;
 mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
+pub(super) mod remote_push;
 pub(super) mod responses;
 mod session;
 mod session_transfer;
@@ -1067,15 +1068,7 @@ impl App {
             let Some(public_pane_id) = self.public_pane_id(update.ws_idx, update.pane_id) else {
                 continue;
             };
-            let event_text = match push_kind {
-                crate::push::PushKind::NeedsInput => "needs attention",
-                crate::push::PushKind::Finished => "finished",
-                crate::push::PushKind::Died => "exited",
-                // Gram alerts are built in `emit_apns_gram_message`, never from a
-                // pane-state update, so this arm is unreachable here; it only
-                // keeps the match exhaustive.
-                crate::push::PushKind::Gram => "sent a message",
-            };
+            let event_text = push_event_text(push_kind);
             let workspace_label =
                 ws.display_name_from(&self.state.terminals, &self.terminal_runtimes);
             // Bound the alert text so the JSON payload stays well under Apple's 4096-byte
@@ -1106,26 +1099,13 @@ impl App {
             });
         }
 
-        if notifications.is_empty() {
-            return;
-        }
-
-        // Detached + best-effort: never block the app loop on curl or disk. A
-        // named Builder means a thread-creation failure (EAGAIN) is handled
-        // instead of panicking the app-loop thread. Bounding fan-out with a
-        // single worker queue is a follow-up.
-        let cfg = self.state.push_config.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("herdr-push".to_string())
-            .spawn(move || crate::push::deliver(cfg, notifications))
-        {
-            tracing::warn!(error = %err, "failed to spawn push sender thread; dropping batch");
-        }
+        crate::push::dispatch(self.state.push_config.clone(), notifications);
     }
 
     /// Push the session's aggregate agent status to every registered Live Activity, so the
     /// lock-screen / Dynamic Island widget refreshes while the app is closed. Fired from the
-    /// same sites as `emit_apns_agent_notifications` (i.e. whenever agent status changes).
+    /// same sites as `emit_apns_agent_notifications` (i.e. whenever agent status changes)
+    /// and after remote federation agents change (`sync_remote_agent_notifications`).
     /// Best-effort + detached; a no-op when push is off or no Live Activity is registered.
     fn emit_live_activity_updates(&self) {
         use std::sync::atomic::Ordering;
@@ -1137,7 +1117,9 @@ impl App {
         // The aggregate is computed from in-memory state (no disk on the hot loop). The
         // activity-store read + the send happen off-loop in the spawned thread below; the
         // dedup + monotonic-timestamp bookkeeping here is all lock-free on this one thread.
-        let content_state = live_activity_content_state(&self.collect_agent_infos());
+        let mut agents = self.collect_agent_infos();
+        agents.extend(self.reachable_remote_agents());
+        let content_state = live_activity_content_state(&agents);
 
         // Dedup: skip when the aggregate is unchanged since the last dispatch. Status-change
         // events fire often without altering the widget's content (e.g. a git refresh), and
@@ -1164,13 +1146,11 @@ impl App {
         };
         LAST_LIVE_ACTIVITY_HASH.store(hash, Ordering::Relaxed);
 
-        let cfg = self.state.push_config.clone();
-        if let Err(err) = std::thread::Builder::new()
-            .name("herdr-liveactivity".to_string())
-            .spawn(move || crate::push::deliver_live_activity(cfg, content_state, timestamp))
-        {
-            tracing::warn!(error = %err, "failed to spawn live-activity sender thread; dropping update");
-        }
+        crate::push::dispatch_live_activity(
+            self.state.push_config.clone(),
+            content_state,
+            timestamp,
+        );
     }
     pub(crate) fn sync_toast_deadline(
         &mut self,
@@ -2435,6 +2415,18 @@ fn push_title_agent<'a>(agent_name: Option<&'a str>, agent_label: &'a str) -> &'
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .unwrap_or(agent_label)
+}
+
+/// The verb phrase after the agent in a push title ("jarvis needs attention").
+fn push_event_text(kind: crate::push::PushKind) -> &'static str {
+    match kind {
+        crate::push::PushKind::NeedsInput => "needs attention",
+        crate::push::PushKind::Finished => "finished",
+        crate::push::PushKind::Died => "exited",
+        // Gram alerts are built in `emit_apns_gram_message`, never from an agent
+        // transition, so this arm only keeps the match exhaustive.
+        crate::push::PushKind::Gram => "sent a message",
+    }
 }
 
 /// The largest muted-pane set we persist per device. A defensive bound so a

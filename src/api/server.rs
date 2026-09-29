@@ -786,8 +786,8 @@ fn poll_once_into_cache(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             // Race guard for a changed peer: the manager sets this peer's
-            // `peer_stop` AND evicts the alias while holding this same store
-            // Mutex, so checking `peer_stop` here — WHILE HOLDING the lock, just
+            // `peer_stop` and then evicts the alias while holding this same
+            // store Mutex, so checking `peer_stop` here — WHILE HOLDING the lock, just
             // before the write — serializes a retiring thread against the
             // reconcile. If stop is set, skip the write so a stale entry can
             // never reappear after the alias was evicted (or be overwritten by
@@ -8169,6 +8169,13 @@ mod federation_tests {
     }
 
     fn start_relay(addr: SocketAddr) -> RelayFixture {
+        start_relay_on(PeerRoute::for_test(ConnectionTarget::Tcp {
+            addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        }))
+    }
+
+    fn start_relay_on(route: PeerRoute) -> RelayFixture {
         let hub = EventHub::default();
         let store = Arc::new(Mutex::new(FederationStore::default()));
         store.lock().unwrap().set_peer(
@@ -8182,10 +8189,6 @@ mod federation_tests {
                 },
             ),
         );
-        let route = PeerRoute::for_test(ConnectionTarget::Tcp {
-            addr,
-            token: Some(SEEDED_PEER_TOKEN.into()),
-        });
         let stop = Arc::new(AtomicBool::new(false));
         let relay = PeerRelay {
             alias: "box".into(),
@@ -8577,6 +8580,63 @@ mod federation_tests {
                     crate::api::federation_store::RemotePaneEvent::Exited
                 ),
             ]
+        );
+
+        relay.stop();
+        peer.shutdown();
+    }
+
+    /// A poll that stops vouching for a pinned peer's identity ends its live
+    /// stream: events the peer sends afterwards are neither published nor
+    /// recorded, and the relay streams again only once the identity is
+    /// validated anew.
+    #[test]
+    fn relay_stops_relaying_once_peer_identity_is_revoked() {
+        let state = streaming_state(
+            vec![peer_agent("w1:p1", AgentStatus::Working)],
+            "boot-1",
+            true,
+        );
+        let peer = StreamingPeer::spawn(Arc::clone(&state));
+        let route = PeerRoute::for_test_unvalidated(ConnectionTarget::Tcp {
+            addr: peer.addr,
+            token: Some(SEEDED_PEER_TOKEN.into()),
+        });
+        route.set_identity_validated(true);
+        let relay = start_relay_on(route);
+        assert!(wait_until(Duration::from_secs(5), || peer.subscribes()
+            == 1
+            && relay_baseline_has(&relay.store, "box/w1:p1")));
+        peer.event_hub
+            .push(peer_status("w1:p1", AgentStatus::Blocked));
+        assert!(wait_until(Duration::from_secs(5), || hub_statuses(
+            &relay.hub
+        )
+        .len()
+            == 1));
+
+        // The poll found a different machine behind the endpoint.
+        relay.route.set_identity_validated(false);
+        peer.event_hub.push(peer_status("w1:p1", AgentStatus::Idle));
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            hub_statuses(&relay.hub),
+            status_pairs(&[("box/w1:p1", AgentStatus::Blocked)]),
+            "a revoked peer's events must not be relayed"
+        );
+        assert_eq!(
+            relay.store.lock().unwrap().peer("box").unwrap().relayed["box/w1:p1"]
+                .event
+                .agent_status,
+            AgentStatus::Blocked,
+            "a revoked peer's events must not be recorded"
+        );
+        assert_eq!(peer.subscribes(), 1);
+
+        relay.route.set_identity_validated(true);
+        assert!(
+            wait_until(Duration::from_secs(5), || peer.subscribes() == 2),
+            "the revoked stream ended, so a validated peer opens a new one"
         );
 
         relay.stop();

@@ -91,6 +91,10 @@ enum SessionEnd {
     /// The route generation moved (peer boot changed or route retired):
     /// reconnect at once against the current generation.
     Stale,
+    /// The poll stopped vouching for the peer's identity: nothing more from
+    /// this stream is applied; the thread waits until the peer is eligible
+    /// again.
+    Revoked,
     /// Transport, protocol or idle failure: reconnect after the backoff.
     Failed(String),
 }
@@ -147,6 +151,9 @@ impl PeerRelay {
                 SessionEnd::Stopped => break,
                 SessionEnd::Stale => {
                     debug!(alias = %self.alias, "federation event relay route changed; reconnecting");
+                }
+                SessionEnd::Revoked => {
+                    info!(alias = %self.alias, "federation peer identity no longer validated; event relay paused");
                 }
                 SessionEnd::Failed(reason) => {
                     debug!(alias = %self.alias, %reason, "federation event relay stream unavailable");
@@ -250,9 +257,10 @@ impl PeerRelay {
         }
     }
 
-    /// The next stream line, re-checking stop and the route stamp at least
-    /// every read slice. A stream silent for longer than the federation idle
-    /// timeout (the peer heartbeats every 15 s) has failed.
+    /// The next stream line, re-checking stop, the route stamp and the peer's
+    /// identity validation at least every read slice. A stream silent for
+    /// longer than the federation idle timeout (the peer heartbeats every
+    /// 15 s) has failed.
     fn next_line(
         &self,
         stream: &mut FederatedStream,
@@ -265,6 +273,9 @@ impl PeerRelay {
             }
             if !self.current(stamp) {
                 return Err(SessionEnd::Stale);
+            }
+            if !self.route.identity_validated() {
+                return Err(SessionEnd::Revoked);
             }
             match stream.next_frame(
                 FEDERATION_MAX_STREAM_FRAME_BYTES,
@@ -361,17 +372,22 @@ impl PeerRelay {
             // Same under-lock stop guard as the poll: never write an alias
             // the reconcile has already evicted.
             if self.stop.load(Ordering::Relaxed) {
-                return 0;
+                return Some(0);
+            }
+            if !self.route.identity_validated() {
+                return None;
             }
             let missed = store.relay_resync(&self.alias, current, mode, Instant::now());
             let published = missed.len();
             for event in missed {
                 self.event_hub.push_relayed(status_envelope(event));
             }
-            published
+            Some(published)
         });
-        let Some(published) = published else {
-            return Some(SessionEnd::Stale);
+        let published = match published {
+            None => return Some(SessionEnd::Stale),
+            Some(None) => return Some(SessionEnd::Revoked),
+            Some(Some(published)) => published,
         };
         debug!(alias = %self.alias, ?mode, published, "federation event relay resynchronized");
         state.boot = snapshot.remote_boot_id;
@@ -400,13 +416,18 @@ impl PeerRelay {
         if !self.current(stamp) {
             return Some(SessionEnd::Stale);
         }
-        let pushed = self.route.with_current(stamp, || {
+        // `Some(false)`: applied or skipped; `Some(true)`: the peer's identity
+        // was revoked, so the line is dropped and the session ends.
+        let revoked = self.route.with_current(stamp, || {
             let mut store = self
                 .store
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if self.stop.load(Ordering::Relaxed) {
-                return;
+                return false;
+            }
+            if !self.route.identity_validated() {
+                return true;
             }
             let now = Instant::now();
             let publish = match &envelope.data {
@@ -422,7 +443,7 @@ impl PeerRelay {
                     true
                 }
                 EventData::PaneClosed { pane_id, .. } => {
-                    store.relay_pane_closed(&self.alias, pane_id);
+                    store.relay_pane_closed(&self.alias, pane_id, now);
                     true
                 }
                 EventData::PaneExited { pane_id, .. } => {
@@ -442,8 +463,13 @@ impl PeerRelay {
             if publish {
                 self.event_hub.push_relayed(envelope);
             }
+            false
         });
-        pushed.is_none().then_some(SessionEnd::Stale)
+        match revoked {
+            None => Some(SessionEnd::Stale),
+            Some(true) => Some(SessionEnd::Revoked),
+            Some(false) => None,
+        }
     }
 }
 

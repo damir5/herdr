@@ -234,6 +234,11 @@ impl RemotePushTracker {
                         }
                     }
                 }
+                // Closed on purpose, like closing a local pane: no alert when
+                // it drops off the peer's list.
+                RemotePaneEvent::Closed => {
+                    self.panes.remove(&pane_id);
+                }
             }
         }
         let cached: HashSet<&str> = view.peers.iter().map(|(alias, _)| alias.as_str()).collect();
@@ -823,6 +828,20 @@ mod tests {
         let alerts = capture.take().alerts;
         assert_eq!(alerts.len(), 1, "{alerts:?}");
         assert_eq!(alerts[0].kind, PushKind::Finished);
+    }
+
+    #[test]
+    fn closed_remote_pane_leaves_quietly() {
+        // Closing a pane is not a death, like closing a local one.
+        let (mut app, capture, _) = seeded(direct_push(), "llm-opt");
+        app.federation
+            .lock()
+            .unwrap()
+            .relay_pane_closed(PEER, PANE, Instant::now());
+        assert!(sync(&mut app, &capture).is_empty());
+        assert!(app.reachable_remote_agents().is_empty());
+        poll(&app, Vec::new());
+        assert!(sync(&mut app, &capture).is_empty());
     }
 
     #[test]

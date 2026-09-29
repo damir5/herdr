@@ -140,8 +140,8 @@ pub struct PeerCacheEntry {
     /// published. Empty for peers without an event stream.
     pub relayed: HashMap<String, RelayedStatus>,
     /// Per remote pane (qualified id), when a relay resync found the peer no
-    /// longer lists it. A poll that started earlier may still list the pane,
-    /// so it must not bring it back.
+    /// longer lists it or the relay saw it close. A poll that started earlier
+    /// may still list the pane, so it must not bring it back.
     pub vanished: HashMap<String, Instant>,
 }
 
@@ -186,6 +186,8 @@ pub enum RemotePaneEvent {
     AgentReleased,
     /// `pane.exited`: the pane's process exited.
     Exited,
+    /// `pane.closed`: the pane was closed on purpose; it leaves quietly.
+    Closed,
 }
 
 /// Cache of every configured federation peer's agents, keyed by peer alias.
@@ -319,11 +321,17 @@ impl FederationStore {
         entry.record_relayed(event, now);
     }
 
-    /// Forget a closed remote pane's relay baseline.
-    pub fn relay_pane_closed(&mut self, alias: &str, pane_id: &str) {
-        if let Some(entry) = self.peers.get_mut(alias) {
-            entry.relayed.remove(pane_id);
-        }
+    /// Forget a closed remote pane: its relay baseline and cached agent go at
+    /// once, a poll that started earlier cannot bring it back, and the app loop
+    /// learns it was closed rather than lost ([`RemotePaneEvent::Closed`]).
+    pub fn relay_pane_closed(&mut self, alias: &str, pane_id: &str, now: Instant) {
+        let Some(entry) = self.peers.get_mut(alias) else {
+            return;
+        };
+        entry.relayed.remove(pane_id);
+        entry.agents.retain(|agent| agent.pane_id != pane_id);
+        entry.vanished.insert(pane_id.to_owned(), now);
+        self.relay_pane_event(alias, pane_id, RemotePaneEvent::Closed);
     }
 
     /// Queue a relayed pane lifecycle event (pane id qualified) for the app
@@ -602,7 +610,8 @@ pub fn agent_status_event(agent: &AgentInfo) -> PaneAgentStatusChangedEvent {
     }
 }
 
-/// Overwrite `agent`'s status fields with a status event for its pane.
+/// Overwrite `agent`'s status fields with a status event for its pane. The
+/// turn and epoch only move forward, like [`FederationStore::relay_turn`].
 fn apply_status_event(agent: &mut AgentInfo, event: &PaneAgentStatusChangedEvent) {
     agent.agent_status = event.agent_status;
     agent.input_pending = event.input_pending;
@@ -611,8 +620,10 @@ fn apply_status_event(agent: &mut AgentInfo, event: &PaneAgentStatusChangedEvent
     agent.title.clone_from(&event.title);
     agent.display_agent.clone_from(&event.display_agent);
     agent.state_labels.clone_from(&event.state_labels);
-    agent.turn = event.turn;
-    agent.turn_epoch = event.turn_epoch;
+    if (event.turn_epoch, event.turn) > (agent.turn_epoch, agent.turn) {
+        agent.turn = event.turn;
+        agent.turn_epoch = event.turn_epoch;
+    }
 }
 
 /// Apply the honest-offline reachability stamp to one stored (already-prefixed)
@@ -1057,5 +1068,91 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn relayed_status_never_rewinds_the_cached_turn() {
+        let mut store = FederationStore::default();
+        let now = Instant::now();
+        store.set_peer(
+            "home",
+            PeerCacheEntry::reachable(vec![pane_agent("home/p1", AgentStatus::Working)], now),
+        );
+        store.relay_turn("home", "home/p1", 5, 2, now);
+        let turn = |store: &FederationStore| {
+            let agent = &store.peer("home").unwrap().agents[0];
+            (agent.turn_epoch, agent.turn)
+        };
+        assert_eq!(turn(&store), (Some(2), Some(5)));
+
+        // A status carrying an older turn, or none, keeps the newer turn.
+        let mut older = status("home/p1", AgentStatus::Idle);
+        older.turn = Some(4);
+        older.turn_epoch = Some(2);
+        assert!(store.relay_status("home", &older, now));
+        assert_eq!(cached_status(&store, "home/p1"), AgentStatus::Idle);
+        assert_eq!(turn(&store), (Some(2), Some(5)));
+        assert!(store.relay_status("home", &status("home/p1", AgentStatus::Working), now));
+        assert_eq!(turn(&store), (Some(2), Some(5)));
+
+        // A newer epoch moves it, even with a lower turn.
+        let mut restarted = status("home/p1", AgentStatus::Idle);
+        restarted.turn = Some(1);
+        restarted.turn_epoch = Some(3);
+        assert!(store.relay_status("home", &restarted, now));
+        assert_eq!(turn(&store), (Some(3), Some(1)));
+    }
+
+    #[test]
+    fn closed_remote_pane_leaves_the_cache_at_once_and_stays_gone() {
+        use std::time::Duration;
+        let mut store = FederationStore::default();
+        let t0 = Instant::now();
+        let listed = || {
+            vec![
+                pane_agent("home/p1", AgentStatus::Working),
+                pane_agent("home/p2", AgentStatus::Idle),
+            ]
+        };
+        store.set_polled_peer("home", PeerCacheEntry::reachable(listed(), t0), t0);
+        store.relay_resync(
+            "home",
+            vec![
+                status("home/p1", AgentStatus::Working),
+                status("home/p2", AgentStatus::Idle),
+            ],
+            RelayResync::Seed,
+            t0,
+        );
+        let pane_ids = |store: &FederationStore| {
+            store
+                .merged_agents()
+                .into_iter()
+                .map(|agent| agent.pane_id)
+                .collect::<Vec<_>>()
+        };
+
+        let poll_started = Instant::now();
+        let revision = store.revision();
+        store.relay_pane_closed("home", "home/p1", poll_started + Duration::from_millis(1));
+        assert_eq!(pane_ids(&store), ["home/p2"]);
+        assert!(!store.peer("home").unwrap().relayed.contains_key("home/p1"));
+        assert_ne!(
+            store.revision(),
+            revision,
+            "the app loop re-reads the store"
+        );
+        assert_eq!(
+            store.take_pane_events(),
+            [("home/p1".to_owned(), RemotePaneEvent::Closed)]
+        );
+
+        // A poll that started before the close still lists the pane.
+        store.set_polled_peer(
+            "home",
+            PeerCacheEntry::reachable(listed(), t0),
+            poll_started,
+        );
+        assert_eq!(pane_ids(&store), ["home/p2"]);
     }
 }

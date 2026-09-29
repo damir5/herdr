@@ -434,7 +434,7 @@ pub(crate) fn invite_links(
     let encoded = b64url(payload.to_string().as_bytes());
     (
         format!("herdrup://guest-invite#{encoded}"),
-        format!("{relay}/i#{encoded}"),
+        format!("{relay}/i/{encoded}"),
     )
 }
 
@@ -732,6 +732,32 @@ pub(crate) mod tests {
             *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
         }
         out
+    }
+
+    /// Messaging apps (iMessage) split a link at `#` and send the fragment as a second
+    /// message, so the shareable web link must carry the invite in its path. The app link
+    /// keeps the fragment: it never leaves the device.
+    #[test]
+    fn the_web_link_carries_the_invite_in_its_path() {
+        let dir = TempDir::new("links");
+        let invite = invite(&dir.0, at(1_000));
+        let host = HostIdentity {
+            host_id: "h".repeat(22),
+            relay_secret: String::new(),
+        };
+        let (app, web) = invite_links("https://relay.test/", &host, &[9; 32], &invite);
+        assert!(
+            !web.contains('#'),
+            "web link must not use a fragment: {web}"
+        );
+        let payload = web
+            .strip_prefix("https://relay.test/i/")
+            .expect("path form");
+        assert_eq!(app, format!("herdrup://guest-invite#{payload}"));
+        let decoded: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(payload).expect("b64url")).unwrap();
+        assert_eq!(decoded["secret"], json!(invite.secret));
+        assert_eq!(decoded["relay"], json!("https://relay.test"));
     }
 
     #[test]

@@ -796,18 +796,18 @@ impl FederationPeerManager {
             let Some(handle) = handles.remove(alias) else {
                 continue;
             };
+            // Stop before retiring the route, so the relay thread, which sees
+            // a retired route as stale and reconnects at once, exits instead
+            // of spinning until stop lands.
+            handle.stop.store(true, Ordering::Relaxed);
             handle.route.retire();
-            // S (brief): set stop AND evict the alias while holding the store
-            // Mutex, so a retiring thread's under-lock stop check (see
+            // S (brief): evict the alias while holding the store Mutex, after
+            // stop is set, so a retiring thread's under-lock stop check (see
             // `poll_once_into_cache`) can never write a stale entry afterward.
-            {
-                let mut store = self
-                    .store
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                handle.stop.store(true, Ordering::Relaxed);
-                store.remove_peer(alias);
-            }
+            self.store
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove_peer(alias);
             #[cfg(unix)]
             if let Some(gateway) = handle._reverse_gateway {
                 retired_gateways.push(gateway);

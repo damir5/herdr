@@ -656,6 +656,20 @@ Worktree 事件订阅包括 `worktree.created`、`worktree.opened` 和 `worktree
 
 生命周期事件用 `events.subscribe`。支持一次性等待时,专门的等待辅助命令会单独在文档中说明。
 
+### 序列号、全部窗格状态和 events v2
+
+每个事件行都带有 `seq`,即服务器的事件序列号。它在一个流中不会减小,服务器重启后重新开始。来自事件中心的事件行带有该事件的序列号;Herdr 根据窗格状态推导出的行(初始状态、快照状态变化、`pane.output_matched`、`pane.scroll_changed`)带有该流已读到的序列号,因此多行可能共享同一个序列号。每次轮询都会按服务器顺序投递请求中所有条目匹配的全部事件。
+
+`pane.agent_status_changed` 和 `pane.turn_completed` 可以省略 `pane_id`,此时会监视所有窗格,包括订阅开始后创建的窗格。`agent_status` 过滤仍然有效。全部窗格的状态订阅也会在约 1 秒内报告没有独立服务器事件的状态变化,例如窗格被查看后 `done` 变为 `idle`;之后出现的窗格会报告其后续变化,但不会报告其初始状态。
+
+在 `ping` 中声明 `capabilities.events_v2` 的服务器还接受与 `subscriptions` 并列的 `"events_v2": true`。旧服务器会忽略该字段。它只对该请求改变以下三点:
+
+- 引用不存在窗格的条目会被跳过,而不会让整个请求失败。确认响应会以 `"rejected": [{ "index": 1, "error": { "code": "pane_not_found", "message": "…" } }]` 列出这些条目。
+- 如果流落后太多,服务器丢弃了尚未投递的事件,Herdr 会在继续之前写入 `{ "control": "lagged", "seq": 904, "first_missed_seq": 1, "last_missed_seq": 904 }`。请通过 `session.snapshot` 或 `agent.list` 重新同步。
+- 连续 15 秒没有可投递内容的流会写入 `{ "control": "heartbeat", "seq": 904 }`。
+
+不使用 `events_v2` 时,流中不会出现 `control` 行,不存在的窗格仍会让请求失败,落后的流丢失的事件会被静默跳过。
+
 ## 读取窗格
 
 除非你在编写协议客户端,否则通过 CLI 使用 `pane.read`。

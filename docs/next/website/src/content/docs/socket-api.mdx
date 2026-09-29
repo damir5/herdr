@@ -846,7 +846,8 @@ Subscribe to events when you need a long-lived stream:
 The first response acknowledges the subscription. Later lines are pushed events.
 All entries must be valid: if any referenced pane does not exist, Herdr rejects
 the entire request with an error and closes the connection. Refresh the pane list
-and retry rather than assuming the other entries were subscribed.
+and retry rather than assuming the other entries were subscribed. Requests with
+`events_v2` skip such entries instead (see below).
 Lifecycle subscriptions start when the request is accepted and do not replay
 events retained before that point.
 
@@ -873,6 +874,40 @@ updated `PaneLayoutSnapshot` for one tab. Clients that bootstrap with
 Worktree event subscriptions include `worktree.created`, `worktree.opened`, and `worktree.removed`. Worktree events describe Git checkout lifecycle. `worktree.created` includes the opened `workspace` and created `worktree`. `worktree.opened` includes the target `workspace`, opened `worktree`, and `already_open`. `worktree.removed` includes the `workspace_id`, removed `worktree`, and `forced`.
 
 Use `events.subscribe` for lifecycle events. Dedicated wait helpers are documented separately when a one-shot wait is supported.
+
+### Sequence numbers, all-pane status and events v2
+
+Every event line carries `seq`, the server's event sequence number. It never
+decreases along a stream and restarts when the server restarts. Lines for hub
+events carry that event's number; lines Herdr derives from pane state (an
+initial status, a snapshot status change, `pane.output_matched`,
+`pane.scroll_changed`) carry the sequence the stream had read through, so
+several lines can share a number. Each poll delivers every matching event, in
+server order, across all entries of the request.
+
+`pane.agent_status_changed` and `pane.turn_completed` accept an omitted
+`pane_id`, which watches every pane, including panes created after the
+subscription started. `agent_status` still filters. An all-pane status
+subscription reports status changes that have no server event of their own,
+such as `done` becoming `idle` when a pane is seen, within about a second; a
+pane that appears later reports its later transitions but not its first state.
+
+Servers that advertise `capabilities.events_v2` in `ping` also accept
+`"events_v2": true` next to `subscriptions`. Older servers ignore the field. It
+changes three things for that request only:
+
+- Entries whose pane does not exist are skipped instead of failing the whole
+  request. The acknowledgement lists them as
+  `"rejected": [{ "index": 1, "error": { "code": "pane_not_found", "message": "…" } }]`.
+- If the stream fell so far behind that the server discarded events it had not
+  delivered, Herdr writes
+  `{ "control": "lagged", "seq": 904, "first_missed_seq": 1, "last_missed_seq": 904 }`
+  before continuing. Resynchronize from `session.snapshot` or `agent.list`.
+- A stream with nothing to deliver for 15 seconds writes
+  `{ "control": "heartbeat", "seq": 904 }`.
+
+Without `events_v2`, streams never contain `control` lines, a missing pane still
+fails the request, and events lost to a lagging stream are skipped silently.
 
 ## Reading panes
 

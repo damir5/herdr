@@ -1886,8 +1886,16 @@ impl GhosttyPaneTerminal {
         &self,
         ring: &super::output_ring::OutputRing,
     ) -> Option<super::output_ring::OutputSnapshot> {
-        let core = self.core.lock().ok()?;
-        let ansi = ghostty_visible_ansi(&core).ok()?;
+        let mut core = self.core.lock().ok()?;
+        let cursor = current_cursor_state(&mut core);
+        let cursor = effective_cursor_state(&mut core, cursor)?;
+        let mut ansi = ghostty_visible_ansi(&core).ok()?;
+        ansi.push_str(&format!(
+            "\x1b[{};{}H\x1b[?25{}",
+            cursor.y.saturating_add(1),
+            cursor.x.saturating_add(1),
+            if cursor.visible { 'h' } else { 'l' },
+        ));
         let (cursor, resize_id, cols, rows) = ring.capture_offsets();
         Some(super::output_ring::OutputSnapshot {
             ansi,
@@ -4474,6 +4482,34 @@ mod tests {
         pane.process_pty_bytes(pane_id, 0, b"\x1b[6 q", &tx);
 
         assert_eq!(pane.cursor_state().unwrap().shape, 6);
+    }
+
+    #[test]
+    fn output_snapshot_restores_mid_screen_cursor_and_hidden_visibility() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(20, 8, 200).unwrap();
+        terminal.write(b"top\r\nmiddle\r\nbottom\x1b[4;9H\x1b[?25l");
+        let pane = Arc::new(PaneTerminal::new(
+            GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap(),
+        ));
+        let ring =
+            super::super::output_ring::OutputRing::new(1, 1024, 20, 8, Arc::downgrade(&pane));
+        let source_cursor = pane.ghostty.cursor_state().unwrap();
+        let snapshot = pane.output_snapshot(&ring).unwrap();
+
+        let client_terminal = crate::ghostty::Terminal::new(20, 8, 200).unwrap();
+        let client = GhosttyPaneTerminal::new(client_terminal, tx.clone()).unwrap();
+        client.process_pty_bytes(PaneId::from_raw(2), 0, snapshot.ansi.as_bytes(), &tx);
+        let client_cursor = client.cursor_state().unwrap();
+
+        assert_eq!(
+            (source_cursor.x, source_cursor.y, source_cursor.visible),
+            (8, 3, false)
+        );
+        assert_eq!(
+            (client_cursor.x, client_cursor.y, client_cursor.visible),
+            (source_cursor.x, source_cursor.y, source_cursor.visible)
+        );
     }
 
     #[test]

@@ -231,7 +231,7 @@ impl App {
                 };
                 match crate::persist::gram::append(item.clone()) {
                     Ok(_) => {
-                        self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                        self.emit_apns_gram_message(&item);
                         encode_success(
                             id,
                             ResponseResult::GramSent {
@@ -319,7 +319,7 @@ impl App {
 
         match crate::persist::gram::append(item.clone()) {
             Ok(_) => {
-                self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                self.emit_apns_gram_message(&item);
                 encode_success(
                     id,
                     ResponseResult::GramSent {
@@ -613,18 +613,25 @@ impl App {
             return gram_unavailable(id);
         }
 
-        let target_id = params.id.clone();
-        // Returns (found, changed); a re-mark of an already-read message is found
-        // but changes nothing, so it does not rewrite the store.
+        let targets: Vec<String> = params.targets().map(str::to_string).collect();
+        if targets.is_empty() {
+            return encode_error(id, "invalid_params", "pass id or ids");
+        }
+        // Returns (found, changed): every id must exist before any is marked,
+        // and a re-mark of already-read messages does not rewrite the store.
         let outcome = crate::persist::gram::update_if_changed(move |items| {
-            match items.iter_mut().find(|item| item.id == target_id) {
-                Some(item) => {
-                    let changed = !item.read_by_owner;
-                    item.read_by_owner = true;
-                    (true, changed)
-                }
-                None => (false, false),
+            if !targets
+                .iter()
+                .all(|target| items.iter().any(|item| &item.id == target))
+            {
+                return (false, false);
             }
+            let mut changed = false;
+            for item in items.iter_mut().filter(|item| targets.contains(&item.id)) {
+                changed |= !item.read_by_owner;
+                item.read_by_owner = true;
+            }
+            (true, changed)
         });
         match outcome {
             Ok((true, _)) => encode_success(id, ResponseResult::Ok {}),
@@ -927,16 +934,16 @@ impl App {
     /// A sibling of `emit_apns_agent_notifications`: detached, best-effort, guarded
     /// by `crate::push::may_deliver`. The alert deep-links to the app's Gram page, so
     /// it carries no pane/workspace id (the payload's `gram` marker signals this).
-    fn emit_apns_gram_message(&self, from: &str, text: &str, file: Option<&GramFile>) {
+    fn emit_apns_gram_message(&self, item: &GramItem) {
         if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
-        let title =
-            super::sanitized_notification_text(from, 80).unwrap_or_else(|| "New gram".to_string());
-        let mut body = super::sanitized_notification_text(text, 240).unwrap_or_default();
+        let title = super::sanitized_notification_text(&item.from, 80)
+            .unwrap_or_else(|| "New gram".to_string());
+        let mut body = super::sanitized_notification_text(&item.text, 240).unwrap_or_default();
         // Note an attachment so a file-only (or captioned) gram reads sensibly on
         // the lock screen. The name is already a sanitized basename.
-        if let Some(file) = file {
+        if let Some(file) = &item.file {
             let hint = format!("📎 {}", file.name);
             body = if body.is_empty() {
                 hint
@@ -950,6 +957,11 @@ impl App {
             pane_id: String::new(),
             workspace_id: String::new(),
             kind: crate::push::PushKind::Gram,
+            #[cfg(unix)]
+            guest_scope: Some(crate::guest::push::GuestScope::Gram {
+                from: item.from.clone(),
+                gram_id: item.id.clone(),
+            }),
         };
         crate::push::dispatch(self.state.push_config.clone(), vec![notification]);
     }

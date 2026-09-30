@@ -51,6 +51,10 @@ pub(crate) struct PushNotification {
     pub pane_id: String,
     pub workspace_id: String,
     pub kind: PushKind,
+    /// The local agent or Gram this alert is about, so the guests granted
+    /// that agent get it too. `None` for agents on other machines.
+    #[cfg(unix)]
+    pub guest_scope: Option<crate::guest::push::GuestScope>,
 }
 
 /// True when the push config is complete enough to attempt delivery: the master
@@ -171,7 +175,7 @@ fn device_muted(device: &RegisteredDevice, pane_id: &str) -> bool {
 }
 
 /// The device opted into this kind and has not muted its pane.
-fn device_accepts(device: &RegisteredDevice, notification: &PushNotification) -> bool {
+pub(crate) fn device_accepts(device: &RegisteredDevice, notification: &PushNotification) -> bool {
     device_wants(device, notification.kind) && !device_muted(device, &notification.pane_id)
 }
 
@@ -290,12 +294,22 @@ pub(crate) fn deliver(cfg: PushConfig, notifications: Vec<PushNotification>) {
     }
     let devices = crate::persist::devices::load();
     let plan = plan_alerts(&cfg, &notifications, &devices);
+    prune_device_tokens(send_plan(&cfg, &plan));
+    #[cfg(unix)]
+    crate::guest::push::deliver(&cfg, &notifications);
+}
+
+/// Send every alert in `plan` over its route. Returns the device tokens APNs
+/// or the relay reported gone, for the caller to prune from its store.
+pub(crate) fn send_plan(cfg: &PushConfig, plan: &AlertPlan<'_>) -> HashSet<String> {
+    let mut gone = HashSet::new();
     if !plan.direct.is_empty() {
-        deliver_direct(&cfg, &plan.payloads, &plan.direct);
+        gone.extend(deliver_direct(cfg, &plan.payloads, &plan.direct));
     }
     if !plan.relayed.is_empty() {
-        deliver_relay(&cfg.relay_url, &plan.payloads, &plan.relayed);
+        gone.extend(deliver_relay(&cfg.relay_url, &plan.payloads, &plan.relayed));
     }
+    gone
 }
 
 /// Every alert one batch sends: each notification's payload once, and each
@@ -336,8 +350,12 @@ pub(crate) fn plan_alerts<'a>(
 }
 
 /// Direct APNs delivery: mint/reuse one JWT from the host's `.p8` key and send
-/// each alert straight to Apple.
-fn deliver_direct(cfg: &PushConfig, payloads: &[String], sends: &[(usize, &RegisteredDevice)]) {
+/// each alert straight to Apple. Returns the tokens APNs reported gone.
+fn deliver_direct(
+    cfg: &PushConfig,
+    payloads: &[String],
+    sends: &[(usize, &RegisteredDevice)],
+) -> HashSet<String> {
     // Direct routing implies `enabled`, which guarantees these are all `Some`.
     let (Some(key_path), Some(key_id), Some(team_id), Some(topic)) = (
         cfg.key_path.as_deref(),
@@ -345,7 +363,7 @@ fn deliver_direct(cfg: &PushConfig, payloads: &[String], sends: &[(usize, &Regis
         cfg.team_id.as_deref(),
         cfg.topic.as_deref(),
     ) else {
-        return;
+        return HashSet::new();
     };
 
     // `key_path` is host config, not a secret: expand `~` (the form the docs and
@@ -359,7 +377,7 @@ fn deliver_direct(cfg: &PushConfig, payloads: &[String], sends: &[(usize, &Regis
                 error = %err,
                 "failed to read APNs signing key; skipping push"
             );
-            return;
+            return HashSet::new();
         }
     };
 
@@ -367,7 +385,7 @@ fn deliver_direct(cfg: &PushConfig, payloads: &[String], sends: &[(usize, &Regis
         Ok(jwt) => jwt,
         Err(err) => {
             tracing::warn!(error = %err, "failed to build APNs auth token; skipping push");
-            return;
+            return HashSet::new();
         }
     };
     // A 403 (bad token / clock skew) invalidates the cached JWT; re-mint it once
@@ -416,12 +434,16 @@ fn deliver_direct(cfg: &PushConfig, payloads: &[String], sends: &[(usize, &Regis
             }
         }
     }
-    prune_device_tokens(tokens_to_prune);
+    tokens_to_prune
 }
 
 /// Relay delivery of alerts to capability-bearing devices. The payload is the
-/// same JSON the direct path sends.
-fn deliver_relay(relay_url: &str, payloads: &[String], sends: &[(usize, &RegisteredDevice)]) {
+/// same JSON the direct path sends. Returns the tokens the relay reported gone.
+fn deliver_relay(
+    relay_url: &str,
+    payloads: &[String],
+    sends: &[(usize, &RegisteredDevice)],
+) -> HashSet<String> {
     let mut tokens_to_prune: HashSet<String> = HashSet::new();
     for (index, device) in sends {
         if tokens_to_prune.contains(&device.device_token) {
@@ -440,7 +462,7 @@ fn deliver_relay(relay_url: &str, payloads: &[String], sends: &[(usize, &Registe
             tokens_to_prune.insert(device.device_token.clone());
         }
     }
-    prune_device_tokens(tokens_to_prune);
+    tokens_to_prune
 }
 
 /// Deliver ONE Live Activity content-state update to every registered activity push token,

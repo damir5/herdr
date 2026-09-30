@@ -21,7 +21,22 @@ pub struct GuestInviteCreateParams {
     /// Invite lifetime in seconds (60 to 604800). Default: 86400.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_secs: Option<u64>,
+    /// Share the agent's Gram with the guest: every Gram the agent sends from
+    /// the moment the guest accepts, with its files and push notifications.
+    /// Default: false.
+    #[serde(default)]
+    pub share_gram: bool,
     /// Saved SSH machine alias to route this call to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine: Option<String>,
+}
+
+/// `guest.update`: change an accepted guest's settings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GuestUpdateParams {
+    pub guest_id: String,
+    /// Share the agent's Gram with this guest (see `guest.invite.create`).
+    pub share_gram: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
 }
@@ -104,6 +119,9 @@ pub struct GuestInviteInfo {
     pub expires_ms: u64,
     /// Guest id that accepted this invite, once used.
     pub used_by: Option<String>,
+    /// The guest will see the agent's Gram (see `guest.invite.create`).
+    #[serde(default)]
+    pub share_gram: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -118,6 +136,10 @@ pub struct GuestInfo {
     pub created_ms: u64,
     pub last_seen_ms: Option<u64>,
     pub revoked: bool,
+    /// The guest sees the agent's Gram: every Gram the agent sent from
+    /// `created_ms` on, with its files and push notifications.
+    #[serde(default)]
+    pub share_gram: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -151,6 +173,12 @@ pub enum GuestAuditEvent {
     Read,
     /// The guest resized the granted agent's terminal (at most once a minute).
     Resize,
+    /// The guest listed the shared Gram (at most once a minute).
+    GramList,
+    /// The guest marked shared Grams read (at most once a minute).
+    GramRead,
+    /// The guest opened a shared Gram's file.
+    GramFile,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

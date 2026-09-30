@@ -297,6 +297,10 @@ pub enum ResponseResult {
         /// Live guest streams closed by this revoke.
         closed_streams: usize,
     },
+    /// The guest after `guest.update`.
+    GuestUpdated {
+        guest: super::guest::GuestInfo,
+    },
     GuestAudit {
         entries: Vec<super::guest::GuestAuditEntry>,
     },

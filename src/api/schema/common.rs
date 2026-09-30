@@ -139,6 +139,13 @@ pub struct NotificationsRegisterDeviceParams {
     pub relay_capability: Option<String>,
 }
 
+/// Stop pushing to a device registered with `notifications.register_device`.
+/// A guest removes only its own registration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct NotificationsUnregisterDeviceParams {
+    pub device_token: String,
+}
+
 /// Register / unregister an iOS Live Activity push token for BACKGROUND widget updates.
 /// The field name matches the iOS client's `RegisterActivityParams` contract; the same
 /// struct serves both `notifications.register_activity` and `.unregister_activity`.

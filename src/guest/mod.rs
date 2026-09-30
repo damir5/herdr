@@ -8,7 +8,9 @@
 //! `subscribe_changes`.
 
 pub(crate) mod audit;
+pub(crate) mod gram;
 pub(crate) mod link;
+pub(crate) mod push;
 pub(crate) mod store;
 
 use std::collections::HashMap;
@@ -60,6 +62,9 @@ pub struct GuestPrincipal {
     pub(crate) fingerprint: String,
     pub(crate) grant: GuestGrantInfo,
     pub(crate) dir: PathBuf,
+    /// When the guest accepted: it sees the agent's Grams from here on.
+    pub(crate) created_ms: u64,
+    pub(crate) share_gram: bool,
 }
 
 impl GuestPrincipal {
@@ -70,12 +75,19 @@ impl GuestPrincipal {
             fingerprint: record.fingerprint.clone(),
             grant: record.grant.clone(),
             dir,
+            created_ms: record.created_ms,
+            share_gram: record.share_gram,
         }
     }
 
     /// `<name> (via HerdrUp): `, prefixed to every prompt.
     pub(crate) fn label(&self) -> String {
         store::guest_label(&self.name)
+    }
+
+    /// `<name> (via HerdrUp)`, the sender of the guest's Gram posts.
+    pub(crate) fn post_from(&self) -> String {
+        self.label().trim_end_matches(": ").to_string()
     }
 
     /// Record one audit event. Audit failures are logged, never fatal.
@@ -101,6 +113,30 @@ impl GuestPrincipal {
             tracing::warn!(err = %err, "guest audit log write failed");
         }
     }
+}
+
+fn same_kind(a: &str, b: &str) -> bool {
+    match (
+        crate::detect::parse_agent_label(a),
+        crate::detect::parse_agent_label(b),
+    ) {
+        (Some(a), Some(b)) => a == b,
+        _ => a == b,
+    }
+}
+
+/// The grant names the agent with this name and kind in this terminal. The
+/// harness session may change: a restarted agent keeps its guest.
+pub(crate) fn grant_names(
+    grant: &GuestGrantInfo,
+    terminal_id: &str,
+    name: Option<&str>,
+    kind: &str,
+) -> bool {
+    grant.terminal_id == terminal_id
+        && grant.agent_name.is_some()
+        && grant.agent_name.as_deref() == name
+        && same_kind(kind, grant.kind())
 }
 
 // Short-lived per-connection value; the contract shape stays unboxed.
@@ -130,9 +166,10 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
         AdmitOutcome::Refused(error) => return Admission::Refused(error),
         AdmitOutcome::Accepted { guest, replaced } => {
             // Close the replaced grants' live sessions now, not at their next
-            // request.
+            // request, and stop pushing to them.
             for guest_id in &replaced {
                 revoke_live(guest_id);
+                forget_guest(&dir, guest_id);
             }
             notify_changes();
             (guest, Some(GuestAuditEvent::Accepted))
@@ -152,6 +189,7 @@ pub(crate) fn admit_in(dir: PathBuf, device_pub: [u8; 32], hello: &serde_json::V
         "machine_label": record.machine_label,
         "owner_name": record.owner_name,
         "agent": {"name": record.grant.agent_name, "target": record.grant.terminal_id},
+        "features": {"gram": record.share_gram, "push": true},
     });
     Admission::Admitted { principal, reply }
 }
@@ -271,6 +309,7 @@ pub(crate) fn create_invite(
     owner_name: &str,
     machine_label: &str,
     ttl_secs: Option<u64>,
+    share_gram: bool,
 ) -> Result<(GuestInviteInfo, String, String), OwnerError> {
     if !store::valid_guest_name(name) {
         return Err((
@@ -310,6 +349,7 @@ pub(crate) fn create_invite(
         owner_name,
         machine_label,
         ttl_secs,
+        share_gram,
         store::now_ms(),
     )
     .map_err(io_error)?;
@@ -398,8 +438,37 @@ pub(crate) fn revoke_at(
         return Ok(Some(0));
     };
     let closed = revoke_live(&record.guest_id);
+    forget_guest(&dir, &record.guest_id);
     GuestPrincipal::from_record(&record, dir).audit(GuestAuditEvent::Revoked, None, None, None);
     Ok(Some(closed))
+}
+
+/// Drop a revoked guest's push devices and Gram read marks.
+fn forget_guest(dir: &std::path::Path, guest_id: &str) {
+    if let Err(err) = push::remove_guest(dir, guest_id) {
+        tracing::warn!(err = %err, "guest push devices removal failed");
+    }
+    if let Err(err) = gram::forget(dir, guest_id) {
+        tracing::warn!(err = %err, "guest gram read marks removal failed");
+    }
+}
+
+/// `guest.update`: turn Gram sharing on or off for an active guest. `None`
+/// when no active guest has this id.
+pub(crate) fn update(guest_id: &str, share_gram: bool) -> Result<Option<GuestInfo>, OwnerError> {
+    update_at(&store::guest_dir(), guest_id, share_gram)
+}
+
+pub(crate) fn update_at(
+    dir: &std::path::Path,
+    guest_id: &str,
+    share_gram: bool,
+) -> Result<Option<GuestInfo>, OwnerError> {
+    let updated = store::update_share_gram(dir, guest_id, share_gram).map_err(io_error)?;
+    if updated.is_some() {
+        notify_changes();
+    }
+    Ok(updated.as_ref().map(store::GuestRecord::info))
 }
 
 pub(crate) fn read_audit(
@@ -479,13 +548,13 @@ mod tests {
         let previous = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
         let (invite, url, _) =
-            create_invite(&agent(), true, "plotarmordev", "Jerry", "Mac", None).unwrap();
+            create_invite(&agent(), true, "plotarmordev", "Jerry", "Mac", None, false).unwrap();
         let secret = url.rsplit('#').next().unwrap().to_string();
         let payload: serde_json::Value =
             serde_json::from_slice(&store::b64url_decode(&secret).unwrap()).unwrap();
         let hello = json!({"v": 1, "invite_id": invite.invite_id, "secret": payload["secret"], "device": "iPhone"});
         assert!(matches!(admit([6; 32], &hello), Admission::Admitted { .. }));
-        let pending = create_invite(&agent(), true, "second", "Jerry", "Mac", None).unwrap();
+        let pending = create_invite(&agent(), true, "second", "Jerry", "Mac", None, false).unwrap();
         let (guests, invites, link) = list().unwrap();
         let rendered = serde_json::to_string(&(guests, invites, link)).unwrap();
         let dir = store::guest_dir();
@@ -523,6 +592,7 @@ mod tests {
             "Jerry",
             "Jerry's Mac Studio",
             3600,
+            false,
             store::now_ms(),
         )
         .unwrap();
@@ -548,5 +618,105 @@ mod tests {
         assert!(!other.revoked());
         let entries = audit::read(&dir.0, Some(&principal.guest_id), None, 10).unwrap();
         assert_eq!(entries[0].event, GuestAuditEvent::Accepted);
+    }
+
+    fn invite_in(dir: &std::path::Path, share_gram: bool) -> store::NewInvite {
+        store::create_invite(
+            dir,
+            "plotarmordev",
+            store::tests::grant(),
+            "Jerry",
+            "Mac",
+            3600,
+            share_gram,
+            store::now_ms(),
+        )
+        .unwrap()
+    }
+
+    fn accept_in(
+        dir: &std::path::Path,
+        invite: &store::NewInvite,
+        device: u8,
+    ) -> serde_json::Value {
+        let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
+        match admit_in(dir.to_path_buf(), [device; 32], &hello) {
+            Admission::Admitted { reply, .. } => reply,
+            Admission::Refused(error) => panic!("refused: {error}"),
+        }
+    }
+
+    #[test]
+    fn hello_features_follow_share_gram_from_the_invite_and_updates() {
+        let dir = store::tests::TempDir::new("features");
+        let shared = accept_in(&dir.0, &invite_in(&dir.0, true), 1);
+        assert_eq!(shared["features"], json!({"gram": true, "push": true}));
+
+        let reply = accept_in(&dir.0, &invite_in(&dir.0, false), 2);
+        assert_eq!(reply["features"], json!({"gram": false, "push": true}));
+        let guest_id = reply["guest_id"].as_str().unwrap();
+        let returning = |device: u8| match admit_in(dir.0.clone(), [device; 32], &json!({"v": 1})) {
+            Admission::Admitted { reply, principal } => (reply, principal),
+            Admission::Refused(error) => panic!("refused: {error}"),
+        };
+
+        let updated = update_at(&dir.0, guest_id, true).unwrap().unwrap();
+        assert!(updated.share_gram);
+        let (reply, principal) = returning(2);
+        assert_eq!(reply["features"], json!({"gram": true, "push": true}));
+        assert!(principal.share_gram);
+
+        update_at(&dir.0, guest_id, false).unwrap().unwrap();
+        let (reply, principal) = returning(2);
+        assert_eq!(reply["features"]["gram"], false);
+        assert!(!principal.share_gram);
+
+        revoke_at(dir.0.clone(), RevokeTarget::Guest(guest_id)).unwrap();
+        assert!(update_at(&dir.0, guest_id, true).unwrap().is_none());
+        assert!(update_at(&dir.0, "unknown", true).unwrap().is_none());
+    }
+
+    fn device(token: &str) -> crate::persist::devices::RegisteredDevice {
+        crate::persist::devices::RegisteredDevice {
+            device_token: token.to_string(),
+            platform: "ios".to_string(),
+            notify_needs_input: true,
+            notify_dies: true,
+            notify_finishes: true,
+            notify_gram: true,
+            muted_panes: Vec::new(),
+            registered_unix_ms: 0,
+            relay_capability: None,
+        }
+    }
+
+    fn device_owners(dir: &std::path::Path) -> Vec<(String, String)> {
+        push::devices(dir)
+            .unwrap()
+            .into_iter()
+            .map(|registered| (registered.guest_id, registered.device.device_token))
+            .collect()
+    }
+
+    #[test]
+    fn revoking_or_replacing_a_guest_deletes_its_push_devices() {
+        let dir = store::tests::TempDir::new("push-revoke");
+        let first = accept_in(&dir.0, &invite_in(&dir.0, true), 1);
+        let second = accept_in(&dir.0, &invite_in(&dir.0, true), 2);
+        let (first, second) = (
+            first["guest_id"].as_str().unwrap().to_string(),
+            second["guest_id"].as_str().unwrap().to_string(),
+        );
+        push::register(&dir.0, &first, device("aa")).unwrap();
+        push::register(&dir.0, &second, device("bb")).unwrap();
+        assert_eq!(device_owners(&dir.0).len(), 2);
+
+        revoke_at(dir.0.clone(), RevokeTarget::Guest(&first)).unwrap();
+        assert_eq!(device_owners(&dir.0), vec![(second.clone(), "bb".into())]);
+
+        // A new invite accepted on the same device replaces the old grant.
+        let replacement = accept_in(&dir.0, &invite_in(&dir.0, true), 2);
+        assert_ne!(replacement["guest_id"], second.as_str());
+        assert!(device_owners(&dir.0).is_empty());
     }
 }

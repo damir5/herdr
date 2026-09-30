@@ -139,10 +139,22 @@ pub struct GramGrabParams {
     pub grabbed_by: Option<String>,
 }
 
-/// `gram.mark_read` — the owner marks an agent->owner message read.
+/// `gram.mark_read` — the owner marks agent->owner messages read: `id`, `ids`
+/// or both. An unknown id marks nothing and answers `not_found`. A guest marks
+/// its own read state only, never the owner's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramMarkReadParams {
-    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
+}
+
+impl GramMarkReadParams {
+    /// Every id named, `id` first.
+    pub fn targets(&self) -> impl Iterator<Item = &str> {
+        self.id.iter().chain(&self.ids).map(String::as_str)
+    }
 }
 
 /// `gram.delete` — remove a message from the store for good.

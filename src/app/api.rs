@@ -1096,6 +1096,12 @@ impl App {
                 pane_id: public_pane_id,
                 workspace_id: self.public_workspace_id(update.ws_idx),
                 kind: push_kind,
+                #[cfg(unix)]
+                guest_scope: Some(crate::guest::push::GuestScope::Agent {
+                    terminal_id: pane.attached_terminal_id.to_string(),
+                    name: terminal.agent_name.clone(),
+                    kind: agent_label.to_string(),
+                }),
             });
         }
 
@@ -1502,6 +1508,9 @@ impl App {
             }
             Method::NotificationsRegisterDevice(params) => {
                 return self.handle_notifications_register_device(request.id, params);
+            }
+            Method::NotificationsUnregisterDevice(params) => {
+                return self.handle_notifications_unregister_device(request.id, params);
             }
             Method::NotificationsRegisterActivity(params) => {
                 return self.handle_notifications_register_activity(request.id, params);
@@ -1972,47 +1981,34 @@ impl App {
     ) -> String {
         use crate::api::schema::ResponseResult;
 
-        let device_token = params.device_token.trim();
-        if !is_valid_apns_device_token(device_token) {
-            return responses::encode_error(
-                id,
-                "invalid_params",
-                "device_token must be 32-200 hexadecimal characters",
-            );
-        }
-        let platform = params.platform.trim();
-        if platform.is_empty() {
-            return responses::encode_error(id, "invalid_params", "platform is empty");
-        }
-        let relay_capability = match normalize_relay_capability(params.relay_capability) {
-            Ok(capability) => capability,
+        let device = match registered_device(params) {
+            Ok(device) => device,
             Err(message) => return responses::encode_error(id, "invalid_params", message),
         };
-
         // No-session/monolithic mode has no shared device registry to persist
         // to; acknowledge without touching disk, mirroring the plugin handlers.
         if self.no_session {
             return responses::encode_success(id, ResponseResult::Ok {});
         }
-
-        // The client owns the mute set and re-sends it whole on each change;
-        // store a normalised copy (trimmed, blanks dropped, sorted, de-duplicated,
-        // count-capped) so the on-disk record is deterministic and truly bounded.
-        let muted_panes = sanitize_muted_panes(params.muted_panes);
-
-        let device = crate::persist::devices::RegisteredDevice {
-            device_token: device_token.to_string(),
-            platform: platform.to_string(),
-            notify_needs_input: params.notify_needs_input,
-            notify_dies: params.notify_dies,
-            notify_finishes: params.notify_finishes,
-            notify_gram: params.notify_gram,
-            muted_panes,
-            registered_unix_ms: unix_millis_now(),
-            relay_capability,
-        };
-
         match crate::persist::devices::upsert(device) {
+            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => responses::encode_error(id, "device_registry_save_failed", err.to_string()),
+        }
+    }
+
+    fn handle_notifications_unregister_device(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsUnregisterDeviceParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let token = params.device_token.trim();
+        // Best-effort, like unregister_activity: an unknown token is fine.
+        if self.no_session || token.is_empty() {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+        match crate::persist::devices::remove_token(token) {
             Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
             Err(err) => responses::encode_error(id, "device_registry_save_failed", err.to_string()),
         }
@@ -2152,6 +2148,37 @@ fn unix_millis_now() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Validate a `notifications.register_device` call (owner or guest) into the
+/// record to store. Errors are `invalid_params` messages.
+pub(crate) fn registered_device(
+    params: crate::api::schema::NotificationsRegisterDeviceParams,
+) -> Result<crate::persist::devices::RegisteredDevice, &'static str> {
+    let device_token = params.device_token.trim();
+    if !is_valid_apns_device_token(device_token) {
+        return Err("device_token must be 32-200 hexadecimal characters");
+    }
+    let platform = params.platform.trim();
+    if platform.is_empty() {
+        return Err("platform is empty");
+    }
+    let relay_capability = normalize_relay_capability(params.relay_capability)?;
+    Ok(crate::persist::devices::RegisteredDevice {
+        device_token: device_token.to_string(),
+        platform: platform.to_string(),
+        notify_needs_input: params.notify_needs_input,
+        notify_dies: params.notify_dies,
+        notify_finishes: params.notify_finishes,
+        notify_gram: params.notify_gram,
+        // The client owns the mute set and re-sends it whole on each change;
+        // store a normalised copy (trimmed, blanks dropped, sorted,
+        // de-duplicated, count-capped) so the record is deterministic and
+        // truly bounded.
+        muted_panes: sanitize_muted_panes(params.muted_panes),
+        registered_unix_ms: unix_millis_now(),
+        relay_capability,
+    })
 }
 
 /// An APNs device token is lower/upper hex; bound the length so a garbage

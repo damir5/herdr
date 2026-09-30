@@ -1,23 +1,31 @@
 use crate::api::schema::{
-    GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRevokeParams, Method, Request,
+    GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRevokeParams,
+    GuestUpdateParams, Method, Request,
 };
 
 const HELP: &str = "Usage:
-  herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--machine ALIAS]
+  herdr guest invite <agent> --name <name> [--owner-name NAME] [--machine-label LABEL] [--ttl SECS] [--share-gram] [--machine ALIAS]
   herdr guest list [--machine ALIAS]
+  herdr guest share-gram <guest-id> on|off [--machine ALIAS]
   herdr guest revoke <guest-or-invite-id> [--machine ALIAS]
   herdr guest log [<guest-id>] [--limit N] [--machine ALIAS]
 
 Share one named, running agent with one outside person through the HerdrUp
 guest relay. The guest can prompt it (labeled \"<name> (via HerdrUp): \") and
 watch its terminal, but cannot type into the terminal or reach any other pane.
-Invites work once and expire after 24 hours by default. --machine runs the
-command on that saved SSH machine.";
+With --share-gram (or share-gram on later) the guest also sees every Gram the
+agent sends from the moment the guest accepted, with its files. Invites work
+once and expire after 24 hours by default. --machine runs the command on that
+saved SSH machine.";
+
+/// Options that take no value.
+const FLAGS: &[&str] = &["share-gram"];
 
 pub(super) fn run_guest_command(args: &[String]) -> std::io::Result<i32> {
     let result = match args.first().map(String::as_str) {
         Some("invite") => invite(&args[1..]),
         Some("list") => list(&args[1..]),
+        Some("share-gram") => share_gram(&args[1..]),
         Some("revoke") => revoke(&args[1..]),
         Some("log") => log(&args[1..]),
         Some("help" | "--help" | "-h") => {
@@ -38,7 +46,7 @@ pub(super) fn run_guest_command(args: &[String]) -> std::io::Result<i32> {
     }
 }
 
-/// Positional arguments plus `--flag value` options.
+/// Positional arguments plus `--flag value` options and value-less [`FLAGS`].
 struct Parsed {
     positional: Vec<String>,
     options: Vec<(String, String)>,
@@ -52,6 +60,10 @@ impl Parsed {
             .find(|(key, _)| key == name)
             .map(|(_, value)| value.clone())
     }
+
+    fn flag(&self, name: &str) -> bool {
+        self.options.iter().any(|(key, _)| key == name)
+    }
 }
 
 fn parse(args: &[String], known: &[&str]) -> Result<Parsed, String> {
@@ -64,6 +76,10 @@ fn parse(args: &[String], known: &[&str]) -> Result<Parsed, String> {
         if let Some(name) = arg.strip_prefix("--") {
             if !known.contains(&name) {
                 return Err(format!("unknown option: {arg}"));
+            }
+            if FLAGS.contains(&name) {
+                parsed.options.push((name.to_string(), String::new()));
+                continue;
             }
             let value = iter
                 .next()
@@ -86,7 +102,14 @@ fn send(id: &str, method: Method) -> std::io::Result<i32> {
 fn invite(args: &[String]) -> Result<i32, String> {
     let parsed = parse(
         args,
-        &["name", "owner-name", "machine-label", "ttl", "machine"],
+        &[
+            "name",
+            "owner-name",
+            "machine-label",
+            "ttl",
+            "share-gram",
+            "machine",
+        ],
     )?;
     let [target] = parsed.positional.as_slice() else {
         return Err("invite takes exactly one agent".into());
@@ -112,6 +135,29 @@ fn invite(args: &[String]) -> Result<i32, String> {
             owner_name,
             machine_label,
             ttl_secs,
+            share_gram: parsed.flag("share-gram"),
+            machine: parsed.option("machine"),
+        }),
+    )
+    .map_err(|err| err.to_string())
+}
+
+/// Turn Gram sharing on or off for an accepted guest.
+fn share_gram(args: &[String]) -> Result<i32, String> {
+    let parsed = parse(args, &["machine"])?;
+    let [guest_id, setting] = parsed.positional.as_slice() else {
+        return Err("share-gram takes a guest id and on or off".into());
+    };
+    let share_gram = match setting.as_str() {
+        "on" => true,
+        "off" => false,
+        _ => return Err("share-gram takes on or off".into()),
+    };
+    send(
+        "cli:guest:update",
+        Method::GuestUpdate(GuestUpdateParams {
+            guest_id: guest_id.clone(),
+            share_gram,
             machine: parsed.option("machine"),
         }),
     )

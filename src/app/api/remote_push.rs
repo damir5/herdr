@@ -193,6 +193,8 @@ impl RemoteTransition {
             pane_id: self.pane_id,
             workspace_id: self.alert.workspace_id,
             kind: self.kind,
+            #[cfg(unix)]
+            guest_scope: None,
         })
     }
 }

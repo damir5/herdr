@@ -83,6 +83,8 @@ pub enum Method {
     CommandInvoke(CommandInvokeParams),
     #[serde(rename = "notifications.register_device")]
     NotificationsRegisterDevice(NotificationsRegisterDeviceParams),
+    #[serde(rename = "notifications.unregister_device")]
+    NotificationsUnregisterDevice(NotificationsUnregisterDeviceParams),
     #[serde(rename = "notifications.register_activity")]
     NotificationsRegisterActivity(NotificationsRegisterActivityParams),
     #[serde(rename = "notifications.unregister_activity")]
@@ -121,6 +123,8 @@ pub enum Method {
     GuestList(GuestListParams),
     #[serde(rename = "guest.revoke")]
     GuestRevoke(GuestRevokeParams),
+    #[serde(rename = "guest.update")]
+    GuestUpdate(GuestUpdateParams),
     #[serde(rename = "guest.audit")]
     GuestAudit(GuestAuditParams),
     /// Internal only: resolve an agent and its live-agent check for the guest gate.

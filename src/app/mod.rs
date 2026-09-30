@@ -9,6 +9,8 @@ pub(crate) mod agent_view;
 mod agents;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
+#[cfg(unix)]
+pub(crate) use api::registered_device;
 #[cfg(test)]
 pub(crate) use api::test_support::exiting_test_command;
 mod api_helpers;

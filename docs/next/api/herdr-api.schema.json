@@ -2895,15 +2895,21 @@
           "type": "object"
         },
         "GramMarkReadParams": {
-          "description": "`gram.mark_read` — the owner marks an agent->owner message read.",
+          "description": "`gram.mark_read` — the owner marks agent->owner messages read: `id`, `ids`\nor both. An unknown id marks nothing and answers `not_found`. A guest marks\nits own read state only, never the owner's.",
           "properties": {
             "id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
-          "required": [
-            "id"
-          ],
           "type": "object"
         },
         "GramPostParams": {
@@ -3148,6 +3154,11 @@
             "owner_name": {
               "type": "string"
             },
+            "share_gram": {
+              "default": false,
+              "description": "Share the agent's Gram with the guest: every Gram the agent sends from\nthe moment the guest accepts, with its files and push notifications.\nDefault: false.",
+              "type": "boolean"
+            },
             "target": {
               "description": "Agent pane id or agent name. The agent must be named, running and have a\nstable harness session.",
               "type": "string"
@@ -3204,6 +3215,29 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "GuestUpdateParams": {
+          "description": "`guest.update`: change an accepted guest's settings.",
+          "properties": {
+            "guest_id": {
+              "type": "string"
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "share_gram": {
+              "description": "Share the agent's Gram with this guest (see `guest.invite.create`).",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "guest_id",
+            "share_gram"
+          ],
           "type": "object"
         },
         "IntegrationInstallParams": {
@@ -3510,6 +3544,18 @@
           "required": [
             "device_token",
             "platform"
+          ],
+          "type": "object"
+        },
+        "NotificationsUnregisterDeviceParams": {
+          "description": "Stop pushing to a device registered with `notifications.register_device`.\nA guest removes only its own registration.",
+          "properties": {
+            "device_token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_token"
           ],
           "type": "object"
         },
@@ -6253,6 +6299,22 @@
         {
           "properties": {
             "method": {
+              "const": "notifications.unregister_device",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/NotificationsUnregisterDeviceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "notifications.register_activity",
               "type": "string"
             },
@@ -6517,6 +6579,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/GuestRevokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "guest.update",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestUpdateParams"
             }
           },
           "required": [
@@ -13068,6 +13146,21 @@
               "const": "resize",
               "description": "The guest resized the granted agent's terminal (at most once a minute).",
               "type": "string"
+            },
+            {
+              "const": "gram_list",
+              "description": "The guest listed the shared Gram (at most once a minute).",
+              "type": "string"
+            },
+            {
+              "const": "gram_read",
+              "description": "The guest marked shared Grams read (at most once a minute).",
+              "type": "string"
+            },
+            {
+              "const": "gram_file",
+              "description": "The guest opened a shared Gram's file.",
+              "type": "string"
             }
           ]
         },
@@ -13154,6 +13247,11 @@
             },
             "revoked": {
               "type": "boolean"
+            },
+            "share_gram": {
+              "default": false,
+              "description": "The guest sees the agent's Gram: every Gram the agent sent from\n`created_ms` on, with its files and push notifications.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -13193,6 +13291,11 @@
             },
             "owner_name": {
               "type": "string"
+            },
+            "share_gram": {
+              "default": false,
+              "description": "The guest will see the agent's Gram (see `guest.invite.create`).",
+              "type": "boolean"
             },
             "used_by": {
               "description": "Guest id that accepted this invite, once used.",
@@ -16396,6 +16499,23 @@
               "required": [
                 "type",
                 "closed_streams"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The guest after `guest.update`.",
+              "properties": {
+                "guest": {
+                  "$ref": "#/schemas/success_response/$defs/GuestInfo"
+                },
+                "type": {
+                  "const": "guest_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "guest"
               ],
               "type": "object"
             },

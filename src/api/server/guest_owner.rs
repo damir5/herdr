@@ -28,6 +28,7 @@ pub(super) fn maybe_handle(
         Method::GuestInviteCreate(params) => params.machine.take(),
         Method::GuestList(params) => params.machine.take(),
         Method::GuestRevoke(params) => params.machine.take(),
+        Method::GuestUpdate(params) => params.machine.take(),
         Method::GuestAudit(params) => params.machine.take(),
         _ => return None,
     };
@@ -116,6 +117,7 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
                     &params.owner_name,
                     &params.machine_label,
                     params.ttl_secs,
+                    params.share_gram,
                 )
                 .map(
                     |(invite, url, web_url)| ResponseResult::GuestInviteCreated {
@@ -143,6 +145,16 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
                 Ok(None) => Err((
                     "guest_not_found",
                     "no guest or invite with that id".to_string(),
+                )),
+                Err(err) => Err(err),
+            }
+        }
+        Method::GuestUpdate(params) => {
+            match crate::guest::update(&params.guest_id, params.share_gram) {
+                Ok(Some(guest)) => Ok(ResponseResult::GuestUpdated { guest }),
+                Ok(None) => Err((
+                    "guest_not_found",
+                    "no active guest with that id".to_string(),
                 )),
                 Err(err) => Err(err),
             }

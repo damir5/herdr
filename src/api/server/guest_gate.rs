@@ -3,9 +3,11 @@
 //! terminal takes no input (a guest may watch it, read its scrollback and,
 //! while watching, resize it for everyone viewing), and streams close with
 //! `guest_paused` when the agent leaves the foreground or `guest_revoked` on
-//! revoke.
+//! revoke. With `share_gram` the guest also reads the agent's Grams (see
+//! `crate::guest::gram`), and any guest may register a phone for the agent's
+//! push notifications (see `crate::guest::push`).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,10 +18,10 @@ use super::{
     ConnectionPrincipal, EventHub,
 };
 use crate::api::schema::{
-    AgentInfo, ErrorResponse, GramPostParams, GramUploadChunkParams, GuestAgentProbeParams,
-    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, PanePtyLeaseReleaseParams,
-    PaneReadParams, PaneSetPtySizeParams, ReadIntent, ReadSource, Request, ResponseResult,
-    SuccessResponse,
+    AgentInfo, ErrorResponse, GramGetFileChunkParams, GramGetFileParams, GramPostParams,
+    GramUploadChunkParams, GuestAgentProbeParams, GuestAuditEvent, GuestAuditFile, GuestGrantInfo,
+    Method, PanePtyLeaseReleaseParams, PaneReadParams, PaneSetPtySizeParams, ReadIntent,
+    ReadSource, Request, ResponseResult, SuccessResponse,
 };
 use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
@@ -198,28 +200,13 @@ pub(super) fn probe_target(
     }
 }
 
-fn same_kind(a: &str, b: &str) -> bool {
-    match (
-        crate::detect::parse_agent_label(a),
-        crate::detect::parse_agent_label(b),
-    ) {
-        (Some(a), Some(b)) => a == b,
-        _ => a == b,
-    }
-}
-
 /// The grant is the agent with this name and kind in this terminal, local,
 /// not archived and not being transferred. The harness session may change:
 /// a restarted agent keeps its guest.
 fn grant_matches(grant: &GuestGrantInfo, agent: &AgentInfo) -> bool {
-    grant.terminal_id == agent.terminal_id
-        && grant.agent_name.is_some()
-        && grant.agent_name == agent.name
-        && agent
-            .agent
-            .as_deref()
-            .is_some_and(|kind| same_kind(kind, grant.kind()))
-        && agent.machine_id.is_none()
+    agent.agent.as_deref().is_some_and(|kind| {
+        crate::guest::grant_names(grant, &agent.terminal_id, agent.name.as_deref(), kind)
+    }) && agent.machine_id.is_none()
         && agent.archived.is_none()
         && agent.session_transfer.is_none()
 }
@@ -705,7 +692,7 @@ pub(super) fn serve_request(
                     text: params.text,
                     to: agent.name,
                     file,
-                    from: Some(guest.label().trim_end_matches(": ").to_string()),
+                    from: Some(guest.post_from()),
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
@@ -715,7 +702,165 @@ pub(super) fn serve_request(
                 &guest_reply(&id, &response, project_gram_sent),
             )
         }
+        Method::GramList(params) if guest.share_gram => {
+            if audit_due(GuestAuditEvent::GramList, &guest.guest_id) {
+                guest.audit(GuestAuditEvent::GramList, Some(method), None, None);
+            }
+            let items = crate::persist::gram::load();
+            let reply = match crate::guest::gram::list(
+                guest,
+                &items,
+                params.limit,
+                params.before_id.as_deref(),
+            ) {
+                Ok((messages, has_more)) => success_value(
+                    &id,
+                    serde_json::json!({
+                        "type": "guest_gram_list",
+                        "messages": messages,
+                        "has_more": has_more,
+                    }),
+                ),
+                Err(message) => error_response_json(id, "invalid_params", message.into()),
+            };
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
+        Method::GramMarkRead(params) if guest.share_gram => {
+            let ids: Vec<String> = params.targets().map(str::to_string).collect();
+            if ids.is_empty() {
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &error_response_json(id, "invalid_params", "pass id or ids".into()),
+                );
+            }
+            let items = crate::persist::gram::load();
+            let visible: HashSet<&str> = items
+                .iter()
+                .filter(|item| crate::guest::gram::visible(guest, item))
+                .map(|item| item.id.as_str())
+                .collect();
+            if !ids.iter().all(|id| visible.contains(id.as_str())) {
+                return forbidden(&mut stream);
+            }
+            if audit_due(GuestAuditEvent::GramRead, &guest.guest_id) {
+                guest.audit(GuestAuditEvent::GramRead, Some(method), None, None);
+            }
+            let reply =
+                match crate::guest::gram::mark_read(&guest.dir, &guest.guest_id, &ids, &visible) {
+                    Ok(()) => success_value(&id, serde_json::json!({"type": "ok"})),
+                    Err(err) => error_response_json(id, "guest_store_failed", err.to_string()),
+                };
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
+        Method::GramGetFile(params) if guest.share_gram => {
+            if !may_fetch(guest, method, &params.id, true) {
+                return forbidden(&mut stream);
+            }
+            let request = Request {
+                id: id.clone(),
+                method: Method::GramGetFile(GramGetFileParams {
+                    id: params.id,
+                    caller_pane_id: None,
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_file),
+            )
+        }
+        Method::GramGetFileChunk(params) if guest.share_gram => {
+            // A download starts at offset 0: audit the open once, not per chunk.
+            if !may_fetch(guest, method, &params.id, params.offset == 0) {
+                return forbidden(&mut stream);
+            }
+            let request = Request {
+                id: id.clone(),
+                method: Method::GramGetFileChunk(GramGetFileChunkParams {
+                    caller_pane_id: None,
+                    ..params
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_file),
+            )
+        }
+        Method::NotificationsRegisterDevice(params) => {
+            let reply = match crate::app::registered_device(params) {
+                Err(message) => error_response_json(id.clone(), "invalid_params", message.into()),
+                Ok(device) => {
+                    match crate::guest::push::register(&guest.dir, &guest.guest_id, device) {
+                        Ok(()) => success_value(&id, serde_json::json!({"type": "ok"})),
+                        Err(err) => error_response_json(
+                            id.clone(),
+                            "device_registry_save_failed",
+                            err.to_string(),
+                        ),
+                    }
+                }
+            };
+            // Revoked while registering: the revoke already removed this
+            // guest's devices, so remove the one that landed after it.
+            if is_revoked(guest, &live) {
+                if let Err(err) = crate::guest::push::remove_guest(&guest.dir, &guest.guest_id) {
+                    tracing::warn!(err = %err, "guest push devices removal failed");
+                }
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &guest_error(&id, "guest_revoked"),
+                );
+            }
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
+        Method::NotificationsUnregisterDevice(params) => {
+            let reply = match crate::guest::push::unregister(
+                &guest.dir,
+                &guest.guest_id,
+                params.device_token.trim(),
+            ) {
+                Ok(_) => success_value(&id, serde_json::json!({"type": "ok"})),
+                Err(err) => error_response_json(id, "device_registry_save_failed", err.to_string()),
+            };
+            write_text_line_allow_disconnect(&mut stream, &reply)
+        }
         _ => forbidden(&mut stream),
+    }
+}
+
+/// Whether message `message_id` is in the guest's shared Gram. `opens`
+/// audits the guest opening its file.
+fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str, opens: bool) -> bool {
+    let Some(item) = crate::persist::gram::load()
+        .into_iter()
+        .find(|item| item.id == message_id)
+        .filter(|item| crate::guest::gram::visible(guest, item))
+    else {
+        return false;
+    };
+    if let (true, Some(file)) = (opens, item.file) {
+        guest.audit(
+            GuestAuditEvent::GramFile,
+            Some(method),
+            None,
+            Some(GuestAuditFile {
+                name: file.name,
+                size: file.size,
+                sha256: file.sha256,
+            }),
+        );
+    }
+    true
+}
+
+/// File bytes and the metadata the owner's reply carries.
+fn project_file(result: ResponseResult) -> Option<serde_json::Value> {
+    match result {
+        ResponseResult::GramFileContent { .. } | ResponseResult::GramFileChunk { .. } => {
+            serde_json::to_value(result).ok()
+        }
+        _ => None,
     }
 }
 
@@ -908,6 +1053,15 @@ mod tests {
     impl Harness {
         /// An invite to agent `index`, created through the store.
         fn invite(&self, index: usize, name: &str) -> crate::guest::store::NewInvite {
+            self.invite_with(index, name, false)
+        }
+
+        fn invite_with(
+            &self,
+            index: usize,
+            name: &str,
+            share_gram: bool,
+        ) -> crate::guest::store::NewInvite {
             let probe = probe_target(&self.api_tx, None, Some(&self.pane_ids[index]))
                 .expect("probe the granted agent");
             assert!(
@@ -928,6 +1082,7 @@ mod tests {
                 "Jerry",
                 "Jerry's Mac Studio",
                 3600,
+                share_gram,
                 now_ms(),
             )
             .unwrap()
@@ -941,7 +1096,12 @@ mod tests {
 
         /// Accept a new invite for agent `index` from the same device.
         fn admit_to(&self, index: usize) -> GuestPrincipal {
-            let invite = self.invite(index, "plotarmordev");
+            self.admit_with(index, false)
+        }
+
+        /// Accept a new invite for agent `index` with Gram sharing on or off.
+        fn admit_with(&self, index: usize, share_gram: bool) -> GuestPrincipal {
+            let invite = self.invite_with(index, "plotarmordev", share_gram);
             let hello = json!({"v": 1, "invite_id": invite.record.invite_id, "secret": invite.secret, "device": "iPhone"});
             match admit_in(self.dir.0.clone(), [4; 32], &hello) {
                 Admission::Admitted { principal, .. } => principal,

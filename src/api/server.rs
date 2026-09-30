@@ -2188,6 +2188,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::ReleaseNotesDismiss(_) => "release_notes.dismiss",
         Method::CommandInvoke(_) => "command.invoke",
         Method::NotificationsRegisterDevice(_) => "notifications.register_device",
+        Method::NotificationsUnregisterDevice(_) => "notifications.unregister_device",
         Method::NotificationsRegisterActivity(_) => "notifications.register_activity",
         Method::NotificationsUnregisterActivity(_) => "notifications.unregister_activity",
         Method::NotificationsStatus(_) => "notifications.status",
@@ -2205,6 +2206,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::GuestInviteCreate(_) => "guest.invite.create",
         Method::GuestList(_) => "guest.list",
         Method::GuestRevoke(_) => "guest.revoke",
+        Method::GuestUpdate(_) => "guest.update",
         Method::GuestAudit(_) => "guest.audit",
         #[cfg(unix)]
         Method::GuestAgentProbe(_) => "guest.agent_probe",
@@ -4397,6 +4399,7 @@ mod federation_tests {
             ("server.reload_agent_manifests", Denied),
             ("notification.show", Denied),
             ("notifications.register_device", Denied),
+            ("notifications.unregister_device", Denied),
             ("notifications.register_activity", Denied),
             ("notifications.unregister_activity", Denied),
             ("notifications.status", Denied),
@@ -4414,6 +4417,7 @@ mod federation_tests {
             ("guest.invite.create", Denied),
             ("guest.list", Denied),
             ("guest.revoke", Denied),
+            ("guest.update", Denied),
             ("guest.audit", Denied),
             ("guest.agent_probe", Denied),
             ("client.window_title.set", Denied),
@@ -4746,6 +4750,7 @@ mod federation_tests {
     fn admin_federation_peers_are_forbidden_every_guest_method() {
         use crate::api::schema::{
             GuestAuditParams, GuestInviteCreateParams, GuestListParams, GuestRevokeParams,
+            GuestUpdateParams,
         };
         let mut fed = start_federation(one_peer("adm", CapabilityTier::Admin));
         for method in [
@@ -4755,12 +4760,18 @@ mod federation_tests {
                 owner_name: "Jerry".into(),
                 machine_label: "Mac".into(),
                 ttl_secs: None,
+                share_gram: true,
                 machine: None,
             }),
             Method::GuestList(GuestListParams::default()),
             Method::GuestRevoke(GuestRevokeParams {
                 guest_id: Some("g".into()),
                 ..Default::default()
+            }),
+            Method::GuestUpdate(GuestUpdateParams {
+                guest_id: "g".into(),
+                share_gram: true,
+                machine: None,
             }),
             Method::GuestAudit(GuestAuditParams::default()),
         ] {

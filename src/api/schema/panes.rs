@@ -342,6 +342,11 @@ pub struct PaneSetPtySizeParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(range(min = 1, max = 86_400_000))]
     pub ttl_ms: Option<u64>,
+    /// Internal: refuse `lock:true` unless this viewer has a `pane.stream` open
+    /// on the pane (the guest gate).
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) require_stream: bool,
 }
 
 /// Internal: the viewer whose width leases to drop.

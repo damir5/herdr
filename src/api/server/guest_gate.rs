@@ -1,8 +1,9 @@
 //! Guest principal gate: an explicit allowlist bound to one agent grant.
 //! Everything else answers `guest_forbidden`. Prompts are labeled, the
-//! terminal takes no input (a guest may watch it, read its scrollback and
-//! resize it for everyone viewing), and streams close with `guest_paused`
-//! when the agent leaves the foreground or `guest_revoked` on revoke.
+//! terminal takes no input (a guest may watch it, read its scrollback and,
+//! while watching, resize it for everyone viewing), and streams close with
+//! `guest_paused` when the agent leaves the foreground or `guest_revoked` on
+//! revoke.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -67,9 +68,9 @@ fn guest_viewer_id(guest_id: &str) -> String {
     format!("guest:{guest_id}")
 }
 
-/// Drop the guest's width lease now, for a revoke: its streams close on
-/// their own, but a lease taken outside a stream would last its TTL.
-pub(super) fn release_lease(api_tx: &ApiRequestSender, guest_id: &str) {
+/// Drop the guest's width lease now, for a resize that landed after a revoke:
+/// its streams close on their own, but only at their next watch.
+fn release_lease(api_tx: &ApiRequestSender, guest_id: &str) {
     dispatch_to_app_with_timeout(
         Request {
             id: "guest:release".into(),
@@ -562,6 +563,8 @@ pub(super) fn serve_request(
             if audit_due(GuestAuditEvent::Resize, &guest.guest_id) {
                 guest.audit(GuestAuditEvent::Resize, Some(method), None, None);
             }
+            // Only while one of the guest's streams watches the grant: the lease
+            // then ends with the guest's last stream, and a revoke closes those.
             let request = Request {
                 id: id.clone(),
                 method: Method::PaneSetPtySize(PaneSetPtySizeParams {
@@ -575,10 +578,19 @@ pub(super) fn serve_request(
                             .unwrap_or(RESIZE_DEFAULT_TTL_MS)
                             .clamp(*RESIZE_TTL_MS.start(), *RESIZE_TTL_MS.end()),
                     ),
+                    require_stream: true,
                     ..params
                 }),
             };
             let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            // Revoked while the resize was in flight: take its lease back now.
+            if is_revoked(guest, &live) {
+                release_lease(api_tx, &guest.guest_id);
+                return write_text_line_allow_disconnect(
+                    &mut stream,
+                    &guest_error(&id, "guest_revoked"),
+                );
+            }
             write_text_line_allow_disconnect(
                 &mut stream,
                 &guest_reply(&id, &response, project_pty_size),
@@ -770,6 +782,9 @@ mod tests {
         pty: std_mpsc::Receiver<(usize, bytes::Bytes)>,
         pane_ids: Vec<String>,
         dir: TempDir,
+        /// Runs once on the app thread just before it applies the next
+        /// `pane.set_pty_size`.
+        before_resize: Arc<Mutex<Option<Control>>>,
         thread: Option<JoinHandle<()>>,
     }
 
@@ -789,6 +804,8 @@ mod tests {
         let (ids_tx, ids_rx) = std_mpsc::channel();
         let running = Arc::new(AtomicBool::new(true));
         let app_running = Arc::clone(&running);
+        let before_resize: Arc<Mutex<Option<Control>>> = Arc::default();
+        let app_before_resize = Arc::clone(&before_resize);
         let thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(1)
@@ -858,6 +875,15 @@ mod tests {
                         app.handle_deferred_agent_api_request(message.request, message.respond_to);
                     }
                     Ok(message) => {
+                        if matches!(message.request.method, Method::PaneSetPtySize(_)) {
+                            let hook = app_before_resize
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .take();
+                            if let Some(hook) = hook {
+                                hook(&mut app);
+                            }
+                        }
                         let response = app.handle_api_request(message.request);
                         let _ = message.respond_to.send(response);
                     }
@@ -874,6 +900,7 @@ mod tests {
             pty: pty_rx,
             pane_ids,
             dir: TempDir::new(tag),
+            before_resize,
             thread: Some(thread),
         }
     }
@@ -1530,6 +1557,7 @@ mod tests {
         let guest = harness.admit();
         let viewer = format!("guest:{}", guest.guest_id);
         let pane = harness.pane_ids[0].as_str();
+        let _stream = open_stream(&harness, &guest);
 
         let lines = harness.call(
             &guest,
@@ -1673,45 +1701,72 @@ mod tests {
     }
 
     #[test]
-    fn an_owner_revoke_drops_a_lease_taken_outside_any_stream() {
-        let _config = ConfigHome::new("resize-revoke");
-        let mut harness = start("resize-revoke");
-        harness.dir = TempDir(crate::guest::store::guest_dir());
+    fn a_resize_needs_one_of_the_guests_streams_open() {
+        let harness = start("resize-stream");
         let guest = harness.admit();
-        let resize = set_pty_size("llm-opt", 120, 40, json!({"ttl_ms": 60_000}));
-        assert_eq!(code(&harness.call(&guest, resize)), "<success>");
-        assert_eq!(harness.pty(0).1.len(), 1);
+        let resize = set_pty_size("llm-opt", 120, 40, json!({}));
+        let lines = harness.call(&guest, resize.clone());
+        assert_eq!(code(&lines), "guest_no_stream", "{lines:?}");
+        assert_eq!(harness.pty(0), ((80, 24), Vec::new()));
+        let release = harness.call(
+            &guest,
+            set_pty_size("llm-opt", 80, 24, json!({"lock": false})),
+        );
+        assert_eq!(code(&release), "<success>", "{release:?}");
 
-        let (client, server) = UnixStream::pair().unwrap();
-        let mut stream = ApiStream::Local(crate::ipc::LocalStream::from(
-            interprocess::os::unix::uds_local_socket::Stream::from(server),
-        ));
-        let mut request: Request = serde_json::from_value(
-            json!({"id": "r", "method": "guest.revoke", "params": {"guest_id": guest.guest_id}}),
-        )
-        .unwrap();
-        super::super::guest_owner::maybe_handle(
-            &mut stream,
-            &mut request,
-            &HashMap::new(),
-            &harness.api_tx,
-            &harness.running,
-            false,
-        )
-        .expect("an owner guest RPC")
-        .unwrap();
-        drop(stream);
-        let mut reply = String::new();
-        BufReader::new(client).read_line(&mut reply).unwrap();
-        let reply: Value = serde_json::from_str(&reply).unwrap();
-        assert_eq!(reply["result"]["type"], "guest_revoked", "{reply}");
+        let (reader, handle) = open_stream(&harness, &guest);
+        assert_eq!(code(&harness.call(&guest, resize.clone())), "<success>");
+        drop(reader);
+        handle.join().unwrap();
+        wait_for_no_lease(&harness, 0);
+        let lines = harness.call(&guest, resize);
+        assert_eq!(code(&lines), "guest_no_stream", "{lines:?}");
         assert!(harness.pty(0).1.is_empty(), "{:?}", harness.pty(0));
+    }
+
+    #[test]
+    fn the_lease_lasts_until_the_guests_last_stream_closes() {
+        let harness = start("resize-streams");
+        let guest = harness.admit();
+        let (old_reader, old_handle) = open_stream(&harness, &guest);
+        let (new_reader, new_handle) = open_stream(&harness, &guest);
+        let resize = set_pty_size("llm-opt", 120, 40, json!({}));
+        assert_eq!(code(&harness.call(&guest, resize)), "<success>");
+        // The app remounted its view: the old stream closes, the new one watches.
+        drop(old_reader);
+        old_handle.join().unwrap();
+        let (size, leases) = harness.pty(0);
+        assert_eq!((size, leases.len()), ((120, 40), 1), "{leases:?}");
+        drop(new_reader);
+        new_handle.join().unwrap();
+        assert!(harness.pty(0).1.is_empty(), "{:?}", harness.pty(0));
+    }
+
+    #[test]
+    fn a_resize_that_lands_after_a_revoke_is_taken_back() {
+        let harness = start("resize-revoked");
+        let guest = harness.admit();
+        let (mut reader, handle) = open_stream(&harness, &guest);
+        let (dir, guest_id) = (harness.dir.0.clone(), guest.guest_id.clone());
+        *harness
+            .before_resize
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some(Box::new(move |_: &mut App| {
+                crate::guest::revoke_at(dir, RevokeTarget::Guest(&guest_id)).unwrap();
+            }));
+        let lines = harness.call(&guest, set_pty_size("llm-opt", 120, 40, json!({})));
+        assert_eq!(code(&lines), "guest_revoked", "{lines:?}");
+        assert!(harness.pty(0).1.is_empty(), "{:?}", harness.pty(0));
+        assert_eq!(stream_end(&mut reader)["error"]["code"], "guest_revoked");
+        handle.join().unwrap();
     }
 
     #[test]
     fn resizes_are_audited_once_a_minute_apart_from_reads() {
         let harness = start("resize-audit");
         let guest = harness.admit();
+        let _stream = open_stream(&harness, &guest);
         for cols in [100, 110, 120] {
             let lines = harness.call(&guest, set_pty_size("llm-opt", cols, 30, json!({})));
             assert_eq!(code(&lines), "<success>", "{lines:?}");

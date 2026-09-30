@@ -795,8 +795,8 @@ pub type ViewerId = String;
 /// One viewer's requested PTY geometry for a pane, kept alive while the viewer is
 /// attached. [`AppState::effective_pty_size`] arbitrates the widest active lease
 /// and applies its FULL geometry. A lease is dropped by explicit release
-/// (`pane.set_pty_size` with `lock:false`), by its viewer's `pane.stream`
-/// closing, or by the TTL backstop swept on the tick.
+/// (`pane.set_pty_size` with `lock:false`), by its viewer's last open
+/// `pane.stream` closing, or by the TTL backstop swept on the tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WidthLease {
     pub cols: u16,
@@ -848,7 +848,7 @@ pub struct AppState {
     /// Per-viewer width leases owned by API `pane.set_pty_size` callers, keyed by
     /// terminal then by [`ViewerId`]. The effective winsize is the widest active
     /// lease's full geometry (see [`AppState::effective_pty_size`]); a lease dies
-    /// when its viewer's `pane.stream` closes (primary) or its TTL elapses
+    /// when its viewer's last `pane.stream` closes (primary) or its TTL elapses
     /// (backstop). Tracked separately from `direct_attach_resize_locks` so the
     /// two ownership sources cannot clear each other (a direct attach client
     /// connecting/disconnecting must not drop an API lease, and vice versa).
@@ -860,6 +860,12 @@ pub struct AppState {
     /// terminal; swept alongside lease TTL expiry off the render path.
     pub pty_pending_shrinks:
         std::collections::HashMap<crate::terminal::TerminalId, PtyPendingShrink>,
+    /// Open `pane.stream`s that carry a viewer id, keyed by the pane id each was
+    /// opened with and its viewer: the terminal it attached to and how many
+    /// such streams are open. A viewer's lease drops when its LAST stream
+    /// closes, so an overlapping reconnect does not drop it.
+    pub(crate) pty_stream_viewers:
+        std::collections::HashMap<(String, ViewerId), (crate::terminal::TerminalId, usize)>,
     pub(crate) pane_id_aliases: std::collections::HashMap<u32, PaneId>,
     pub(crate) public_pane_id_aliases: std::collections::HashMap<String, PaneId>,
     pub workspaces: Vec<Workspace>,
@@ -1062,6 +1068,48 @@ impl AppState {
         removed
     }
 
+    /// Count one more `pane.stream` open for `viewer` on `pane_id` (the id the
+    /// stream was opened with), attached to `terminal_id`.
+    pub(crate) fn open_stream_viewer(
+        &mut self,
+        pane_id: &str,
+        viewer: &str,
+        terminal_id: crate::terminal::TerminalId,
+    ) {
+        self.pty_stream_viewers
+            .entry((pane_id.to_string(), viewer.to_string()))
+            .or_insert((terminal_id, 0))
+            .1 += 1;
+    }
+
+    /// Count one `pane.stream` closed for `viewer` on `pane_id`. Returns true
+    /// when it was the viewer's last stream there (or none was counted).
+    pub(crate) fn close_stream_viewer(&mut self, pane_id: &str, viewer: &str) -> bool {
+        let key = (pane_id.to_string(), viewer.to_string());
+        let Some((_, open)) = self.pty_stream_viewers.get_mut(&key) else {
+            return true;
+        };
+        *open -= 1;
+        if *open > 0 {
+            return false;
+        }
+        self.pty_stream_viewers.remove(&key);
+        true
+    }
+
+    /// Whether `viewer` has a `pane.stream` open on this terminal.
+    pub(crate) fn has_stream_viewer(
+        &self,
+        terminal_id: &crate::terminal::TerminalId,
+        viewer: &str,
+    ) -> bool {
+        self.pty_stream_viewers
+            .iter()
+            .any(|((_, open_viewer), (open_terminal, _))| {
+                open_viewer == viewer && open_terminal == terminal_id
+            })
+    }
+
     /// The width arbiter: among a terminal's non-expired leases, return the
     /// widest (max cols) lease's FULL geometry WHOLESALE as
     /// `(rows, cols, cell_width_px, cell_height_px)` — never a mixed synthesis.
@@ -1209,6 +1257,7 @@ impl AppState {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pty_width_leases: std::collections::HashMap::new(),
+            pty_stream_viewers: std::collections::HashMap::new(),
             pty_pending_shrinks: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),

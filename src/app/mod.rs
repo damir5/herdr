@@ -492,6 +492,7 @@ impl App {
             terminals: std::collections::HashMap::new(),
             direct_attach_resize_locks: std::collections::HashSet::new(),
             pty_width_leases: std::collections::HashMap::new(),
+            pty_stream_viewers: std::collections::HashMap::new(),
             pty_pending_shrinks: std::collections::HashMap::new(),
             pane_id_aliases: std::collections::HashMap::new(),
             public_pane_id_aliases: std::collections::HashMap::new(),

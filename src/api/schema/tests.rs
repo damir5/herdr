@@ -641,6 +641,7 @@ fn pane_set_pty_size_request_and_response_round_trip() {
             lock: true,
             viewer_id: Some("viewer-a".into()),
             ttl_ms: Some(60_000),
+            require_stream: false,
         }),
     };
     let json = serde_json::to_value(&request).unwrap();

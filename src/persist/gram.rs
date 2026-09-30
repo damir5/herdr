@@ -131,6 +131,22 @@ pub struct GramItem {
     /// older build. See issue #98.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub origin_id: String,
+    /// The local pane's terminal and agent kind that sent an `agent_to_owner`
+    /// message, resolved server-side from its `caller_pane_id`. `None` for
+    /// relayed or remote messages, sends without a caller pane, and records
+    /// from older builds. Guests see an agent's Grams only through this, never
+    /// by the `from` name alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sender: Option<GramSender>,
+}
+
+/// Who sent a local agent's gram: its terminal's public id and the agent kind
+/// running there at the time (for example `claude`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GramSender {
+    pub terminal_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
 }
 
 impl GramItem {
@@ -367,6 +383,7 @@ mod tests {
             read_by_owner: false,
             file: None,
             origin_id: String::new(),
+            sender: None,
         }
     }
 

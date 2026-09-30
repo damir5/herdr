@@ -18,7 +18,11 @@ const READ_FILE: &str = "gram-read.json";
 /// Read marks per guest id.
 type ReadMarks = BTreeMap<String, BTreeSet<String>>;
 
-/// Whether `item` is in the guest's shared Gram.
+/// Whether `item` is in the guest's shared Gram: a Gram the granted agent
+/// itself sent (see [`super::grant_sent`]), or the guest's own post to it,
+/// created since the guest accepted. It does not depend on the agent running
+/// now: what qualifies is fixed by who sent it, so history stays readable
+/// while the grant is paused and nothing new can qualify meanwhile.
 pub(crate) fn visible(guest: &GuestPrincipal, item: &GramItem) -> bool {
     let Some(agent) = guest.grant.agent_name.as_deref() else {
         return false;
@@ -27,7 +31,9 @@ pub(crate) fn visible(guest: &GuestPrincipal, item: &GramItem) -> bool {
         return false;
     }
     match item.direction {
-        GramDirection::AgentToOwner => item.from == agent,
+        GramDirection::AgentToOwner => {
+            super::grant_sent(&guest.grant, &item.from, item.sender.as_ref())
+        }
         GramDirection::OwnerToAgent => {
             item.to.as_deref() == Some(agent) && item.from == guest.post_from()
         }

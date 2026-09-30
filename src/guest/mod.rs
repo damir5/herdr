@@ -64,7 +64,6 @@ pub struct GuestPrincipal {
     pub(crate) dir: PathBuf,
     /// When the guest accepted: it sees the agent's Grams from here on.
     pub(crate) created_ms: u64,
-    pub(crate) share_gram: bool,
 }
 
 impl GuestPrincipal {
@@ -76,8 +75,13 @@ impl GuestPrincipal {
             grant: record.grant.clone(),
             dir,
             created_ms: record.created_ms,
-            share_gram: record.share_gram,
         }
+    }
+
+    /// Whether the guest shares the agent's Gram now. Read from the store on
+    /// every call, so `guest.update` applies to sessions already admitted.
+    pub(crate) fn shares_gram(&self) -> bool {
+        store::shares_gram(&self.dir, &self.guest_id)
     }
 
     /// `<name> (via HerdrUp): `, prefixed to every prompt.
@@ -137,6 +141,23 @@ pub(crate) fn grant_names(
         && grant.agent_name.is_some()
         && grant.agent_name.as_deref() == name
         && same_kind(kind, grant.kind())
+}
+
+/// A Gram to the owner came from the granted agent: sent from its terminal,
+/// by an agent of its kind, under its name. A Gram with no recorded local
+/// sender (relayed, remote, sent without a pane, or older) never qualifies,
+/// whatever its `from` says.
+pub(crate) fn grant_sent(
+    grant: &GuestGrantInfo,
+    from: &str,
+    sender: Option<&crate::persist::gram::GramSender>,
+) -> bool {
+    sender.is_some_and(|sender| {
+        sender
+            .agent
+            .as_deref()
+            .is_some_and(|kind| grant_names(grant, &sender.terminal_id, Some(from), kind))
+    })
 }
 
 // Short-lived per-connection value; the contract shape stays unboxed.
@@ -655,21 +676,17 @@ mod tests {
         let reply = accept_in(&dir.0, &invite_in(&dir.0, false), 2);
         assert_eq!(reply["features"], json!({"gram": false, "push": true}));
         let guest_id = reply["guest_id"].as_str().unwrap();
-        let returning = |device: u8| match admit_in(dir.0.clone(), [device; 32], &json!({"v": 1})) {
-            Admission::Admitted { reply, principal } => (reply, principal),
+        let returning = || match admit_in(dir.0.clone(), [2; 32], &json!({"v": 1})) {
+            Admission::Admitted { reply, .. } => reply,
             Admission::Refused(error) => panic!("refused: {error}"),
         };
 
         let updated = update_at(&dir.0, guest_id, true).unwrap().unwrap();
         assert!(updated.share_gram);
-        let (reply, principal) = returning(2);
-        assert_eq!(reply["features"], json!({"gram": true, "push": true}));
-        assert!(principal.share_gram);
+        assert_eq!(returning()["features"], json!({"gram": true, "push": true}));
 
         update_at(&dir.0, guest_id, false).unwrap().unwrap();
-        let (reply, principal) = returning(2);
-        assert_eq!(reply["features"]["gram"], false);
-        assert!(!principal.share_gram);
+        assert_eq!(returning()["features"]["gram"], false);
 
         revoke_at(dir.0.clone(), RevokeTarget::Guest(guest_id)).unwrap();
         assert!(update_at(&dir.0, guest_id, true).unwrap().is_none());

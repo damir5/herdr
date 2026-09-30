@@ -44,11 +44,12 @@ const RESIZE_ROWS: std::ops::RangeInclusive<u16> = 5..=300;
 const RESIZE_TTL_MS: std::ops::RangeInclusive<u64> = 1_000..=60_000;
 const RESIZE_DEFAULT_TTL_MS: u64 = 30_000;
 
-/// When each guest's last throttled event was audited.
+/// When each throttled event was last audited, per key (a guest id, or a
+/// guest id and Gram id for file opens).
 static AUDITED: Mutex<Vec<(GuestAuditEvent, String, Instant)>> = Mutex::new(Vec::new());
 
-/// Whether this guest's `event` should be audited now; records it if so.
-fn audit_due(event: GuestAuditEvent, guest_id: &str) -> bool {
+/// Whether `event` for `key` should be audited now; records it if so.
+fn audit_due(event: GuestAuditEvent, key: &str) -> bool {
     let now = Instant::now();
     let mut audited = AUDITED
         .lock()
@@ -56,11 +57,11 @@ fn audit_due(event: GuestAuditEvent, guest_id: &str) -> bool {
     audited.retain(|(_, _, at)| now.duration_since(*at) < AUDIT_INTERVAL);
     if audited
         .iter()
-        .any(|(seen, id, _)| *seen == event && id == guest_id)
+        .any(|(seen, seen_key, _)| *seen == event && seen_key == key)
     {
         return false;
     }
-    audited.push((event, guest_id.to_string(), now));
+    audited.push((event, key.to_string(), now));
     true
 }
 
@@ -702,7 +703,7 @@ pub(super) fn serve_request(
                 &guest_reply(&id, &response, project_gram_sent),
             )
         }
-        Method::GramList(params) if guest.share_gram => {
+        Method::GramList(params) if guest.shares_gram() => {
             if audit_due(GuestAuditEvent::GramList, &guest.guest_id) {
                 guest.audit(GuestAuditEvent::GramList, Some(method), None, None);
             }
@@ -725,7 +726,7 @@ pub(super) fn serve_request(
             };
             write_text_line_allow_disconnect(&mut stream, &reply)
         }
-        Method::GramMarkRead(params) if guest.share_gram => {
+        Method::GramMarkRead(params) if guest.shares_gram() => {
             let ids: Vec<String> = params.targets().map(str::to_string).collect();
             if ids.is_empty() {
                 return write_text_line_allow_disconnect(
@@ -752,8 +753,8 @@ pub(super) fn serve_request(
                 };
             write_text_line_allow_disconnect(&mut stream, &reply)
         }
-        Method::GramGetFile(params) if guest.share_gram => {
-            if !may_fetch(guest, method, &params.id, true) {
+        Method::GramGetFile(params) if guest.shares_gram() => {
+            if !may_fetch(guest, method, &params.id) {
                 return forbidden(&mut stream);
             }
             let request = Request {
@@ -769,9 +770,8 @@ pub(super) fn serve_request(
                 &guest_reply(&id, &response, project_file),
             )
         }
-        Method::GramGetFileChunk(params) if guest.share_gram => {
-            // A download starts at offset 0: audit the open once, not per chunk.
-            if !may_fetch(guest, method, &params.id, params.offset == 0) {
+        Method::GramGetFileChunk(params) if guest.shares_gram() => {
+            if !may_fetch(guest, method, &params.id) {
                 return forbidden(&mut stream);
             }
             let request = Request {
@@ -829,9 +829,10 @@ pub(super) fn serve_request(
     }
 }
 
-/// Whether message `message_id` is in the guest's shared Gram. `opens`
-/// audits the guest opening its file.
-fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str, opens: bool) -> bool {
+/// Whether message `message_id` is in the guest's shared Gram. The first
+/// fetch of its file, at whatever offset, is audited as the guest opening it;
+/// further fetches of the same file within [`AUDIT_INTERVAL`] are not.
+fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str) -> bool {
     let Some(item) = crate::persist::gram::load()
         .into_iter()
         .find(|item| item.id == message_id)
@@ -839,7 +840,11 @@ fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str, opens: bool
     else {
         return false;
     };
-    if let (true, Some(file)) = (opens, item.file) {
+    let key = format!("{}\0{message_id}", guest.guest_id);
+    if let Some(file) = item
+        .file
+        .filter(|_| audit_due(GuestAuditEvent::GramFile, &key))
+    {
         guest.audit(
             GuestAuditEvent::GramFile,
             Some(method),
@@ -2391,19 +2396,36 @@ mod tests {
         .unwrap()
     }
 
-    /// An agent's Gram to the owner; returns its id.
-    fn send_gram(harness: &Harness, from: &str, text: &str) -> String {
-        let sent = owner(
-            harness,
-            json!({"id": "s", "method": "gram.send", "params": {"text": text, "from": from}}),
-        );
+    /// The pane an agent of the harness runs in, by name.
+    fn pane_of(harness: &Harness, agent: &str) -> Option<String> {
+        let index = ["llm-opt", "other-agent"]
+            .iter()
+            .position(|name| *name == agent)?;
+        Some(harness.pane_ids[index].clone())
+    }
+
+    fn sent_id(sent: &Value) -> String {
         sent["result"]["message"]["id"]
             .as_str()
             .unwrap_or_else(|| panic!("sent: {sent}"))
             .to_string()
     }
 
-    /// An agent's Gram carrying a file holding `hello`; returns its id.
+    /// A Gram to the owner labeled `from`, sent from `pane` as `herdr gram send`
+    /// in that pane would (no pane: sent from outside any pane); returns its id.
+    fn send_gram_as(harness: &Harness, pane: Option<String>, from: &str, text: &str) -> String {
+        sent_id(&owner(
+            harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": text, "from": from, "caller_pane_id": pane}}),
+        ))
+    }
+
+    /// An agent's Gram to the owner from its own pane; returns its id.
+    fn send_gram(harness: &Harness, from: &str, text: &str) -> String {
+        send_gram_as(harness, pane_of(harness, from), from, text)
+    }
+
+    /// An agent's Gram from its pane carrying a file holding `hello`.
     fn send_file(harness: &Harness, from: &str, name: &str) -> String {
         let upload = format!("up-{name}");
         let staged = owner(
@@ -2411,22 +2433,10 @@ mod tests {
             json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": upload, "offset": 0, "data_base64": "aGVsbG8="}}),
         );
         assert_eq!(staged["result"]["type"], "ok", "{staged}");
-        let sent = owner(
+        sent_id(&owner(
             harness,
-            json!({"id": "s", "method": "gram.send", "params": {"text": "", "from": from, "file": {"upload_id": upload, "name": name, "mime": "text/plain"}}}),
-        );
-        sent["result"]["message"]["id"]
-            .as_str()
-            .unwrap_or_else(|| panic!("sent: {sent}"))
-            .to_string()
-    }
-
-    /// The guest again, as its next session is admitted.
-    fn returning(harness: &Harness) -> GuestPrincipal {
-        match admit_in(harness.dir.0.clone(), [4; 32], &json!({"v": 1})) {
-            Admission::Admitted { principal, .. } => principal,
-            Admission::Refused(error) => panic!("refused: {error}"),
-        }
+            json!({"id": "s", "method": "gram.send", "params": {"text": "", "from": from, "caller_pane_id": pane_of(harness, from), "file": {"upload_id": upload, "name": name, "mime": "text/plain"}}}),
+        ))
     }
 
     fn guest_list(harness: &Harness, guest: &GuestPrincipal, params: Value) -> Value {
@@ -2458,6 +2468,43 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[test]
+    fn grams_named_like_the_agent_but_sent_by_another_are_hidden() {
+        let _config = ConfigHome::new("gram-impostor");
+        let harness = start("gram-impostor");
+        let guest = harness.admit_with(0, true);
+        let other_pane = pane_of(&harness, "other-agent");
+        let elsewhere = send_gram_as(&harness, other_pane, "llm-opt", "same name, other pane");
+        let no_pane = send_gram_as(&harness, None, "llm-opt", "same name, no pane");
+        // What a Gram relayed from another machine's `llm-opt` stores.
+        crate::persist::gram::append(crate::persist::gram::GramItem {
+            id: "relay-remote".into(),
+            direction: crate::persist::gram::GramDirection::AgentToOwner,
+            from: "llm-opt".into(),
+            to: None,
+            text: "same name, relayed".into(),
+            grabbed_by: None,
+            grabbed_unix_ms: None,
+            created_unix_ms: now_ms(),
+            read_by_owner: false,
+            file: None,
+            origin_id: String::new(),
+            sender: None,
+        })
+        .unwrap();
+        send_gram(&harness, "llm-opt", "the granted agent");
+
+        let result = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&result), ["the granted agent"]);
+        for id in [elsewhere.as_str(), no_pane.as_str(), "relay-remote"] {
+            let lines = harness.call(
+                &guest,
+                json!({"id": "m", "method": "gram.mark_read", "params": {"ids": [id]}}),
+            );
+            assert_eq!(code(&lines), "guest_forbidden", "{id}");
+        }
     }
 
     #[test]
@@ -2518,21 +2565,31 @@ mod tests {
         let harness = start("gram-share");
         let guest = harness.admit();
         let id = send_file(&harness, "llm-opt", "notes.txt");
-        for request in [
+        let requests = [
             json!({"id": "d", "method": "gram.list", "params": {}}),
             json!({"id": "d", "method": "gram.mark_read", "params": {"ids": [id]}}),
             json!({"id": "d", "method": "gram.get_file", "params": {"id": id}}),
             json!({"id": "d", "method": "gram.get_file_chunk", "params": {"id": id, "offset": 0}}),
-        ] {
+        ];
+        for request in &requests {
             let lines = harness.call(&guest, request.clone());
             assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
         }
+        // The owner's change applies to the session already admitted.
         crate::guest::update_at(&guest.dir, &guest.guest_id, true)
             .unwrap()
             .unwrap();
-        let guest = returning(&harness);
-        let result = guest_list(&harness, &guest, json!({}));
-        assert_eq!(result["messages"][0]["id"], id.as_str(), "{result}");
+        for request in &requests {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "<success>", "{request} -> {lines:?}");
+        }
+        crate::guest::update_at(&guest.dir, &guest.guest_id, false)
+            .unwrap()
+            .unwrap();
+        for request in &requests {
+            let lines = harness.call(&guest, request.clone());
+            assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
+        }
     }
 
     #[test]
@@ -2543,7 +2600,15 @@ mod tests {
         std::thread::sleep(Duration::from_millis(5));
         let guest = harness.admit_with(0, true);
         let visible = send_file(&harness, "llm-opt", "notes.txt");
+        let second = send_file(&harness, "llm-opt", "second.txt");
         let other = send_file(&harness, "other-agent", "other.txt");
+
+        // A download resumed mid-file is still an open.
+        let resumed = harness.call(
+            &guest,
+            json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": second, "offset": 3}}),
+        );
+        assert_eq!(resumed[0]["result"]["data_base64"], "bG8=", "{resumed:?}");
 
         let chunk = harness.call(
             &guest,
@@ -2573,15 +2638,15 @@ mod tests {
                 assert_eq!(code(&lines), "guest_forbidden", "{request} -> {lines:?}");
             }
         }
-        let opens: Vec<_> = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 100)
-            .unwrap()
-            .into_iter()
-            .filter(|entry| entry.event == GuestAuditEvent::GramFile)
-            .collect();
-        assert_eq!(opens.len(), 2, "one per download start: {opens:?}");
-        assert!(opens
-            .iter()
-            .all(|entry| entry.file.as_ref().unwrap().name == "notes.txt"));
+        let mut opened: Vec<String> =
+            crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|entry| entry.event == GuestAuditEvent::GramFile)
+                .map(|entry| entry.file.unwrap().name)
+                .collect();
+        opened.sort();
+        assert_eq!(opened, ["notes.txt", "second.txt"], "one per file opened");
     }
 
     #[test]
@@ -2698,10 +2763,11 @@ mod tests {
         }
     }
 
-    /// Both agents need input and both send a Gram; every alert the app
-    /// dispatches.
+    /// Both agents need input and send a Gram from their panes, and the other
+    /// agent sends one more labeled `llm-opt`; every alert the app dispatches.
     fn both_agents_alert(harness: &Harness) -> Vec<crate::push::PushNotification> {
         let (done_tx, done_rx) = std_mpsc::channel();
+        let panes = harness.pane_ids.clone();
         harness
             .control
             .send(Box::new(move |app: &mut App| {
@@ -2720,9 +2786,13 @@ mod tests {
                         observed_at: Instant::now(),
                     });
                 }
-                for from in ["llm-opt", "other-agent"] {
+                for (pane, from) in [
+                    (&panes[0], "llm-opt"),
+                    (&panes[1], "other-agent"),
+                    (&panes[1], "llm-opt"),
+                ] {
                     let request: Request = serde_json::from_value(
-                        json!({"id": "s", "method": "gram.send", "params": {"text": "done", "from": from}}),
+                        json!({"id": "s", "method": "gram.send", "params": {"text": "done", "from": from, "caller_pane_id": pane}}),
                     )
                     .unwrap();
                     app.handle_api_request(request);

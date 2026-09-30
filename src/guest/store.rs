@@ -408,6 +408,17 @@ pub(crate) fn update_grant_session(
     })
 }
 
+/// Whether an active guest shares the agent's Gram. False for a revoked or
+/// unknown guest, or when the store cannot be read.
+pub(crate) fn shares_gram(dir: &Path, guest_id: &str) -> bool {
+    load_store(dir).is_ok_and(|store| {
+        store
+            .guests
+            .iter()
+            .any(|guest| guest.guest_id == guest_id && !guest.revoked && guest.share_gram)
+    })
+}
+
 pub(crate) fn is_revoked(dir: &Path, guest_id: &str) -> bool {
     load_store(dir).map_or(true, |store| {
         store

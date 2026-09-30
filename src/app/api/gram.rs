@@ -228,6 +228,8 @@ impl App {
                     read_by_owner: false,
                     file,
                     origin_id: store_id.clone(),
+                    // Relayed from another machine: never a local agent's Gram.
+                    sender: None,
                 };
                 match crate::persist::gram::append(item.clone()) {
                     Ok(_) => {
@@ -303,6 +305,10 @@ impl App {
             Ok(file) => file,
             Err(err) => return err,
         };
+        let sender = params
+            .caller_pane_id
+            .as_deref()
+            .and_then(|pane| self.caller_sender(pane));
         let item = GramItem {
             id: message_id,
             direction: StoredDirection::AgentToOwner,
@@ -315,6 +321,7 @@ impl App {
             read_by_owner: false,
             file,
             origin_id: store_id.clone(),
+            sender,
         };
 
         match crate::persist::gram::append(item.clone()) {
@@ -388,6 +395,7 @@ impl App {
             read_by_owner: true,
             file,
             origin_id: store_id.clone(),
+            sender: None,
         };
 
         match crate::persist::gram::append(item.clone()) {
@@ -895,6 +903,18 @@ impl App {
             .or_else(|| self.public_pane_id(ws_idx, pane_id))
     }
 
+    /// The terminal and agent kind behind a caller pane, recorded on the Gram
+    /// it sends so a guest's view follows the agent, not a reusable name.
+    fn caller_sender(&self, caller_pane_id: &str) -> Option<crate::persist::gram::GramSender> {
+        let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
+        let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+        let terminal = self.state.terminals.get(terminal_id)?;
+        Some(crate::persist::gram::GramSender {
+            terminal_id: terminal_id.to_string(),
+            agent: terminal.effective_agent_label().map(str::to_string),
+        })
+    }
+
     /// Whether some live terminal has this exact unique agent name. Used to reject
     /// a direct `gram.post` to a nonexistent agent instead of black-holing it.
     fn is_live_agent_name(&self, name: &str) -> bool {
@@ -960,6 +980,7 @@ impl App {
             #[cfg(unix)]
             guest_scope: Some(crate::guest::push::GuestScope::Gram {
                 from: item.from.clone(),
+                sender: item.sender.clone(),
                 gram_id: item.id.clone(),
             }),
         };
@@ -1286,6 +1307,7 @@ mod tests {
             read_by_owner: true,
             file: None,
             origin_id: "machine_test".to_string(),
+            sender: None,
         }
     }
 

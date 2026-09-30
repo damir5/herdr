@@ -31,8 +31,12 @@ pub(crate) enum GuestScope {
         name: Option<String>,
         kind: String,
     },
-    /// A new Gram to the owner from this sender.
-    Gram { from: String, gram_id: String },
+    /// A new Gram to the owner, with its `from` label and recorded sender.
+    Gram {
+        from: String,
+        sender: Option<crate::persist::gram::GramSender>,
+        gram_id: String,
+    },
 }
 
 /// One guest's registered device.
@@ -116,8 +120,8 @@ fn reaches(scope: &GuestScope, guest: &GuestRecord) -> bool {
             name,
             kind,
         } => super::grant_names(&guest.grant, terminal_id, name.as_deref(), kind),
-        GuestScope::Gram { from, .. } => {
-            guest.share_gram && guest.grant.agent_name.as_deref() == Some(from.as_str())
+        GuestScope::Gram { from, sender, .. } => {
+            guest.share_gram && super::grant_sent(&guest.grant, from, sender.as_ref())
         }
     }
 }

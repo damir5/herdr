@@ -1248,6 +1248,9 @@ fn handle_connection(
 }
 
 /// Who is on the other end of one API connection.
+// One per connection and moved, not stored; the guest variant stays unboxed
+// like `crate::guest::Admission`.
+#[allow(clippy::large_enum_variant)]
 pub(crate) enum ConnectionPrincipal {
     /// The local socket or an SSH bridge to it: the owner.
     Owner,

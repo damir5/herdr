@@ -344,6 +344,12 @@ pub struct PaneSetPtySizeParams {
     pub ttl_ms: Option<u64>,
 }
 
+/// Internal: the viewer whose width leases to drop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct PanePtyLeaseReleaseParams {
+    pub viewer_id: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]
 pub struct PaneListParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]

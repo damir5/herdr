@@ -149,6 +149,8 @@ pub enum GuestAuditEvent {
     Resumed,
     /// The guest read the granted agent's scrollback (at most once a minute).
     Read,
+    /// The guest resized the granted agent's terminal (at most once a minute).
+    Resize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]

@@ -1739,6 +1739,9 @@ impl App {
             Method::PaneStreamClose(params) => {
                 return self.handle_pane_stream_close(request.id, params);
             }
+            Method::PanePtyLeaseRelease(params) => {
+                return self.handle_pane_pty_lease_release(request.id, params);
+            }
             Method::PaneInputStream(_) => {
                 return responses::encode_error(
                     request.id,

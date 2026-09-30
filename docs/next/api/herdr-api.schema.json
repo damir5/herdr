@@ -13063,6 +13063,11 @@
               "const": "read",
               "description": "The guest read the granted agent's scrollback (at most once a minute).",
               "type": "string"
+            },
+            {
+              "const": "resize",
+              "description": "The guest resized the granted agent's terminal (at most once a minute).",
+              "type": "string"
             }
           ]
         },

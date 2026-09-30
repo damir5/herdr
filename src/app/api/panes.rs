@@ -1004,6 +1004,32 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    /// Internal: drop one viewer's width lease wherever it holds one, with the
+    /// same debounced shrink as that viewer's `pane.stream` closing.
+    pub(super) fn handle_pane_pty_lease_release(
+        &mut self,
+        id: String,
+        params: crate::api::schema::PanePtyLeaseReleaseParams,
+    ) -> String {
+        let released: std::collections::HashSet<_> = self
+            .state
+            .pty_width_leases
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter(|terminal_id| {
+                self.state
+                    .remove_pty_width_lease(terminal_id, &params.viewer_id)
+            })
+            .collect();
+        let now = std::time::Instant::now();
+        for (ws_idx, pane_id, terminal_id) in self.state.pane_locations_for_terminals(&released) {
+            self.reconcile_pty_lease_size(ws_idx, pane_id, &terminal_id, now, false);
+        }
+        encode_success(id, ResponseResult::Ok {})
+    }
+
     /// Open handshake for the persistent `pane.input.stream` write channel
     /// (issue #62). Unlike the output stream there is no ring or registry to
     /// attach: each frame is dispatched through the normal `pane.send_input`

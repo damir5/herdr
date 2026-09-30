@@ -1,8 +1,8 @@
 //! Guest principal gate: an explicit allowlist bound to one agent grant.
 //! Everything else answers `guest_forbidden`. Prompts are labeled, the
-//! terminal is view-only (a guest may watch it and read its scrollback), and
-//! streams close with `guest_paused` when the agent leaves the foreground or
-//! `guest_revoked` on revoke.
+//! terminal takes no input (a guest may watch it, read its scrollback and
+//! resize it for everyone viewing), and streams close with `guest_paused`
+//! when the agent leaves the foreground or `guest_revoked` on revoke.
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
@@ -16,8 +16,9 @@ use super::{
 };
 use crate::api::schema::{
     AgentInfo, ErrorResponse, GramPostParams, GramUploadChunkParams, GuestAgentProbeParams,
-    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, PaneReadParams, ReadIntent,
-    ReadSource, Request, ResponseResult, SuccessResponse,
+    GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method, PanePtyLeaseReleaseParams,
+    PaneReadParams, PaneSetPtySizeParams, ReadIntent, ReadSource, Request, ResponseResult,
+    SuccessResponse,
 };
 use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
@@ -29,25 +30,56 @@ pub(super) const WATCH_INTERVAL: Duration = Duration::from_millis(250);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Most scrollback lines one guest `agent.read` returns.
 const READ_MAX_LINES: u32 = 1000;
-/// A guest's reads are audited at most once per interval: the app reads the
-/// scrollback again on every stream reseed and reconnect.
-const READ_AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+/// A guest's reads and resizes are audited at most once per interval: the app
+/// reads the scrollback again on every stream reseed and reconnect, and
+/// resizes on every rotation or layout change.
+const AUDIT_INTERVAL: Duration = Duration::from_secs(60);
+/// Bounds of a guest's terminal size and width-lease TTL. The TTL is the
+/// backstop when the guest vanishes without closing its stream.
+const RESIZE_COLS: std::ops::RangeInclusive<u16> = 20..=500;
+const RESIZE_ROWS: std::ops::RangeInclusive<u16> = 5..=300;
+const RESIZE_TTL_MS: std::ops::RangeInclusive<u64> = 1_000..=60_000;
+const RESIZE_DEFAULT_TTL_MS: u64 = 30_000;
 
-/// When each guest's last `read` was audited.
-static READ_AUDITED: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+/// When each guest's last throttled event was audited.
+static AUDITED: Mutex<Vec<(GuestAuditEvent, String, Instant)>> = Mutex::new(Vec::new());
 
-/// Whether this guest's read should be audited now; records it if so.
-fn read_audit_due(guest_id: &str) -> bool {
+/// Whether this guest's `event` should be audited now; records it if so.
+fn audit_due(event: GuestAuditEvent, guest_id: &str) -> bool {
     let now = Instant::now();
-    let mut audited = READ_AUDITED
+    let mut audited = AUDITED
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    audited.retain(|(_, at)| now.duration_since(*at) < READ_AUDIT_INTERVAL);
-    if audited.iter().any(|(id, _)| id == guest_id) {
+    audited.retain(|(_, _, at)| now.duration_since(*at) < AUDIT_INTERVAL);
+    if audited
+        .iter()
+        .any(|(seen, id, _)| *seen == event && id == guest_id)
+    {
         return false;
     }
-    audited.push((guest_id.to_string(), now));
+    audited.push((event, guest_id.to_string(), now));
     true
+}
+
+/// The viewer a guest's width lease and stream are tied to, whatever viewer
+/// id the guest sent, so its stream closing drops its lease.
+fn guest_viewer_id(guest_id: &str) -> String {
+    format!("guest:{guest_id}")
+}
+
+/// Drop the guest's width lease now, for a revoke: its streams close on
+/// their own, but a lease taken outside a stream would last its TTL.
+pub(super) fn release_lease(api_tx: &ApiRequestSender, guest_id: &str) {
+    dispatch_to_app_with_timeout(
+        Request {
+            id: "guest:release".into(),
+            method: Method::PanePtyLeaseRelease(PanePtyLeaseReleaseParams {
+                viewer_id: guest_viewer_id(guest_id),
+            }),
+        },
+        api_tx,
+        Some(PROBE_TIMEOUT),
+    );
 }
 
 #[derive(Clone)]
@@ -388,6 +420,26 @@ fn project_read(result: ResponseResult) -> Option<serde_json::Value> {
     }))
 }
 
+/// The size in effect, the same fields the owner's `pane.set_pty_size` returns.
+fn project_pty_size(result: ResponseResult) -> Option<serde_json::Value> {
+    let ResponseResult::PanePtySize {
+        pane_id,
+        cols,
+        rows,
+        locked,
+    } = result
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "type": "pane_pty_size",
+        "pane_id": pane_id,
+        "cols": cols,
+        "rows": rows,
+        "locked": locked,
+    }))
+}
+
 fn project_gram_sent(result: ResponseResult) -> Option<serde_json::Value> {
     let ResponseResult::GramSent { message, .. } = result else {
         return None;
@@ -476,7 +528,7 @@ pub(super) fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
-            if read_audit_due(&guest.guest_id) {
+            if audit_due(GuestAuditEvent::Read, &guest.guest_id) {
                 guest.audit(GuestAuditEvent::Read, Some(method), None, None);
             }
             // A passive pane read of the grant: the snapshot only, never the
@@ -498,6 +550,40 @@ pub(super) fn serve_request(
                 &guest_reply(&id, &response, project_read),
             )
         }
+        Method::PaneSetPtySize(params) => {
+            let state = grant_state(guest, api_tx);
+            let target = params.pane_id.as_deref().unwrap_or_default();
+            if !names_grant(target, guest, state.pane_id()) {
+                return forbidden(&mut stream);
+            }
+            let GrantState::Live(agent) = state else {
+                return paused(&mut stream);
+            };
+            if audit_due(GuestAuditEvent::Resize, &guest.guest_id) {
+                guest.audit(GuestAuditEvent::Resize, Some(method), None, None);
+            }
+            let request = Request {
+                id: id.clone(),
+                method: Method::PaneSetPtySize(PaneSetPtySizeParams {
+                    pane_id: Some(agent.pane_id),
+                    cols: params.cols.clamp(*RESIZE_COLS.start(), *RESIZE_COLS.end()),
+                    rows: params.rows.clamp(*RESIZE_ROWS.start(), *RESIZE_ROWS.end()),
+                    viewer_id: Some(guest_viewer_id(&guest.guest_id)),
+                    ttl_ms: Some(
+                        params
+                            .ttl_ms
+                            .unwrap_or(RESIZE_DEFAULT_TTL_MS)
+                            .clamp(*RESIZE_TTL_MS.start(), *RESIZE_TTL_MS.end()),
+                    ),
+                    ..params
+                }),
+            };
+            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            write_text_line_allow_disconnect(
+                &mut stream,
+                &guest_reply(&id, &response, project_pty_size),
+            )
+        }
         Method::PaneStream(mut params) => {
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.pane_id, guest, state.pane_id()) {
@@ -506,9 +592,10 @@ pub(super) fn serve_request(
             let GrantState::Live(agent) = state else {
                 return paused(&mut stream);
             };
-            // View-only: no viewer id, so no width lease and no resize path.
+            // The guest's own viewer, so this stream closing (paused, revoked or
+            // gone) drops the width lease its `pane.set_pty_size` took.
             params.pane_id = agent.pane_id;
-            params.viewer_id = None;
+            params.viewer_id = Some(guest_viewer_id(&guest.guest_id));
             // Asked before every frame: the live revoke flag and a fresh grant
             // probe each time; the store at most every WATCH_INTERVAL.
             let mut last_store_check = Instant::now();
@@ -671,6 +758,7 @@ mod tests {
     use crate::guest::{admit_in, Admission};
 
     type Control = Box<dyn FnOnce(&mut App) + Send>;
+    type PtyView = ((u16, u16), Vec<(String, u16, u16, Duration)>);
 
     /// A real `App` on its own thread with two named agents: the granted
     /// `llm-opt` and `other-agent` on another pane.
@@ -944,6 +1032,35 @@ mod tests {
                 }))
                 .unwrap();
         }
+
+        /// Agent `index`'s PTY size as (cols, rows) and the width leases on
+        /// its terminal as (viewer, cols, rows, time left).
+        fn pty(&self, index: usize) -> PtyView {
+            let (done_tx, done_rx) = std_mpsc::channel();
+            self.control
+                .send(Box::new(move |app: &mut App| {
+                    let workspace = &app.state.workspaces[index];
+                    let pane = workspace.tabs[0].root_pane;
+                    let terminal_id = &workspace.tabs[0].panes[&pane].attached_terminal_id;
+                    let (rows, cols) = workspace.test_runtimes[&pane].current_size();
+                    let now = Instant::now();
+                    let mut leases: Vec<_> = app
+                        .state
+                        .pty_width_leases
+                        .get(terminal_id)
+                        .into_iter()
+                        .flatten()
+                        .map(|(viewer, lease)| {
+                            let left = lease.expires_at.saturating_duration_since(now);
+                            (viewer.clone(), lease.cols, lease.rows, left)
+                        })
+                        .collect();
+                    leases.sort();
+                    let _ = done_tx.send(((cols, rows), leases));
+                }))
+                .unwrap();
+            done_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+        }
     }
 
     fn kind_label(kind: crate::detect::Agent) -> &'static str {
@@ -1050,7 +1167,7 @@ mod tests {
             json!({"id": "d", "method": "pane.send_text", "params": {"pane_id": pane, "text": "rm -rf /"}}),
             json!({"id": "d", "method": "pane.send_keys", "params": {"pane_id": pane, "keys": ["enter"]}}),
             json!({"id": "d", "method": "pane.send_input", "params": {"pane_id": pane, "text": "x"}}),
-            json!({"id": "d", "method": "pane.set_pty_size", "params": {"pane_id": pane, "cols": 20, "rows": 5}}),
+            json!({"id": "d", "method": "pane.resize", "params": {"pane_id": pane, "direction": "right"}}),
             json!({"id": "d", "method": "pane.input.stream", "params": {"pane_id": pane}}),
             json!({"id": "d", "method": "gram.list", "params": {}}),
             json!({"id": "d", "method": "gram.get_file", "params": {"id": "gram-1"}}),
@@ -1396,6 +1513,229 @@ mod tests {
         crate::api::output_registry::lookup(&harness.pane_ids[0])
             .expect("the granted pane has a live output ring")
             .append(b"owner-only output\r\n");
+    }
+
+    fn set_pty_size(target: &str, cols: u16, rows: u16, extra: Value) -> Value {
+        let mut params = json!({"pane_id": target, "cols": cols, "rows": rows, "lock": true});
+        params
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        json!({"id": "z", "method": "pane.set_pty_size", "params": params})
+    }
+
+    #[test]
+    fn a_guest_resizes_the_granted_terminal_under_its_own_clamped_lease() {
+        let harness = start("resize");
+        let guest = harness.admit();
+        let viewer = format!("guest:{}", guest.guest_id);
+        let pane = harness.pane_ids[0].as_str();
+
+        let lines = harness.call(
+            &guest,
+            set_pty_size(
+                "llm-opt",
+                1000,
+                1,
+                json!({"viewer_id": "owner-mac", "ttl_ms": 999_999_999u64, "cell_width_px": 9, "cell_height_px": 18}),
+            ),
+        );
+        assert_eq!(
+            lines,
+            vec![
+                json!({"id": "z", "result": {"type": "pane_pty_size", "pane_id": pane, "cols": 500, "rows": 5, "locked": true}})
+            ]
+        );
+        let ((cols, rows), leases) = harness.pty(0);
+        assert_eq!((cols, rows), (500, 5));
+        assert_eq!(leases.len(), 1, "{leases:?}");
+        let (lease_viewer, lease_cols, lease_rows, left) = &leases[0];
+        assert_eq!(
+            lease_viewer, &viewer,
+            "the guest's viewer, not the one it sent"
+        );
+        assert_eq!((*lease_cols, *lease_rows), (500, 5));
+        assert!(
+            *left <= Duration::from_secs(60) && *left > Duration::from_secs(50),
+            "{left:?}"
+        );
+
+        // Every target naming the grant; the lower clamps and the TTL floor.
+        for target in [guest.grant.terminal_id.as_str(), pane] {
+            let lines = harness.call(&guest, set_pty_size(target, 3, 1000, json!({"ttl_ms": 1})));
+            assert_eq!(lines[0]["result"]["cols"], 20, "{lines:?}");
+            assert_eq!(lines[0]["result"]["rows"], 300, "{lines:?}");
+            let (size, leases) = harness.pty(0);
+            assert_eq!(size, (20, 300));
+            assert_eq!(leases.len(), 1, "one lease, replaced: {leases:?}");
+            assert_eq!((leases[0].1, leases[0].2), (20, 300));
+            assert!(
+                leases[0].3 <= Duration::from_secs(1) && leases[0].3 > Duration::from_millis(500),
+                "{leases:?}"
+            );
+        }
+
+        // No TTL: the default.
+        harness.call(&guest, set_pty_size("llm-opt", 100, 30, json!({})));
+        let (_, leases) = harness.pty(0);
+        assert!(
+            leases[0].3 <= Duration::from_secs(30) && leases[0].3 > Duration::from_secs(25),
+            "{leases:?}"
+        );
+
+        // Release: the guest's lease goes, whatever viewer it names.
+        let lines = harness.call(
+            &guest,
+            set_pty_size(
+                "llm-opt",
+                90,
+                28,
+                json!({"lock": false, "viewer_id": "owner-mac"}),
+            ),
+        );
+        assert_eq!(lines[0]["result"]["locked"], false, "{lines:?}");
+        assert_eq!(harness.pty(0), ((90, 28), Vec::new()));
+        assert_eq!(harness.pty(1), ((80, 24), Vec::new()));
+    }
+
+    #[test]
+    fn pane_set_pty_size_is_bound_to_a_live_grant() {
+        let harness = start("resize-forged");
+        let guest = harness.admit();
+        let other = harness.pane_ids[1].clone();
+        for target in [
+            other.clone(),
+            "other-agent".to_string(),
+            format!("studio/{}", harness.pane_ids[0]),
+            format!("studio/{}", guest.grant.terminal_id),
+            "studio/llm-opt".to_string(),
+            "w99:p99".to_string(),
+        ] {
+            let lines = harness.call(&guest, set_pty_size(&target, 40, 10, json!({})));
+            assert_eq!(code(&lines), "guest_forbidden", "{target} -> {lines:?}");
+        }
+        let no_target = harness.call(
+            &guest,
+            json!({"id": "z", "method": "pane.set_pty_size", "params": {"cols": 40, "rows": 10, "lock": true}}),
+        );
+        assert_eq!(code(&no_target), "guest_forbidden", "{no_target:?}");
+        assert_eq!(harness.pty(0), ((80, 24), Vec::new()));
+        assert_eq!(harness.pty(1), ((80, 24), Vec::new()));
+
+        harness.agent_exits();
+        for lock in [true, false] {
+            let lines = harness.call(
+                &guest,
+                set_pty_size("llm-opt", 40, 10, json!({"lock": lock})),
+            );
+            assert_eq!(code(&lines), "guest_paused", "lock {lock}: {lines:?}");
+        }
+        assert_eq!(harness.pty(0), ((80, 24), Vec::new()));
+    }
+
+    /// Poll until agent `index` holds no width lease.
+    fn wait_for_no_lease(harness: &Harness, index: usize) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !harness.pty(index).1.is_empty() {
+            assert!(Instant::now() < deadline, "{:?}", harness.pty(index));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    #[test]
+    fn the_guests_lease_ends_with_its_stream_or_its_revoke() {
+        let harness = start("resize-lease");
+        let guest = harness.admit();
+        let resize = set_pty_size(
+            "llm-opt",
+            120,
+            40,
+            json!({"viewer_id": "v", "ttl_ms": 60_000}),
+        );
+
+        // The app closing its stream (it went away) drops the lease.
+        let (reader, handle) = open_stream(&harness, &guest);
+        assert_eq!(code(&harness.call(&guest, resize.clone())), "<success>");
+        assert_eq!(harness.pty(0).1.len(), 1);
+        drop(reader);
+        handle.join().unwrap();
+        wait_for_no_lease(&harness, 0);
+
+        // A revoke closes the stream, which drops the lease.
+        let (mut reader, handle) = open_stream(&harness, &guest);
+        assert_eq!(code(&harness.call(&guest, resize)), "<success>");
+        assert_eq!(harness.pty(0).1.len(), 1);
+        crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+            .unwrap();
+        assert_eq!(stream_end(&mut reader)["error"]["code"], "guest_revoked");
+        handle.join().unwrap();
+        assert!(harness.pty(0).1.is_empty(), "{:?}", harness.pty(0));
+    }
+
+    #[test]
+    fn an_owner_revoke_drops_a_lease_taken_outside_any_stream() {
+        let _config = ConfigHome::new("resize-revoke");
+        let mut harness = start("resize-revoke");
+        harness.dir = TempDir(crate::guest::store::guest_dir());
+        let guest = harness.admit();
+        let resize = set_pty_size("llm-opt", 120, 40, json!({"ttl_ms": 60_000}));
+        assert_eq!(code(&harness.call(&guest, resize)), "<success>");
+        assert_eq!(harness.pty(0).1.len(), 1);
+
+        let (client, server) = UnixStream::pair().unwrap();
+        let mut stream = ApiStream::Local(crate::ipc::LocalStream::from(
+            interprocess::os::unix::uds_local_socket::Stream::from(server),
+        ));
+        let mut request: Request = serde_json::from_value(
+            json!({"id": "r", "method": "guest.revoke", "params": {"guest_id": guest.guest_id}}),
+        )
+        .unwrap();
+        super::super::guest_owner::maybe_handle(
+            &mut stream,
+            &mut request,
+            &HashMap::new(),
+            &harness.api_tx,
+            &harness.running,
+            false,
+        )
+        .expect("an owner guest RPC")
+        .unwrap();
+        drop(stream);
+        let mut reply = String::new();
+        BufReader::new(client).read_line(&mut reply).unwrap();
+        let reply: Value = serde_json::from_str(&reply).unwrap();
+        assert_eq!(reply["result"]["type"], "guest_revoked", "{reply}");
+        assert!(harness.pty(0).1.is_empty(), "{:?}", harness.pty(0));
+    }
+
+    #[test]
+    fn resizes_are_audited_once_a_minute_apart_from_reads() {
+        let harness = start("resize-audit");
+        let guest = harness.admit();
+        for cols in [100, 110, 120] {
+            let lines = harness.call(&guest, set_pty_size("llm-opt", cols, 30, json!({})));
+            assert_eq!(code(&lines), "<success>", "{lines:?}");
+        }
+        assert_eq!(
+            code(&harness.call(&guest, read("llm-opt", 80))),
+            "<success>"
+        );
+        let audit = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 50).unwrap();
+        let resizes: Vec<_> = audit
+            .iter()
+            .filter(|entry| entry.event == GuestAuditEvent::Resize)
+            .collect();
+        assert_eq!(resizes.len(), 1, "{audit:?}");
+        assert_eq!(resizes[0].method.as_deref(), Some("pane.set_pty_size"));
+        assert_eq!(resizes[0].text, None);
+        assert_eq!(
+            audit
+                .iter()
+                .filter(|entry| entry.event == GuestAuditEvent::Read)
+                .count(),
+            1,
+            "a read after a resize is still audited: {audit:?}"
+        );
     }
 
     #[test]

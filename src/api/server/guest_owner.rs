@@ -135,11 +135,16 @@ fn handle_local(request: &Request, api_tx: &ApiRequestSender) -> String {
         }
         Method::GuestRevoke(params) => {
             match crate::guest::revoke(params.guest_id.as_deref(), params.invite_id.as_deref()) {
-                Ok(Some(closed_streams)) => Ok(ResponseResult::GuestRevoked {
-                    guest_id: params.guest_id.clone(),
-                    invite_id: params.invite_id.clone(),
-                    closed_streams,
-                }),
+                Ok(Some(closed_streams)) => {
+                    if let Some(guest_id) = &params.guest_id {
+                        super::guest_gate::release_lease(api_tx, guest_id);
+                    }
+                    Ok(ResponseResult::GuestRevoked {
+                        guest_id: params.guest_id.clone(),
+                        invite_id: params.invite_id.clone(),
+                        closed_streams,
+                    })
+                }
                 Ok(None) => Err((
                     "guest_not_found",
                     "no guest or invite with that id".to_string(),

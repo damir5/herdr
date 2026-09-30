@@ -1029,6 +1029,7 @@ impl App {
         encode_success(id, ResponseResult::Ok {})
     }
 
+    #[cfg(unix)]
     /// Internal: drop one viewer's width lease wherever it holds one, with the
     /// same debounced shrink as that viewer's `pane.stream` closing.
     pub(super) fn handle_pane_pty_lease_release(

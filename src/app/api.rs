@@ -1739,6 +1739,7 @@ impl App {
             Method::PaneStreamClose(params) => {
                 return self.handle_pane_stream_close(request.id, params);
             }
+            #[cfg(unix)]
             Method::PanePtyLeaseRelease(params) => {
                 return self.handle_pane_pty_lease_release(request.id, params);
             }

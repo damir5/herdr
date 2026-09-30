@@ -349,7 +349,8 @@ pub struct PaneSetPtySizeParams {
     pub(crate) require_stream: bool,
 }
 
-/// Internal: the viewer whose width leases to drop.
+/// Internal: the viewer whose width leases to drop (guest gate, unix-only).
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PanePtyLeaseReleaseParams {
     pub viewer_id: String,

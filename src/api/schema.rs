@@ -313,7 +313,9 @@ pub enum Method {
     #[schemars(skip)]
     PaneStreamClose(PaneStreamParams),
     /// Internal only: drop one viewer's width lease on every pane, as its
-    /// `pane.stream` closing would (the guest gate, on revoke).
+    /// `pane.stream` closing would (the guest gate, on revoke). Unix-only, like
+    /// the guest gate that is its only sender.
+    #[cfg(unix)]
     #[serde(skip)]
     #[schemars(skip)]
     PanePtyLeaseRelease(PanePtyLeaseReleaseParams),

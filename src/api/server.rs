@@ -2296,6 +2296,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneStream(_) => "pane.stream",
         Method::PaneStreamOpen(_) => "pane.stream.open",
         Method::PaneStreamClose(_) => "pane.stream.close",
+        #[cfg(unix)]
         Method::PanePtyLeaseRelease(_) => "pane.pty_lease.release",
         Method::PaneInputStream(_) => "pane.input.stream",
         Method::PaneInputStreamOpen(_) => "pane.input.stream.open",

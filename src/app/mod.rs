@@ -9,10 +9,10 @@ pub(crate) mod agent_view;
 mod agents;
 pub(crate) use agents::{AGENT_START_SETTLE_DELAY, MAX_AGENT_START_TIMEOUT};
 mod api;
-#[cfg(unix)]
-pub(crate) use api::registered_device;
 #[cfg(test)]
 pub(crate) use api::test_support::exiting_test_command;
+#[cfg(unix)]
+pub(crate) use api::{gram_push_notification, registered_device};
 mod api_helpers;
 pub(crate) use api_helpers::limit_snapshot_lines;
 // Claude config-home layout, shared with the CLI so `herdr accounts prepare` writes the

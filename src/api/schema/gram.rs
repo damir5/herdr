@@ -238,6 +238,21 @@ pub enum GramRelayCall {
     UploadChunk(GramUploadChunkParams),
     GetFileChunk(GramGetFileChunkParams),
     Delete(GramDeleteParams),
+    /// A HerdrUp guest's post to an agent on the relaying machine.
+    Post(GramRelayPostParams),
+}
+
+/// A HerdrUp guest's post relayed by the machine that serves the guest: `to`
+/// must name one of that machine's agents, and the message is labeled
+/// `<guest> (via HerdrUp)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayPostParams {
+    pub text: String,
+    pub to: String,
+    /// The guest's name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`.
+    pub guest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
 }
 /// File attached to a gram message, as returned to clients. Metadata only — fetch
 /// the bytes with `gram.get_file`.

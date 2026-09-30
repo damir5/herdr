@@ -19,12 +19,14 @@ use super::{
 };
 use crate::api::schema::{
     AgentInfo, ErrorResponse, GramGetFileChunkParams, GramGetFileParams, GramPostParams,
-    GramUploadChunkParams, GuestAgentProbeParams, GuestAuditEvent, GuestAuditFile, GuestGrantInfo,
-    Method, PanePtyLeaseReleaseParams, PaneReadParams, PaneSetPtySizeParams, ReadIntent,
-    ReadSource, Request, ResponseResult, SuccessResponse,
+    GramRelayCall, GramRelayParams, GramRelayPostParams, GramUploadChunkParams,
+    GuestAgentProbeParams, GuestAuditEvent, GuestAuditFile, GuestGrantInfo, Method,
+    PanePtyLeaseReleaseParams, PaneReadParams, PaneSetPtySizeParams, ReadIntent, ReadSource,
+    Request, ResponseResult, SuccessResponse,
 };
 use crate::api::transport::ApiStream;
 use crate::guest::GuestPrincipal;
+use crate::persist::gram::GramItem;
 
 /// Prompt text cap, before the label is prefixed.
 const PROMPT_MAX_BYTES: usize = 32 * 1024;
@@ -672,7 +674,10 @@ pub(super) fn serve_request(
                     ..params
                 }),
             };
-            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            // On a Gram-relay remote the post goes to the coordinator, where
+            // the agent reads its Gram, so its upload is staged there too.
+            let response = crate::api::reverse::forward_relay(&request)
+                .unwrap_or_else(|| dispatch_to_app_with_timeout(request, api_tx, None));
             write_text_line_allow_disconnect(&mut stream, &guest_reply(&id, &response, project_ok))
         }
         Method::GramPost(params) => {
@@ -687,16 +692,40 @@ pub(super) fn serve_request(
                 file.upload_id = guest_upload_id(guest, &file.upload_id);
                 file
             });
-            let request = Request {
+            // On a Gram-relay remote the agent reads the coordinator's Gram:
+            // post there, and keep the guest's own copy here.
+            let relayed = Request {
                 id: id.clone(),
-                method: Method::GramPost(GramPostParams {
-                    text: params.text,
-                    to: agent.name,
-                    file,
-                    from: Some(guest.post_from()),
+                method: Method::GramRelay(GramRelayParams {
+                    peer_alias: String::new(),
+                    call: GramRelayCall::Post(GramRelayPostParams {
+                        text: params.text.clone(),
+                        to: agent.name.clone().unwrap_or_default(),
+                        guest: guest.name.clone(),
+                        file: file.clone(),
+                    }),
                 }),
             };
-            let response = dispatch_to_app_with_timeout(request, api_tx, None);
+            let response = match crate::api::reverse::forward_relay(&relayed) {
+                Some(response) => {
+                    if guest.shares_gram() {
+                        mirror_relayed(&guest.dir, &response, &agent.pane_id, None);
+                    }
+                    response
+                }
+                None => {
+                    let request = Request {
+                        id: id.clone(),
+                        method: Method::GramPost(GramPostParams {
+                            text: params.text,
+                            to: agent.name,
+                            file,
+                            from: Some(guest.post_from()),
+                        }),
+                    };
+                    dispatch_to_app_with_timeout(request, api_tx, None)
+                }
+            };
             audit_post(guest, method, text, &response);
             write_text_line_allow_disconnect(
                 &mut stream,
@@ -707,7 +736,7 @@ pub(super) fn serve_request(
             if audit_due(GuestAuditEvent::GramList, &guest.guest_id) {
                 guest.audit(GuestAuditEvent::GramList, Some(method), None, None);
             }
-            let items = crate::persist::gram::load();
+            let items = crate::guest::gram::items(guest);
             let reply = match crate::guest::gram::list(
                 guest,
                 &items,
@@ -734,7 +763,7 @@ pub(super) fn serve_request(
                     &error_response_json(id, "invalid_params", "pass id or ids".into()),
                 );
             }
-            let items = crate::persist::gram::load();
+            let items = crate::guest::gram::items(guest);
             let visible: HashSet<&str> = items
                 .iter()
                 .filter(|item| crate::guest::gram::visible(guest, item))
@@ -754,8 +783,11 @@ pub(super) fn serve_request(
             write_text_line_allow_disconnect(&mut stream, &reply)
         }
         Method::GramGetFile(params) if guest.shares_gram() => {
-            if !may_fetch(guest, method, &params.id) {
+            let Some(item) = may_fetch(guest, method, &params.id) else {
                 return forbidden(&mut stream);
+            };
+            if let Some(reply) = mirrored_file(guest, &id, &item, None) {
+                return write_text_line_allow_disconnect(&mut stream, &reply);
             }
             let request = Request {
                 id: id.clone(),
@@ -771,8 +803,11 @@ pub(super) fn serve_request(
             )
         }
         Method::GramGetFileChunk(params) if guest.shares_gram() => {
-            if !may_fetch(guest, method, &params.id) {
+            let Some(item) = may_fetch(guest, method, &params.id) else {
                 return forbidden(&mut stream);
+            };
+            if let Some(reply) = mirrored_file(guest, &id, &item, Some(params.offset)) {
+                return write_text_line_allow_disconnect(&mut stream, &reply);
             }
             let request = Request {
                 id: id.clone(),
@@ -829,20 +864,18 @@ pub(super) fn serve_request(
     }
 }
 
-/// Whether message `message_id` is in the guest's shared Gram. The first
+/// Message `message_id` when it is in the guest's shared Gram. The first
 /// fetch of its file, at whatever offset, is audited as the guest opening it;
 /// further fetches of the same file within [`AUDIT_INTERVAL`] are not.
-fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str) -> bool {
-    let Some(item) = crate::persist::gram::load()
+fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str) -> Option<GramItem> {
+    let item = crate::guest::gram::items(guest)
         .into_iter()
         .find(|item| item.id == message_id)
-        .filter(|item| crate::guest::gram::visible(guest, item))
-    else {
-        return false;
-    };
+        .filter(|item| crate::guest::gram::visible(guest, item))?;
     let key = format!("{}\0{message_id}", guest.guest_id);
     if let Some(file) = item
         .file
+        .clone()
         .filter(|_| audit_due(GuestAuditEvent::GramFile, &key))
     {
         guest.audit(
@@ -856,7 +889,193 @@ fn may_fetch(guest: &GuestPrincipal, method: &str, message_id: &str) -> bool {
             }),
         );
     }
-    true
+    Some(item)
+}
+
+/// The reply for a file kept as a guest copy (see `crate::guest::mirror`):
+/// the whole file, or one chunk from `offset`. `None` for a message of this
+/// machine's own store.
+fn mirrored_file(
+    guest: &GuestPrincipal,
+    id: &str,
+    item: &GramItem,
+    offset: Option<u64>,
+) -> Option<String> {
+    use base64::Engine as _;
+    let mirrored = crate::guest::mirror::get(&guest.dir, &item.id)?;
+    let Some(file) = mirrored.file else {
+        return Some(error_response_json(
+            id.to_string(),
+            "no_file",
+            "that message has no attached file".into(),
+        ));
+    };
+    let (start, len) = match offset {
+        Some(offset) if offset > file.size => {
+            return Some(error_response_json(
+                id.to_string(),
+                "invalid_params",
+                "file offset exceeds size".into(),
+            ))
+        }
+        Some(offset) => (offset, crate::persist::gram_files::MAX_CHUNK_BYTES as u64),
+        None => (0, file.size),
+    };
+    let bytes = match crate::guest::mirror::read_file(&guest.dir, &item.id, start, len) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return Some(error_response_json(
+                id.to_string(),
+                "gram_file_error",
+                format!("failed to read file: {err}"),
+            ))
+        }
+    };
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let result = match offset {
+        Some(offset) => ResponseResult::GramFileChunk {
+            name: file.name,
+            mime: file.mime,
+            size: file.size,
+            sha256: file.sha256,
+            offset,
+            data_base64,
+        },
+        None => ResponseResult::GramFileContent {
+            name: file.name,
+            mime: file.mime,
+            size: file.size,
+            data_base64,
+        },
+    };
+    Some(success_value(id, serde_json::to_value(result).ok()?))
+}
+
+/// On a Gram-relay remote, after the coordinator accepted a local agent's
+/// `gram.send`, keep a guest copy of it when a sharing guest's grant names
+/// the sending pane's agent, and notify those guests. The owner's copy and
+/// the owner's notifications stay with the coordinator.
+pub(super) fn mirror_relayed_send(request: &Request, response: &str, api_tx: &ApiRequestSender) {
+    let Method::GramSend(params) = &request.method else {
+        return;
+    };
+    let Some(pane) = params.caller_pane_id.as_deref() else {
+        return;
+    };
+    // No guest was ever invited here: leave the guest directory alone.
+    let dir = crate::guest::store::guest_dir();
+    if !dir.join("guests.json").exists() {
+        return;
+    }
+    let Ok(Probe {
+        agent: Some(agent), ..
+    }) = probe_target(api_tx, None, Some(pane))
+    else {
+        return;
+    };
+    let sender = crate::persist::gram::GramSender {
+        terminal_id: agent.terminal_id,
+        agent: agent.agent,
+    };
+    if let Some(item) = mirror_relayed(&dir, response, pane, Some(sender)) {
+        let cfg = crate::config::Config::load().config.push;
+        crate::push::dispatch_guests(cfg, vec![crate::app::gram_push_notification(&item)]);
+    }
+}
+
+/// Keep a guest copy of the Gram the coordinator answered with `response`,
+/// when an active sharing guest can see it, pulling its file back through
+/// the relay as the agent in `pane`. `sender` binds an agent's own Gram to
+/// the pane that sent it. Returns the copy kept.
+fn mirror_relayed(
+    dir: &std::path::Path,
+    response: &str,
+    pane: &str,
+    sender: Option<crate::persist::gram::GramSender>,
+) -> Option<GramItem> {
+    let Ok(SuccessResponse {
+        result: ResponseResult::GramSent { message, .. },
+        ..
+    }) = serde_json::from_str::<SuccessResponse>(response)
+    else {
+        return None;
+    };
+    let direction = match message.direction {
+        crate::api::schema::GramDirection::AgentToOwner => {
+            crate::persist::gram::GramDirection::AgentToOwner
+        }
+        crate::api::schema::GramDirection::OwnerToAgent => {
+            crate::persist::gram::GramDirection::OwnerToAgent
+        }
+    };
+    let item = GramItem {
+        id: message.id,
+        direction,
+        from: message.from,
+        to: message.to,
+        text: message.text,
+        grabbed_by: None,
+        grabbed_unix_ms: None,
+        created_unix_ms: message.created_unix_ms,
+        read_by_owner: false,
+        file: message.file.map(|file| crate::persist::gram::GramFile {
+            name: file.name,
+            size: file.size,
+            mime: file.mime,
+            sha256: file.sha256,
+        }),
+        origin_id: String::new(),
+        sender,
+    };
+    let guests = crate::guest::store::load_store(dir).ok()?.guests;
+    if !crate::guest::gram::any_guest_sees(&guests, &item) {
+        return None;
+    }
+    let bytes = match &item.file {
+        Some(file) => Some(pull_relayed_file(&item.id, file.size, pane)?),
+        None => None,
+    };
+    match crate::guest::mirror::add(dir, item.clone(), bytes.as_deref()) {
+        Ok(()) => Some(item),
+        Err(err) => {
+            tracing::warn!(err = %err, "guest gram copy failed");
+            None
+        }
+    }
+}
+
+/// A relayed Gram's file bytes, fetched chunk by chunk from the coordinator
+/// as the agent in `pane`, which can see it.
+fn pull_relayed_file(message_id: &str, size: u64, pane: &str) -> Option<Vec<u8>> {
+    use base64::Engine as _;
+    let mut bytes = Vec::new();
+    while (bytes.len() as u64) < size {
+        let request = Request {
+            id: "guest:mirror".into(),
+            method: Method::GramGetFileChunk(GramGetFileChunkParams {
+                id: message_id.to_string(),
+                offset: bytes.len() as u64,
+                caller_pane_id: Some(pane.to_string()),
+            }),
+        };
+        let response = crate::api::reverse::forward_relay(&request)?;
+        let Ok(SuccessResponse {
+            result: ResponseResult::GramFileChunk { data_base64, .. },
+            ..
+        }) = serde_json::from_str::<SuccessResponse>(&response)
+        else {
+            tracing::warn!("guest gram copy: the coordinator refused the file");
+            return None;
+        };
+        let chunk = base64::engine::general_purpose::STANDARD
+            .decode(data_base64)
+            .ok()?;
+        if chunk.is_empty() {
+            break;
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Some(bytes)
 }
 
 /// File bytes and the metadata the owner's reply carries.
@@ -2869,5 +3088,319 @@ mod tests {
             .unwrap();
         harness.call(&guest, register(&token, json!({"notify_finishes": true})));
         assert!(guest_sends(&guest, &alerts).is_empty());
+    }
+
+    /// What a coordinator holds for one relaying remote.
+    #[derive(Default)]
+    struct CoordinatorState {
+        uploads: HashMap<String, Vec<u8>>,
+        /// Each stored message with its file bytes.
+        messages: Vec<(Value, Vec<u8>)>,
+        posts: Vec<Value>,
+    }
+
+    /// A coordinator behind the production gateway (`serve_one`) that answers
+    /// the relay calls in memory, naming the remote's two panes `llm-opt` and
+    /// `other-agent`. It serves files 3 bytes per chunk.
+    struct Coordinator {
+        state: Arc<Mutex<CoordinatorState>>,
+        _socket_dir: TempDir,
+    }
+
+    impl Coordinator {
+        /// Makes this daemon (the harness) a Gram-relay remote of it.
+        fn start(harness: &Harness) -> Self {
+            use base64::Engine as _;
+            let socket_dir = TempDir::new("relay-socket");
+            std::fs::create_dir_all(&socket_dir.0).unwrap();
+            let socket = socket_dir.0.join("gram.sock");
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ApiRequestMessage>();
+            crate::api::reverse::serve_test_gateway(&socket, "mac-studio", tx);
+            std::env::set_var(crate::api::gram_relay::SOCKET_ENV, &socket);
+            crate::api::gram_relay::apply_config(&crate::config::Config::default().gram_relay);
+            assert!(crate::api::gram_relay::policy().remote_socket().is_some());
+
+            let state: Arc<Mutex<CoordinatorState>> = Arc::default();
+            let names: HashMap<String, &str> = [
+                (harness.pane_ids[0].clone(), "llm-opt"),
+                (harness.pane_ids[1].clone(), "other-agent"),
+            ]
+            .into_iter()
+            .collect();
+            let handled = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let b64 = base64::engine::general_purpose::STANDARD;
+                while let Some(message) = rx.blocking_recv() {
+                    let id = message.request.id.clone();
+                    let Method::GramRelay(relay) = message.request.method else {
+                        panic!("the gateway sends relay envelopes");
+                    };
+                    assert_eq!(relay.peer_alias, "mac-studio");
+                    let mut state = handled.lock().unwrap();
+                    let caller = |pane: &Option<String>| {
+                        pane.as_deref().and_then(|pane| names.get(pane).copied())
+                    };
+                    let file_record =
+                        |file: Option<crate::api::schema::GramFileUpload>,
+                         state: &mut CoordinatorState| {
+                            let Some(file) = file else {
+                                return (Value::Null, Vec::new());
+                            };
+                            let bytes = state.uploads.remove(&file.upload_id).unwrap_or_default();
+                            let sha: String = <sha2::Sha256 as sha2::Digest>::digest(&bytes)
+                                .iter()
+                                .map(|byte| format!("{byte:02x}"))
+                                .collect();
+                            (
+                                json!({"name": file.name, "size": bytes.len(), "mime": file.mime, "sha256": sha}),
+                                bytes,
+                            )
+                        };
+                    let result = match relay.call {
+                        GramRelayCall::UploadChunk(chunk) => {
+                            let bytes = b64.decode(chunk.data_base64).unwrap();
+                            state
+                                .uploads
+                                .entry(chunk.upload_id)
+                                .or_default()
+                                .extend(bytes);
+                            json!({"type": "ok"})
+                        }
+                        GramRelayCall::Send(send) => {
+                            let Some(from) = caller(&send.caller_pane_id) else {
+                                let _ = message.respond_to.send(
+                                    json!({"id": id, "error": {"code": "unknown_caller", "message": "?"}}).to_string(),
+                                );
+                                continue;
+                            };
+                            let (file, bytes) = file_record(send.file, &mut state);
+                            let mut stored = json!({
+                                "id": format!("relay-{}", state.messages.len()),
+                                "direction": "agent_to_owner", "from": from, "text": send.text,
+                                "created_unix_ms": now_ms(), "read_by_owner": false,
+                            });
+                            if !file.is_null() {
+                                stored["file"] = file;
+                            }
+                            state.messages.push((stored.clone(), bytes));
+                            json!({"type": "gram_sent", "message": stored, "store_id": "coordinator"})
+                        }
+                        GramRelayCall::Post(post) => {
+                            state.posts.push(serde_json::to_value(&post).unwrap());
+                            let (file, bytes) = file_record(post.file, &mut state);
+                            let mut stored = json!({
+                                "id": format!("gram-{}", state.messages.len()),
+                                "direction": "owner_to_agent",
+                                "from": crate::guest::post_from(&post.guest),
+                                "to": post.to, "text": post.text,
+                                "created_unix_ms": now_ms(), "read_by_owner": true,
+                            });
+                            if !file.is_null() {
+                                stored["file"] = file;
+                            }
+                            state.messages.push((stored.clone(), bytes));
+                            json!({"type": "gram_sent", "message": stored, "store_id": "coordinator"})
+                        }
+                        GramRelayCall::GetFileChunk(fetch) => {
+                            let identity = caller(&fetch.caller_pane_id);
+                            let found = state.messages.iter().find(|(stored, _)| {
+                                stored["id"] == fetch.id.as_str()
+                                    && identity.is_some_and(|identity| {
+                                        stored["from"] == identity || stored["to"] == identity
+                                    })
+                            });
+                            match found {
+                                Some((stored, bytes)) => {
+                                    let start = (fetch.offset as usize).min(bytes.len());
+                                    let end = (start + 3).min(bytes.len());
+                                    let file = &stored["file"];
+                                    json!({"type": "gram_file_chunk", "name": file["name"], "mime": file["mime"],
+                                        "size": file["size"], "sha256": file["sha256"], "offset": fetch.offset,
+                                        "data_base64": b64.encode(&bytes[start..end])})
+                                }
+                                None => {
+                                    let _ = message.respond_to.send(
+                                        json!({"id": id, "error": {"code": "forbidden", "message": "?"}}).to_string(),
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        other => panic!("unexpected relay call {other:?}"),
+                    };
+                    let _ = message
+                        .respond_to
+                        .send(json!({"id": id, "result": result}).to_string());
+                }
+            });
+            Self {
+                state,
+                _socket_dir: socket_dir,
+            }
+        }
+    }
+
+    /// One request on this machine's own API, as a local client (`herdr` in
+    /// an agent's pane) sends it. Runs on the calling thread, so a push
+    /// capture installed there sees what it dispatches.
+    fn local_call(harness: &Harness, request: Value) -> Value {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        writeln!(client, "{request}").unwrap();
+        client.shutdown(std::net::Shutdown::Write).unwrap();
+        let stream = ApiStream::Local(crate::ipc::LocalStream::from(
+            interprocess::os::unix::uds_local_socket::Stream::from(server),
+        ));
+        super::super::handle_principal_connection(
+            stream,
+            &harness.api_tx,
+            &harness.event_hub,
+            &harness.running,
+            None,
+            None,
+            ConnectionPrincipal::Owner,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let mut line = String::new();
+        BufReader::new(client).read_line(&mut line).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    /// A harness whose guest store is this daemon's real one.
+    fn relay_remote(tag: &str) -> (ConfigHome, Harness, Coordinator) {
+        let config = ConfigHome::new(tag);
+        let mut harness = start(tag);
+        harness.dir = TempDir(crate::guest::store::guest_dir());
+        let coordinator = Coordinator::start(&harness);
+        (config, harness, coordinator)
+    }
+
+    #[test]
+    fn on_a_gram_relay_remote_the_agents_grams_reach_its_sharing_guest() {
+        let (_config, harness, _coordinator) = relay_remote("relay-send");
+        let guest = harness.admit_with(0, true);
+        let token = "ef".repeat(32);
+        harness.call(&guest, register(&token, json!({"notify_gram": true})));
+        let pane = &harness.pane_ids[0];
+
+        let staged = local_call(
+            &harness,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": "up-1", "offset": 0, "data_base64": "aGVsbG8gd29ybGQ="}}),
+        );
+        assert_eq!(staged["result"]["type"], "ok", "{staged}");
+        let capture = crate::push::test_sink::Capture::install();
+        let sent = local_call(
+            &harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": "report", "caller_pane_id": pane, "file": {"upload_id": "up-1", "name": "report.txt", "mime": "text/plain"}}}),
+        );
+        let id = sent["result"]["message"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(id.starts_with("relay-"), "{sent}");
+        let sent_alerts = capture.take();
+        drop(capture);
+        // The coordinator keeps the owner's copy and notifies the owner.
+        assert!(crate::persist::gram::load().is_empty());
+        assert!(sent_alerts.alerts.is_empty());
+
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["report"], "{listed}");
+        assert_eq!(listed["messages"][0]["id"], id.as_str());
+        assert_eq!(listed["messages"][0]["from"], "llm-opt");
+        let chunk = harness.call(
+            &guest,
+            json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": id, "offset": 0}}),
+        );
+        assert_eq!(
+            chunk[0]["result"]["data_base64"], "aGVsbG8gd29ybGQ=",
+            "{chunk:?}"
+        );
+        assert_eq!(chunk[0]["result"]["size"], 11);
+
+        let sends = guest_sends(&guest, &sent_alerts.guest_alerts);
+        assert_eq!(sends.len(), 1, "{sends:?}");
+        assert_eq!(sends[0].0, "relay");
+        assert_eq!(sends[0].1["herdr_guest"]["kind"], "gram");
+        assert_eq!(sends[0].1["herdr_guest"]["gram_id"], id.as_str());
+
+        // Another pane's Gram is not the shared agent's.
+        let capture = crate::push::test_sink::Capture::install();
+        local_call(
+            &harness,
+            json!({"id": "s", "method": "gram.send", "params": {"text": "elsewhere", "caller_pane_id": harness.pane_ids[1]}}),
+        );
+        assert!(capture.take().guest_alerts.is_empty());
+        assert_eq!(texts(&guest_list(&harness, &guest, json!({}))), ["report"]);
+
+        // Revoking the only sharing guest drops its copies.
+        crate::guest::revoke_at(guest.dir.clone(), RevokeTarget::Guest(&guest.guest_id)).unwrap();
+        assert!(crate::guest::mirror::load(&guest.dir).unwrap().is_empty());
+    }
+
+    /// The file of Gram `id` as the agent in `pane` downloads it through this
+    /// machine's API, chunk by chunk.
+    fn agent_download(harness: &Harness, pane: &str, id: &str) -> Vec<u8> {
+        use base64::Engine as _;
+        let mut bytes = Vec::new();
+        loop {
+            let chunk = local_call(
+                harness,
+                json!({"id": "c", "method": "gram.get_file_chunk", "params": {"id": id, "offset": bytes.len(), "caller_pane_id": pane}}),
+            );
+            let data = chunk["result"]["data_base64"]
+                .as_str()
+                .unwrap_or_else(|| panic!("chunk: {chunk}"));
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap();
+            if data.is_empty() {
+                return bytes;
+            }
+            bytes.extend(data);
+        }
+    }
+
+    #[test]
+    fn on_a_gram_relay_remote_a_guests_post_reaches_the_agent_where_it_reads() {
+        let (_config, harness, coordinator) = relay_remote("relay-post");
+        let guest = harness.admit_with(0, true);
+        let staged = harness.call(
+            &guest,
+            json!({"id": "u", "method": "gram.upload_chunk", "params": {"upload_id": "g-up", "offset": 0, "data_base64": "aGVsbG8="}}),
+        );
+        assert_eq!(staged[0]["result"]["type"], "ok", "{staged:?}");
+        let posted = harness.call(
+            &guest,
+            json!({"id": "p", "method": "gram.post", "params": {"text": "see file", "file": {"upload_id": "g-up", "name": "a.txt", "mime": "text/plain"}}}),
+        );
+        let id = posted[0]["result"]["message"]["id"]
+            .as_str()
+            .unwrap_or_else(|| panic!("posted: {posted:?}"))
+            .to_string();
+        assert!(
+            crate::persist::gram::load().is_empty(),
+            "nothing stays local"
+        );
+        let relayed = coordinator.state.lock().unwrap().posts.clone();
+        assert_eq!(relayed.len(), 1);
+        assert_eq!(relayed[0]["to"], "llm-opt");
+        assert_eq!(relayed[0]["guest"], "plotarmordev");
+
+        // The agent finds the attachment where it reads its Gram.
+        assert_eq!(
+            agent_download(&harness, &harness.pane_ids[0], &id),
+            b"hello"
+        );
+
+        // The guest still sees its own post and file.
+        let listed = guest_list(&harness, &guest, json!({}));
+        assert_eq!(texts(&listed), ["see file"], "{listed}");
+        assert_eq!(listed["messages"][0]["from"], "plotarmordev (via HerdrUp)");
+        let whole = harness.call(
+            &guest,
+            json!({"id": "f", "method": "gram.get_file", "params": {"id": id}}),
+        );
+        assert_eq!(whole[0]["result"]["data_base64"], "aGVsbG8=", "{whole:?}");
     }
 }

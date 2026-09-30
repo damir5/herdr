@@ -281,7 +281,50 @@ impl App {
                 };
                 self.handle_gram_delete_for(id, delete.id, Some(identity))
             }
+            GramRelayCall::Post(post) => {
+                // Only a HerdrUp guest's post, and only to an agent of the
+                // relaying machine: that machine serves the agent's guest.
+                if !crate::guest::store::valid_guest_name(&post.guest)
+                    || !self.relay_agent_named(&alias, post.to.trim())
+                {
+                    return encode_error(
+                        id,
+                        "forbidden",
+                        "a relayed post comes from a guest to one of this machine's agents",
+                    );
+                }
+                let file = post.file.map(|mut file| {
+                    file.upload_id = relay_upload_id(&alias, &file.upload_id);
+                    file
+                });
+                let params = GramPostParams {
+                    text: post.text,
+                    to: Some(post.to),
+                    file,
+                    from: Some(crate::guest::post_from(&post.guest)),
+                };
+                self.store_gram_post(id, params, false)
+            }
         }
+    }
+
+    /// Whether a reachable agent of peer `alias` has this name.
+    #[cfg(unix)]
+    fn relay_agent_named(&self, alias: &str, name: &str) -> bool {
+        let prefix = format!("{alias}/");
+        !name.is_empty()
+            && self
+                .federation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .merged_agents()
+                .into_iter()
+                .any(|agent| {
+                    agent.pane_id.starts_with(&prefix)
+                        && agent.name.as_deref() == Some(name)
+                        && agent.reachability
+                            == Some(crate::api::federation_store::Reachability::Reachable)
+                })
     }
 
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
@@ -344,6 +387,13 @@ impl App {
     }
 
     pub(super) fn handle_gram_post(&mut self, id: String, params: GramPostParams) -> String {
+        self.store_gram_post(id, params, true)
+    }
+
+    /// Store an owner-to-agent post. `check_live` refuses a `to` that names no
+    /// live agent here; a relayed post names an agent of the relaying machine
+    /// instead, checked by the caller.
+    fn store_gram_post(&mut self, id: String, params: GramPostParams, check_live: bool) -> String {
         let text = params.text.trim();
         if let Some(err) = validate_text(&id, text, params.file.is_some()) {
             return err;
@@ -364,7 +414,7 @@ impl App {
         // A direct message must name a live agent, else it would be visible to no
         // one and never expire — a silent black hole. Omit `to` for the shared
         // queue instead.
-        if let Some(target) = &to {
+        if let Some(target) = to.as_ref().filter(|_| check_live) {
             if !self.is_live_agent_name(target) {
                 return encode_error(
                     id,
@@ -958,33 +1008,41 @@ impl App {
         if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
-        let title = super::sanitized_notification_text(&item.from, 80)
-            .unwrap_or_else(|| "New gram".to_string());
-        let mut body = super::sanitized_notification_text(&item.text, 240).unwrap_or_default();
-        // Note an attachment so a file-only (or captioned) gram reads sensibly on
-        // the lock screen. The name is already a sanitized basename.
-        if let Some(file) = &item.file {
-            let hint = format!("📎 {}", file.name);
-            body = if body.is_empty() {
-                hint
-            } else {
-                format!("{body}\n{hint}")
-            };
-        }
-        let notification = crate::push::PushNotification {
-            title,
-            body,
-            pane_id: String::new(),
-            workspace_id: String::new(),
-            kind: crate::push::PushKind::Gram,
-            #[cfg(unix)]
-            guest_scope: Some(crate::guest::push::GuestScope::Gram {
-                from: item.from.clone(),
-                sender: item.sender.clone(),
-                gram_id: item.id.clone(),
-            }),
+        crate::push::dispatch(
+            self.state.push_config.clone(),
+            vec![gram_push_notification(item)],
+        );
+    }
+}
+
+/// The alert for a new Gram to the owner. It deep-links to the app's Gram
+/// page, so it carries no pane or workspace id.
+pub(crate) fn gram_push_notification(item: &GramItem) -> crate::push::PushNotification {
+    let title = super::sanitized_notification_text(&item.from, 80)
+        .unwrap_or_else(|| "New gram".to_string());
+    let mut body = super::sanitized_notification_text(&item.text, 240).unwrap_or_default();
+    // Note an attachment so a file-only (or captioned) gram reads sensibly on
+    // the lock screen. The name is already a sanitized basename.
+    if let Some(file) = &item.file {
+        let hint = format!("📎 {}", file.name);
+        body = if body.is_empty() {
+            hint
+        } else {
+            format!("{body}\n{hint}")
         };
-        crate::push::dispatch(self.state.push_config.clone(), vec![notification]);
+    }
+    crate::push::PushNotification {
+        title,
+        body,
+        pane_id: String::new(),
+        workspace_id: String::new(),
+        kind: crate::push::PushKind::Gram,
+        #[cfg(unix)]
+        guest_scope: Some(crate::guest::push::GuestScope::Gram {
+            from: item.from.clone(),
+            sender: item.sender.clone(),
+            gram_id: item.id.clone(),
+        }),
     }
 }
 
@@ -2239,6 +2297,118 @@ mod tests {
             reload(&mut app, &path, "");
             assert_eq!(crate::api::gram_relay::policy().remote_socket(), None);
             assert_eq!(status(&app)["remote"]["accepting"], serde_json::Value::Null);
+        }
+
+        /// A coordinator allowing `PEER`, whose roster has `llm-opt` in pane
+        /// `w1-1` and `other-agent` in `w1-2`.
+        fn coordinator() -> App {
+            let (mut app, path) = app_with_config_file();
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\npeers = [\"{PEER}\"]\n"),
+            );
+            let agent = |pane: &str, name: &str| -> crate::api::schema::AgentInfo {
+                serde_json::from_value(serde_json::json!({
+                    "terminal_id": format!("{PEER}/t-{pane}"),
+                    "name": name,
+                    "agent": "claude",
+                    "agent_status": "idle",
+                    "workspace_id": format!("{PEER}/w1"),
+                    "tab_id": format!("{PEER}/w1:t1"),
+                    "pane_id": format!("{PEER}/{pane}"),
+                    "focused": false,
+                    "revision": 1,
+                    "machine_id": PEER,
+                    "reachability": "reachable",
+                }))
+                .unwrap()
+            };
+            app.federation.lock().unwrap().set_peer(
+                PEER,
+                crate::api::federation_store::PeerCacheEntry::reachable(
+                    vec![agent("w1-1", "llm-opt"), agent("w1-2", "other-agent")],
+                    std::time::Instant::now(),
+                ),
+            );
+            app
+        }
+
+        fn relay(app: &mut App, call: serde_json::Value) -> serde_json::Value {
+            let call: GramRelayCall = serde_json::from_value(call).unwrap();
+            serde_json::from_str(&app.handle_gram_relay(
+                "relay".into(),
+                GramRelayParams {
+                    peer_alias: PEER.into(),
+                    call,
+                },
+            ))
+            .unwrap()
+        }
+
+        fn guest_post(to: &str, guest: &str) -> serde_json::Value {
+            serde_json::json!({"kind": "post", "params": {"text": "notes", "to": to, "guest": guest}})
+        }
+
+        #[test]
+        fn a_relayed_guest_post_reaches_the_remote_agent_with_its_file() {
+            let mut app = coordinator();
+            let staged = relay(
+                &mut app,
+                serde_json::json!({"kind": "upload_chunk", "params": {"upload_id": "guest-g-up", "offset": 0, "data_base64": "aGVsbG8="}}),
+            );
+            assert_eq!(staged["result"]["type"], "ok", "{staged}");
+            let posted = relay(
+                &mut app,
+                serde_json::json!({"kind": "post", "params": {"text": "notes", "to": "llm-opt", "guest": "plotarmordev", "file": {"upload_id": "guest-g-up", "name": "a.txt", "mime": "text/plain"}}}),
+            );
+            let message = &posted["result"]["message"];
+            assert_eq!(message["direction"], "owner_to_agent", "{posted}");
+            assert_eq!(message["to"], "llm-opt");
+            let id = message["id"].as_str().unwrap();
+
+            let listed = relay(
+                &mut app,
+                serde_json::json!({"kind": "list", "params": {"caller_pane_id": "w1-1"}}),
+            );
+            let found = listed["result"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("the agent lists the guest's post: {listed}"));
+            assert_eq!(found["from"], "plotarmordev (via HerdrUp)");
+            let chunk = relay(
+                &mut app,
+                serde_json::json!({"kind": "get_file_chunk", "params": {"id": id, "offset": 0, "caller_pane_id": "w1-1"}}),
+            );
+            assert_eq!(chunk["result"]["data_base64"], "aGVsbG8=", "{chunk}");
+
+            let others = relay(
+                &mut app,
+                serde_json::json!({"kind": "list", "params": {"caller_pane_id": "w1-2"}}),
+            );
+            assert!(
+                !others.to_string().contains(id),
+                "another agent does not see it: {others}"
+            );
+        }
+
+        #[test]
+        fn relayed_posts_are_only_guest_posts_to_the_peers_own_agents() {
+            let mut app = coordinator();
+            for call in [
+                guest_post("llm-opt", ""),
+                guest_post("llm-opt", "owner (via HerdrUp)"),
+                guest_post("not-on-the-peer", "plotarmordev"),
+                guest_post("", "plotarmordev"),
+            ] {
+                let answer = relay(&mut app, call.clone());
+                assert_eq!(answer["error"]["code"], "forbidden", "{call} -> {answer}");
+            }
+            let answer = relay(&mut app, guest_post("other-agent", "friend"));
+            assert_eq!(answer["result"]["type"], "gram_sent", "{answer}");
         }
     }
 }

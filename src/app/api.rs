@@ -5,6 +5,8 @@ mod agent_view;
 pub(super) mod agents;
 mod env;
 mod gram;
+#[cfg(unix)]
+pub(crate) use gram::gram_push_notification;
 mod integrations;
 mod layouts;
 mod machines;

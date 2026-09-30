@@ -1399,7 +1399,11 @@ fn handle_principal_connection(
     #[cfg(unix)]
     if federation.is_none() {
         if let Some(response) = crate::api::reverse::forward_local(&request) {
-            return write_text_line_allow_disconnect(&mut stream, &response);
+            let written = write_text_line_allow_disconnect(&mut stream, &response);
+            // The coordinator keeps the Gram; the guests of the sending agent
+            // on this machine get their own copy.
+            guest_gate::mirror_relayed_send(&request, &response, api_tx);
+            return written;
         }
     }
 
@@ -2119,7 +2123,7 @@ fn emit_line_to_client(stream: &mut ApiStream, line: &str) -> std::io::Result<bo
 
 #[cfg(unix)]
 pub(crate) fn handle_reverse_gram(request: Request, tx: &ApiRequestSender) -> String {
-    // Only api::reverse creates this envelope, after accepting its five-method
+    // Only api::reverse creates this envelope, after accepting its six-method
     // whitelist on the per-peer SSH gateway. The regular TCP policy still denies
     // gram.* and the local API remains local.
     handle_request(request, tx, None, None, None)

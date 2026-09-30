@@ -3022,6 +3022,23 @@
                 "params"
               ],
               "type": "object"
+            },
+            {
+              "description": "A HerdrUp guest's post to an agent on the relaying machine.",
+              "properties": {
+                "kind": {
+                  "const": "post",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramRelayPostParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -3038,6 +3055,37 @@
           "required": [
             "peer_alias",
             "call"
+          ],
+          "type": "object"
+        },
+        "GramRelayPostParams": {
+          "description": "A HerdrUp guest's post relayed by the machine that serves the guest: `to`\nmust name one of that machine's agents, and the message is labeled\n`<guest> (via HerdrUp)`.",
+          "properties": {
+            "file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/GramFileUpload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "guest": {
+              "description": "The guest's name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "to",
+            "guest"
           ],
           "type": "object"
         },

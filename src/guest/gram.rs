@@ -24,20 +24,48 @@ type ReadMarks = BTreeMap<String, BTreeSet<String>>;
 /// now: what qualifies is fixed by who sent it, so history stays readable
 /// while the grant is paused and nothing new can qualify meanwhile.
 pub(crate) fn visible(guest: &GuestPrincipal, item: &GramItem) -> bool {
-    let Some(agent) = guest.grant.agent_name.as_deref() else {
+    visible_in(&guest.grant, guest.created_ms, &guest.name, item)
+}
+
+/// [`visible`] for a stored guest record.
+pub(crate) fn visible_to(guest: &store::GuestRecord, item: &GramItem) -> bool {
+    visible_in(&guest.grant, guest.created_ms, &guest.name, item)
+}
+
+fn visible_in(
+    grant: &crate::api::schema::GuestGrantInfo,
+    created_ms: u64,
+    name: &str,
+    item: &GramItem,
+) -> bool {
+    let Some(agent) = grant.agent_name.as_deref() else {
         return false;
     };
-    if item.created_unix_ms < guest.created_ms {
+    if item.created_unix_ms < created_ms {
         return false;
     }
     match item.direction {
-        GramDirection::AgentToOwner => {
-            super::grant_sent(&guest.grant, &item.from, item.sender.as_ref())
-        }
+        GramDirection::AgentToOwner => super::grant_sent(grant, &item.from, item.sender.as_ref()),
         GramDirection::OwnerToAgent => {
-            item.to.as_deref() == Some(agent) && item.from == guest.post_from()
+            item.to.as_deref() == Some(agent) && item.from == super::post_from(name)
         }
     }
+}
+
+/// Whether an active guest sharing the Gram can see `item`.
+pub(crate) fn any_guest_sees(guests: &[store::GuestRecord], item: &GramItem) -> bool {
+    guests
+        .iter()
+        .any(|guest| !guest.revoked && guest.share_gram && visible_to(guest, item))
+}
+
+/// The guest's Gram: this machine's store and, on a Gram-relay remote, the
+/// copies kept for guests, oldest first.
+pub(crate) fn items(guest: &GuestPrincipal) -> Vec<GramItem> {
+    let mut items = crate::persist::gram::load();
+    items.extend(super::mirror::load(&guest.dir).unwrap_or_default());
+    items.sort_by_key(|item| item.created_unix_ms);
+    items
 }
 
 /// `gram.list` for a guest: newest first, `limit` (default 100, at most 500)

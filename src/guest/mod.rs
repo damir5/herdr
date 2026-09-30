@@ -10,6 +10,7 @@
 pub(crate) mod audit;
 pub(crate) mod gram;
 pub(crate) mod link;
+pub(crate) mod mirror;
 pub(crate) mod push;
 pub(crate) mod store;
 
@@ -91,7 +92,7 @@ impl GuestPrincipal {
 
     /// `<name> (via HerdrUp)`, the sender of the guest's Gram posts.
     pub(crate) fn post_from(&self) -> String {
-        self.label().trim_end_matches(": ").to_string()
+        post_from(&self.name)
     }
 
     /// Record one audit event. Audit failures are logged, never fatal.
@@ -127,6 +128,11 @@ fn same_kind(a: &str, b: &str) -> bool {
         (Some(a), Some(b)) => a == b,
         _ => a == b,
     }
+}
+
+/// `<name> (via HerdrUp)`, the sender of a guest's Gram posts.
+pub(crate) fn post_from(name: &str) -> String {
+    store::guest_label(name).trim_end_matches(": ").to_string()
 }
 
 /// The grant names the agent with this name and kind in this terminal. The
@@ -472,6 +478,16 @@ fn forget_guest(dir: &std::path::Path, guest_id: &str) {
     if let Err(err) = gram::forget(dir, guest_id) {
         tracing::warn!(err = %err, "guest gram read marks removal failed");
     }
+    prune_mirror(dir);
+}
+
+/// Drop the Gram copies no active sharing guest can see any more.
+fn prune_mirror(dir: &std::path::Path) {
+    let pruned = store::load_store(dir)
+        .and_then(|store| mirror::prune(dir, |item| gram::any_guest_sees(&store.guests, item)));
+    if let Err(err) = pruned {
+        tracing::warn!(err = %err, "guest gram copies prune failed");
+    }
 }
 
 /// `guest.update`: turn Gram sharing on or off for an active guest. `None`
@@ -488,6 +504,9 @@ pub(crate) fn update_at(
     let updated = store::update_share_gram(dir, guest_id, share_gram).map_err(io_error)?;
     if updated.is_some() {
         notify_changes();
+    }
+    if !share_gram {
+        prune_mirror(dir);
     }
     Ok(updated.as_ref().map(store::GuestRecord::info))
 }

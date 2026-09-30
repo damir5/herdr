@@ -1,7 +1,7 @@
 //! Explicit, machine-scoped Gram reverse gateway over a saved SSH connection.
 //!
 //! The coordinator never forwards its unrestricted API socket. A private socket
-//! accepts only the five Gram relay operations below, stamps the saved peer's
+//! accepts only the six Gram relay operations below, stamps the saved peer's
 //! verified routing alias, and is reverse-forwarded to that peer by SSH. A local
 //! process on either trusted machine can impersonate a pane of that machine;
 //! this is not a per-process security boundary.
@@ -51,16 +51,27 @@ pub(crate) fn forward_local(request: &Request) -> Option<String> {
             .to_string()
         });
     }
-    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path));
+    Some(send_to_relay(&path, request))
+}
+
+/// Send one Gram call to the coordinator, whatever method, for callers inside
+/// this daemon (the guest gate). `None` when this daemon keeps its own Gram.
+pub(crate) fn forward_relay(request: &Request) -> Option<String> {
+    let path = crate::api::gram_relay::policy().remote_socket()?;
+    Some(send_to_relay(&path, request))
+}
+
+fn send_to_relay(path: &std::path::Path, request: &Request) -> String {
+    let client = ApiClient::for_target(ConnectionTarget::SocketPath(path.to_path_buf()));
     let reply =
         client.request_value_bounded(request, RESPONSE_LIMIT, Duration::from_secs(30), None);
-    Some(match reply {
+    match reply {
         Ok(value) => value.to_string(),
         Err(error) => serde_json::json!({"id":request.id,"error":{
             "code":"gram_relay_unavailable", "message":format!("Gram relay unavailable: {error}")
         }})
         .to_string(),
-    })
+    }
 }
 
 /// The transport is authenticated by the saved SSH host key and profile. Only
@@ -111,6 +122,12 @@ fn serve_one(
             Method::GramUploadChunk(params) => Some(GramRelayCall::UploadChunk(params)),
             Method::GramGetFileChunk(params) => Some(GramRelayCall::GetFileChunk(params)),
             Method::GramDelete(params) => Some(GramRelayCall::Delete(params)),
+            // The relay envelope carries only a guest's post; the alias is
+            // this gateway's, never the request's.
+            Method::GramRelay(GramRelayParams {
+                call: GramRelayCall::Post(params),
+                ..
+            }) => Some(GramRelayCall::Post(params)),
             _ => None,
         };
         match call {
@@ -393,6 +410,27 @@ impl Drop for ReverseGateway {
         }
         let _ = crate::ipc::remove_socket_file_if_owned(&self.socket, &self.socket_identity);
     }
+}
+
+/// A coordinator's gateway for one peer on `socket`, without SSH: each
+/// connection is served by the production `serve_one` against `tx`.
+#[cfg(test)]
+pub(crate) fn serve_test_gateway(
+    socket: &std::path::Path,
+    alias: &str,
+    tx: ApiRequestSender,
+) -> JoinHandle<()> {
+    let listener = crate::ipc::bind_private_local_listener(socket).unwrap();
+    let route = PeerRoute::for_test(ConnectionTarget::SocketPath(socket.to_path_buf()));
+    let alias = alias.to_string();
+    std::thread::spawn(move || {
+        while let Ok(conn) = listener.accept() {
+            let (alias, tx, route) = (alias.clone(), tx.clone(), route.clone());
+            std::thread::spawn(move || {
+                let _ = serve_one(conn, &alias, &tx, &route);
+            });
+        }
+    })
 }
 
 #[cfg(test)]

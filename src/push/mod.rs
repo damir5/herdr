@@ -208,6 +208,25 @@ pub(crate) fn dispatch(cfg: PushConfig, notifications: Vec<PushNotification>) {
     }
 }
 
+/// Like [`dispatch`], for alerts only guests get: a Gram whose owner copy
+/// lives on another machine that notifies the owner itself.
+#[cfg(unix)]
+pub(crate) fn dispatch_guests(cfg: PushConfig, notifications: Vec<PushNotification>) {
+    if notifications.is_empty() || !may_deliver(&cfg) {
+        return;
+    }
+    #[cfg(test)]
+    if test_sink::capture(|sink| sink.guest_alerts.extend(notifications.iter().cloned())) {
+        return;
+    }
+    if let Err(err) = std::thread::Builder::new()
+        .name("herdr-guest-push".to_string())
+        .spawn(move || crate::guest::push::deliver(&cfg, &notifications))
+    {
+        tracing::warn!(error = %err, "failed to spawn guest push thread; dropping batch");
+    }
+}
+
 /// Hand one Live Activity content-state to a detached sender thread; see
 /// [`dispatch`].
 pub(crate) fn dispatch_live_activity(
@@ -240,6 +259,9 @@ pub(crate) mod test_sink {
     pub(crate) struct Sent {
         pub alerts: Vec<PushNotification>,
         pub live_activities: Vec<serde_json::Value>,
+        /// Alerts for guests alone (see [`super::dispatch_guests`]).
+        #[cfg(unix)]
+        pub guest_alerts: Vec<PushNotification>,
     }
 
     thread_local! {

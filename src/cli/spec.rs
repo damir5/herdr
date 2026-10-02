@@ -132,10 +132,16 @@ fn pair_command() -> Command {
              transported, or stored by this command.\n\n\
              Pairing binds to this machine's Tailscale address, so the listener is not \
              reachable from the internet. The QR carries a single-use code that stops \
-             working the moment it is redeemed.",
+             working the moment it is redeemed.\n\n\
+             With --json, stdout contains exactly one line with the QR payload JSON. \
+             Status messages go to stderr, and the command keeps listening for redemption. \
+             --json and --open cannot be combined.",
         )
         .arg(flag("lan").help(crate::platform::lan_pairing_help()))
         .arg(flag("open").help("Open a clean QR image and also print it in the terminal"))
+        .arg(json_flag().conflicts_with("open").help(
+            "Print one QR payload JSON line instead of the terminal QR; status goes to stderr",
+        ))
         .arg(
             option("qr-file", "PATH")
                 .value_hint(ValueHint::FilePath)
@@ -1522,6 +1528,24 @@ mod tests {
             "missing SVG file option: {help}"
         );
         assert!(help.contains(crate::platform::lan_pairing_help()));
+        assert!(help.contains("--json"));
+        assert!(help.contains("stdout contains exactly one line"));
+        assert!(help.contains("--json and --open cannot be combined"));
+    }
+
+    #[test]
+    fn pair_json_is_accepted_but_conflicts_with_open() {
+        let matches = super::command()
+            .try_get_matches_from(["herdr", "pair", "--json", "--ttl", "60"])
+            .expect("JSON pairing options");
+        assert!(matches.subcommand_matches("pair").unwrap().get_flag("json"));
+        for args in [
+            ["herdr", "pair", "--json", "--open"],
+            ["herdr", "pair", "--open", "--json"],
+        ] {
+            let error = super::command().try_get_matches_from(args).unwrap_err();
+            assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+        }
     }
 
     #[test]

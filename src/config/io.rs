@@ -24,11 +24,12 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
     "worktrees",
 ];
 
+/// Drover's fork keeps its own config, sessions, sockets and state apart from a system herdr.
 pub fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     }
 }
 

@@ -18,8 +18,7 @@
 //! loop never sees the bytes.
 //!
 //! Line-framing reads come from [`super::stream_read`], shared with
-//! `pane_input_stream` and `pane_graphics_stream`; only this channel's byte cap
-//! and deadlines are set here.
+//! `pane_input_stream`; only this channel's byte cap and deadlines are set here.
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,8 +36,8 @@ use crate::ipc::is_connection_closed_error;
 
 use super::stream_read::{stream_is_running, LineReader};
 use super::{
-    api_response_outcome, dispatch_stream_open, write_json_line, write_json_line_allow_disconnect,
-    write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT,
+    api_response_outcome, dispatch_to_app_with_timeout, write_json_line,
+    write_json_line_allow_disconnect, write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT,
 };
 
 /// One frame's max wire size. A 512 KiB raw chunk (the daemon's
@@ -188,14 +187,13 @@ fn serve_with_timeouts(
 
     // Open handshake: the app answers whether gram is available at all
     // (`no_session`) before the connection is upgraded into a frame loop.
-    let open_response = dispatch_stream_open(
+    let open_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
             method: Method::GramUploadStreamOpen(params),
         },
         api_tx,
-        open_timeout,
-        Arc::clone(&stream_active),
+        Some(open_timeout),
     );
     if api_response_outcome(&open_response) != "ok" {
         stream_active.store(false, Ordering::Release);

@@ -6,7 +6,7 @@
 
 param([string]$Action = "")
 
-if ($Action -ne "session") { exit 0 }
+if ($Action -notin @("session", "working", "idle")) { exit 0 }
 if ($env:HERDR_ENV -ne "1") { exit 0 }
 if ([string]::IsNullOrWhiteSpace($env:HERDR_PANE_ID)) { exit 0 }
 
@@ -17,19 +17,20 @@ try {
     exit 0
 }
 
-if ($payload.hook_event_name -and $payload.hook_event_name -ne "SessionStart") { exit 0 }
+$expectedEvents = @{ session = @("SessionStart"); working = @("UserPromptSubmit"); idle = @("Stop", "Interrupt") }[$Action]
+if ($payload.hook_event_name -and $payload.hook_event_name -notin $expectedEvents) { exit 0 }
 
 $sessionId = $payload.session_id
 if ([string]::IsNullOrWhiteSpace($sessionId)) { exit 0 }
-if ([string]::IsNullOrWhiteSpace($payload.transcript_path)) { exit 0 }
+if ($Action -eq "session" -and [string]::IsNullOrWhiteSpace($payload.transcript_path)) { exit 0 }
 if (-not [string]::IsNullOrWhiteSpace($env:CODEX_THREAD_ID) -and $env:CODEX_THREAD_ID -ne $sessionId) { exit 0 }
 
-$seq = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+$seq = [DateTimeOffset]::UtcNow.Ticks
 $herdr = if ([string]::IsNullOrWhiteSpace($env:HERDR_BIN_PATH)) { "herdr" } else { $env:HERDR_BIN_PATH }
 try {
     $args = @(
         "pane",
-        "report-agent-session",
+        $(if ($Action -eq "session") { "report-agent-session" } else { "report-agent" }),
         $env:HERDR_PANE_ID,
         "--source",
         "herdr:codex",
@@ -38,10 +39,12 @@ try {
         "--seq",
         "$seq",
         "--agent-session-id",
-        "$sessionId",
-        "--agent-session-path",
-        "$($payload.transcript_path)"
+        "$sessionId"
     )
+    if (-not [string]::IsNullOrWhiteSpace($payload.transcript_path)) {
+        $args += @("--agent-session-path", "$($payload.transcript_path)")
+    }
+    if ($Action -ne "session") { $args += @("--state", $Action) }
     if ($payload.hook_event_name -eq "SessionStart" -and $payload.source -is [string] -and -not [string]::IsNullOrWhiteSpace($payload.source)) {
         $args += @("--session-start-source", "$($payload.source)")
     }

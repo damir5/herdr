@@ -515,8 +515,6 @@ contains = ["overlay-marker"]
         assert!(!result.visible_working);
         assert!(!result.visible_blocker);
         assert!(detect(Agent::Codex, screen).skip_state_update);
-        assert!(should_skip_state_update(Agent::Codex, screen));
-        assert!(!should_skip_state_update(Agent::Codex, "activity-marker"));
     });
 }
 

@@ -151,6 +151,45 @@ fn with_lock<T>(dir: &Path, operation: impl FnOnce() -> io::Result<T>) -> io::Re
     operation()
 }
 
+fn load_side_unlocked<T: Default + serde::de::DeserializeOwned>(
+    dir: &Path,
+    file: &str,
+) -> io::Result<T> {
+    match read_private(&dir.join(file))? {
+        Some(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err)),
+        None => Ok(T::default()),
+    }
+}
+
+/// Load a private JSON file kept beside `guests.json` (default when absent).
+pub(crate) fn load_side<T: Default + serde::de::DeserializeOwned>(
+    dir: &Path,
+    file: &str,
+) -> io::Result<T> {
+    with_lock(dir, || load_side_unlocked(dir, file))
+}
+
+/// Read-modify-write a file kept beside `guests.json` under the store lock.
+/// It is written only when `mutate` reports a change.
+pub(crate) fn update_side<T, R>(
+    dir: &Path,
+    file: &str,
+    mutate: impl FnOnce(&mut T) -> (R, bool),
+) -> io::Result<R>
+where
+    T: Default + Serialize + serde::de::DeserializeOwned,
+{
+    with_lock(dir, || {
+        let mut value = load_side_unlocked(dir, file)?;
+        let (result, changed) = mutate(&mut value);
+        if changed {
+            write_private(&dir.join(file), &serde_json::to_vec_pretty(&value)?)?;
+        }
+        Ok(result)
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct HostIdentity {
     pub host_id: String,
@@ -228,6 +267,9 @@ pub(crate) struct GuestRecord {
     pub revoked: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_ms: Option<u64>,
+    /// The guest sees the agent's Gram from `created_ms` on.
+    #[serde(default)]
+    pub share_gram: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -243,6 +285,8 @@ pub(crate) struct InviteRecord {
     pub expires_ms: u64,
     #[serde(default)]
     pub used_by: Option<String>,
+    #[serde(default)]
+    pub share_gram: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -264,6 +308,7 @@ impl GuestRecord {
             created_ms: self.created_ms,
             last_seen_ms: self.last_seen_ms,
             revoked: self.revoked,
+            share_gram: self.share_gram,
         }
     }
 }
@@ -279,6 +324,7 @@ impl InviteRecord {
             created_ms: self.created_ms,
             expires_ms: self.expires_ms,
             used_by: self.used_by.clone(),
+            share_gram: self.share_gram,
         }
     }
 
@@ -362,6 +408,17 @@ pub(crate) fn update_grant_session(
     })
 }
 
+/// Whether an active guest shares the agent's Gram. False for a revoked or
+/// unknown guest, or when the store cannot be read.
+pub(crate) fn shares_gram(dir: &Path, guest_id: &str) -> bool {
+    load_store(dir).is_ok_and(|store| {
+        store
+            .guests
+            .iter()
+            .any(|guest| guest.guest_id == guest_id && !guest.revoked && guest.share_gram)
+    })
+}
+
 pub(crate) fn is_revoked(dir: &Path, guest_id: &str) -> bool {
     load_store(dir).map_or(true, |store| {
         store
@@ -378,6 +435,7 @@ pub(crate) struct NewInvite {
     pub secret: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn create_invite(
     dir: &Path,
     name: &str,
@@ -385,6 +443,7 @@ pub(crate) fn create_invite(
     owner_name: &str,
     machine_label: &str,
     ttl_secs: u64,
+    share_gram: bool,
     now: u64,
 ) -> io::Result<NewInvite> {
     let secret_bytes = random_bytes::<32>()?;
@@ -398,6 +457,7 @@ pub(crate) fn create_invite(
         created_ms: now,
         expires_ms: now.saturating_add(ttl_secs.saturating_mul(1000)),
         used_by: None,
+        share_gram,
     };
     let stored = record.clone();
     update_store(dir, move |store| {
@@ -407,6 +467,27 @@ pub(crate) fn create_invite(
     Ok(NewInvite {
         record,
         secret: b64url(&secret_bytes),
+    })
+}
+
+/// Turn Gram sharing on or off for an active guest. Returns the updated
+/// record, or `None` when no active guest has this id.
+pub(crate) fn update_share_gram(
+    dir: &Path,
+    guest_id: &str,
+    share_gram: bool,
+) -> io::Result<Option<GuestRecord>> {
+    update_store(dir, |store| {
+        let Some(guest) = store
+            .guests
+            .iter_mut()
+            .find(|guest| guest.guest_id == guest_id && !guest.revoked)
+        else {
+            return (None, false);
+        };
+        let changed = guest.share_gram != share_gram;
+        guest.share_gram = share_gram;
+        (Some(guest.clone()), changed)
     })
 }
 
@@ -542,6 +623,7 @@ pub(crate) fn admit_in(
             last_connected_ms: None,
             revoked: false,
             revoked_ms: None,
+            share_gram: invite.share_gram,
         };
         store.invites[index].used_by = Some(guest_id);
         store.guests.push(guest.clone());
@@ -669,7 +751,17 @@ pub(crate) mod tests {
     }
 
     fn invite(dir: &Path, now: u64) -> NewInvite {
-        create_invite(dir, "plotarmordev", grant(), "Jerry", "Mac", 3600, now).unwrap()
+        create_invite(
+            dir,
+            "plotarmordev",
+            grant(),
+            "Jerry",
+            "Mac",
+            3600,
+            false,
+            now,
+        )
+        .unwrap()
     }
 
     fn accept(invite: &NewInvite, device: &[u8; 32], now: u64, dir: &Path) -> AdmitOutcome {

@@ -513,7 +513,10 @@ fn gram_mark_read(args: &[String]) -> std::io::Result<i32> {
 
     super::print_response(&super::send_request(&Request {
         id: "cli:gram:mark_read".into(),
-        method: Method::GramMarkRead(GramMarkReadParams { id }),
+        method: Method::GramMarkRead(GramMarkReadParams {
+            id: Some(id),
+            ids: Vec::new(),
+        }),
     })?)
 }
 

@@ -5,10 +5,11 @@ mod agent_view;
 pub(super) mod agents;
 mod env;
 mod gram;
+#[cfg(unix)]
+pub(crate) use gram::gram_push_notification;
 mod integrations;
 mod layouts;
 mod machines;
-mod pane_graphics;
 mod panes;
 pub(crate) mod plugins;
 pub(super) mod remote_push;
@@ -170,6 +171,14 @@ impl App {
                     );
                 }
                 true
+            }
+            AppEvent::WorktreeReadFinished(result) => {
+                let changes_workspace = matches!(
+                    &result.request.method,
+                    crate::api::schema::Method::WorktreeOpen(_)
+                );
+                self.handle_api_worktree_read_finished(*result);
+                changes_workspace
             }
             ev @ AppEvent::TerminalBell { .. } => {
                 self.handle_internal_event(ev);
@@ -395,6 +404,11 @@ impl App {
                     crate::api::schema::PluginCommandStatus::Failed
                 };
             }
+            return Vec::new();
+        }
+
+        if let AppEvent::WorktreeReadFinished(result) = ev {
+            self.handle_api_worktree_read_finished(*result);
             return Vec::new();
         }
 
@@ -714,6 +728,7 @@ impl App {
                     runtime.set_full_lifecycle_authority_active(
                         terminal.full_lifecycle_hook_authority_active(),
                     );
+                    runtime.set_self_reported_agent_active(terminal.self_reported_agent_active());
                 }
             }
         }
@@ -1096,6 +1111,12 @@ impl App {
                 pane_id: public_pane_id,
                 workspace_id: self.public_workspace_id(update.ws_idx),
                 kind: push_kind,
+                #[cfg(unix)]
+                guest_scope: Some(crate::guest::push::GuestScope::Agent {
+                    terminal_id: pane.attached_terminal_id.to_string(),
+                    name: terminal.agent_name.clone(),
+                    kind: agent_label.to_string(),
+                }),
             });
         }
 
@@ -1361,6 +1382,13 @@ impl App {
                     result: ResponseResult::Ok {},
                 }
             }
+            Method::ServerSshAgentRegister(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "connection_local_only",
+                    "SSH agent registration requires a persistent local JSON API connection",
+                );
+            }
             Method::ServerLiveHandoff(_) => {
                 let response = ErrorResponse {
                     id: request.id,
@@ -1503,6 +1531,9 @@ impl App {
             Method::NotificationsRegisterDevice(params) => {
                 return self.handle_notifications_register_device(request.id, params);
             }
+            Method::NotificationsUnregisterDevice(params) => {
+                return self.handle_notifications_unregister_device(request.id, params);
+            }
             Method::NotificationsRegisterActivity(params) => {
                 return self.handle_notifications_register_activity(request.id, params);
             }
@@ -1578,7 +1609,13 @@ impl App {
             Method::WorkspaceClose(target) => {
                 return self.handle_workspace_close(request.id, target);
             }
-            Method::WorktreeList(params) => return self.handle_worktree_list(request.id, params),
+            Method::WorktreeList(_) | Method::WorktreeOpen(_) => {
+                return responses::encode_error(
+                    request.id,
+                    "invalid_request",
+                    "worktree discovery is handled asynchronously by the app runtime",
+                );
+            }
             Method::WorktreeCreate(params) => {
                 let _ = params;
                 return responses::encode_error(
@@ -1587,7 +1624,6 @@ impl App {
                     "worktree.create is handled asynchronously by the app runtime",
                 );
             }
-            Method::WorktreeOpen(params) => return self.handle_worktree_open(request.id, params),
             Method::WorktreeRemove(params) => {
                 let _ = params;
                 return responses::encode_error(
@@ -1612,6 +1648,7 @@ impl App {
             Method::AgentUnarchive(params) => {
                 return self.handle_agent_unarchive(request.id, params)
             }
+            Method::AgentForget(params) => return self.handle_agent_forget(request.id, params),
             Method::AgentViewSet(params) => return self.handle_agent_view_set(request.id, params),
             Method::AgentViewClear(params) => {
                 return self.handle_agent_view_clear(request.id, params);
@@ -1669,6 +1706,7 @@ impl App {
             }
             Method::PaneResize(params) => return self.handle_pane_resize(request.id, params),
             Method::PaneScroll(params) => return self.handle_pane_scroll(request.id, params),
+            Method::PaneClear(target) => return self.handle_pane_clear(request.id, target),
             Method::PaneEditScrollback(target) => {
                 return self.handle_pane_edit_scrollback(request.id, target);
             }
@@ -1698,34 +1736,6 @@ impl App {
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
-            Method::PaneGraphicsSet(params) => {
-                return self.handle_pane_graphics_set(request.id, params);
-            }
-            Method::PaneGraphicsClear(params) => {
-                return self.handle_pane_graphics_clear(request.id, params);
-            }
-            Method::PaneGraphicsInfo(params) => {
-                return self.handle_pane_graphics_info(request.id, params);
-            }
-            Method::PaneGraphicsStream(_) => {
-                return responses::encode_error(
-                    request.id,
-                    "stream_transport_required",
-                    "pane.graphics.stream requires the streaming socket transport",
-                );
-            }
-            Method::PaneGraphicsStreamSet(params) => {
-                return self.handle_pane_graphics_stream_set(request.id, params);
-            }
-            Method::PaneGraphicsStreamDirect(params) => {
-                return self.handle_pane_graphics_stream_direct(request.id, params);
-            }
-            Method::PaneGraphicsStreamOpen(params) => {
-                return self.handle_pane_graphics_stream_open(request.id, params);
-            }
-            Method::PaneGraphicsStreamClose(params) => {
-                return self.handle_pane_graphics_stream_close(request.id, params);
-            }
             Method::PaneStream(_) => {
                 return responses::encode_error(
                     request.id,
@@ -1739,6 +1749,7 @@ impl App {
             Method::PaneStreamClose(params) => {
                 return self.handle_pane_stream_close(request.id, params);
             }
+            #[cfg(unix)]
             Method::PanePtyLeaseRelease(params) => {
                 return self.handle_pane_pty_lease_release(request.id, params);
             }
@@ -1971,47 +1982,34 @@ impl App {
     ) -> String {
         use crate::api::schema::ResponseResult;
 
-        let device_token = params.device_token.trim();
-        if !is_valid_apns_device_token(device_token) {
-            return responses::encode_error(
-                id,
-                "invalid_params",
-                "device_token must be 32-200 hexadecimal characters",
-            );
-        }
-        let platform = params.platform.trim();
-        if platform.is_empty() {
-            return responses::encode_error(id, "invalid_params", "platform is empty");
-        }
-        let relay_capability = match normalize_relay_capability(params.relay_capability) {
-            Ok(capability) => capability,
+        let device = match registered_device(params) {
+            Ok(device) => device,
             Err(message) => return responses::encode_error(id, "invalid_params", message),
         };
-
         // No-session/monolithic mode has no shared device registry to persist
         // to; acknowledge without touching disk, mirroring the plugin handlers.
         if self.no_session {
             return responses::encode_success(id, ResponseResult::Ok {});
         }
-
-        // The client owns the mute set and re-sends it whole on each change;
-        // store a normalised copy (trimmed, blanks dropped, sorted, de-duplicated,
-        // count-capped) so the on-disk record is deterministic and truly bounded.
-        let muted_panes = sanitize_muted_panes(params.muted_panes);
-
-        let device = crate::persist::devices::RegisteredDevice {
-            device_token: device_token.to_string(),
-            platform: platform.to_string(),
-            notify_needs_input: params.notify_needs_input,
-            notify_dies: params.notify_dies,
-            notify_finishes: params.notify_finishes,
-            notify_gram: params.notify_gram,
-            muted_panes,
-            registered_unix_ms: unix_millis_now(),
-            relay_capability,
-        };
-
         match crate::persist::devices::upsert(device) {
+            Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
+            Err(err) => responses::encode_error(id, "device_registry_save_failed", err.to_string()),
+        }
+    }
+
+    fn handle_notifications_unregister_device(
+        &mut self,
+        id: String,
+        params: crate::api::schema::NotificationsUnregisterDeviceParams,
+    ) -> String {
+        use crate::api::schema::ResponseResult;
+
+        let token = params.device_token.trim();
+        // Best-effort, like unregister_activity: an unknown token is fine.
+        if self.no_session || token.is_empty() {
+            return responses::encode_success(id, ResponseResult::Ok {});
+        }
+        match crate::persist::devices::remove_token(token) {
             Ok(_) => responses::encode_success(id, ResponseResult::Ok {}),
             Err(err) => responses::encode_error(id, "device_registry_save_failed", err.to_string()),
         }
@@ -2153,6 +2151,37 @@ fn unix_millis_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Validate a `notifications.register_device` call (owner or guest) into the
+/// record to store. Errors are `invalid_params` messages.
+pub(crate) fn registered_device(
+    params: crate::api::schema::NotificationsRegisterDeviceParams,
+) -> Result<crate::persist::devices::RegisteredDevice, &'static str> {
+    let device_token = params.device_token.trim();
+    if !is_valid_apns_device_token(device_token) {
+        return Err("device_token must be 32-200 hexadecimal characters");
+    }
+    let platform = params.platform.trim();
+    if platform.is_empty() {
+        return Err("platform is empty");
+    }
+    let relay_capability = normalize_relay_capability(params.relay_capability)?;
+    Ok(crate::persist::devices::RegisteredDevice {
+        device_token: device_token.to_string(),
+        platform: platform.to_string(),
+        notify_needs_input: params.notify_needs_input,
+        notify_dies: params.notify_dies,
+        notify_finishes: params.notify_finishes,
+        notify_gram: params.notify_gram,
+        // The client owns the mute set and re-sends it whole on each change;
+        // store a normalised copy (trimmed, blanks dropped, sorted,
+        // de-duplicated, count-capped) so the record is deterministic and
+        // truly bounded.
+        muted_panes: sanitize_muted_panes(params.muted_panes),
+        registered_unix_ms: unix_millis_now(),
+        relay_capability,
+    })
+}
+
 /// An APNs device token is lower/upper hex; bound the length so a garbage
 /// registration cannot bloat the store.
 fn is_valid_apns_device_token(token: &str) -> bool {
@@ -2277,9 +2306,20 @@ fn live_activity_content_state(agents: &[crate::api::schema::AgentInfo]) -> serd
     let lead = agents.iter().min_by_key(|agent| rank(agent.agent_status));
     let (headline, status) = match lead {
         Some(agent) => (
+            // A remote agent's name is stored "<machine-id>/<name>" for addressing; the
+            // headline is read on a lock screen, so it shows the agent's own name.
             agent
                 .name
-                .clone()
+                .as_deref()
+                .map(|name| {
+                    agent
+                        .machine_id
+                        .as_deref()
+                        .and_then(|id| name.strip_prefix(id))
+                        .and_then(|rest| rest.strip_prefix('/'))
+                        .unwrap_or(name)
+                        .to_string()
+                })
                 .or_else(|| agent.terminal_title_stripped.clone())
                 .or_else(|| agent.agent.clone())
                 .unwrap_or_else(|| "agent".to_string()),

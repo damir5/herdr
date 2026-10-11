@@ -157,7 +157,6 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         | "pane.process_info"
         | "pane.neighbor"
         | "pane.edges"
-        | "pane.graphics.info"
         | "events.subscribe"
         | "events.wait"
         | "session.snapshot"

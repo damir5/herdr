@@ -14,6 +14,12 @@ pub struct ServerLiveHandoffParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct ServerSshAgentRegisterParams {
+    /// Absolute remote-host agent socket. Registration lasts until this API connection closes.
+    pub socket_path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ServerCapabilities {
     pub live_handoff: bool,
     #[serde(default)]
@@ -51,4 +57,14 @@ pub struct ServerCapabilities {
     /// `pane.turn_completed` entries without a `pane_id`.
     #[serde(default)]
     pub events_v2: bool,
+    /// Supports connection-scoped `server.ssh_agent.register` on the local JSON API.
+    #[serde(default)]
+    pub ssh_agent_registration: bool,
+    /// Supports `agent.forget` (remove an archived agent's record).
+    #[serde(default)]
+    pub agent_forget: bool,
+    /// `herdr api-bridge --multi` forwards newline-delimited requests over one
+    /// long-lived bridge process instead of one process per request.
+    #[serde(default)]
+    pub api_bridge_multi: bool,
 }

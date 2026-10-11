@@ -20,6 +20,8 @@ mod transport;
 mod wait;
 
 pub use event_hub::EventHub;
+#[cfg(test)]
+pub(crate) use server::prefix_remote_agent;
 #[cfg(unix)]
 pub(crate) use server::serve_guest_stream;
 pub use server::ServerHandle;
@@ -94,17 +96,11 @@ pub(crate) fn request_changes_ui(request: &Request) -> bool {
             | Method::PaneResize(_)
             | Method::PaneSetPtySize(_)
             | Method::PaneScroll(_)
+            | Method::PaneClear(_)
             | Method::PaneEditScrollback(_)
             | Method::PaneFocus(_)
             | Method::PaneInputSet(_)
             | Method::PaneRename(_)
-            | Method::PaneGraphicsSet(_)
-            | Method::PaneGraphicsClear(_)
-            | Method::PaneGraphicsStream(_)
-            | Method::PaneGraphicsStreamSet(_)
-            | Method::PaneGraphicsStreamDirect(_)
-            | Method::PaneGraphicsStreamOpen(_)
-            | Method::PaneGraphicsStreamClose(_)
             | Method::PaneReportAgent(_)
             | Method::PaneReportAgentSession(_)
             | Method::PaneReportMetadata(_)
@@ -125,7 +121,6 @@ pub struct ApiRequestMessage {
     pub request: Request,
     pub respond_to: std::sync::mpsc::Sender<String>,
     pub response_write_complete: Option<std::sync::mpsc::Receiver<()>>,
-    pub stream_active: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 }
 
 pub type ApiRequestSender = mpsc::UnboundedSender<ApiRequestMessage>;

@@ -12,8 +12,14 @@ pub(super) fn command() -> Command {
         )
         .subcommand(
             Command::new("status")
-                .about("Show saved, endpoint, and federation health separately")
+                .about("Check saved machines without prompting for authentication, with coordinator and federation health when a local server runs")
+                .arg(Arg::new("machine").value_name("LABEL_OR_ID"))
                 .arg(json_flag()),
+        )
+        .subcommand(
+            Command::new("reconnect")
+                .about("Authenticate a saved machine in this terminal and verify connectivity")
+                .arg(Arg::new("machine").value_name("LABEL_OR_ID").required(true)),
         )
         .subcommand(
             Command::new("add")
@@ -24,13 +30,13 @@ pub(super) fn command() -> Command {
                         .required(true),
                 )
                 .arg(
-                    option("label", "LABEL")
-                        .required(true)
-                        .help("Set the machine label shown in the sidebar"),
+                    option("label", "LABEL").help(
+                        "Set the machine label shown in the sidebar (defaults to the SSH host, or host/session)",
+                    ),
                 )
                 .arg(
                     option("remote-session", "NAME")
-                        .help("Set the explicit Herdr session on the remote machine"),
+                        .help("Select a session explicitly (default without an interactive terminal)"),
                 ),
         )
         .subcommand(

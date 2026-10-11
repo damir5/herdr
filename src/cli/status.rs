@@ -281,6 +281,7 @@ struct ServerCapabilitiesJson {
     endpoint_protocol_generation: Option<u32>,
     surface_interest: bool,
     health_check: bool,
+    ssh_agent_registration: bool,
 }
 
 #[derive(Serialize)]
@@ -327,6 +328,7 @@ fn server_status_json(server: &ServerRuntimeStatus) -> ServerStatusJson {
                     endpoint_protocol_generation: capabilities.endpoint_protocol_generation,
                     surface_interest: capabilities.surface_interest,
                     health_check: capabilities.health_check,
+                    ssh_agent_registration: capabilities.ssh_agent_registration,
                 }),
             compatible: protocol.map(|value| value == crate::protocol::PROTOCOL_VERSION),
             endpoint_compatible: capabilities.as_ref().and_then(|capabilities| {
@@ -429,8 +431,18 @@ mod tests {
                 endpoint_protocol_generation: endpoint_generation,
                 surface_interest: true,
                 health_check: true,
+                ssh_agent_registration: false,
+                agent_forget: false,
+                api_bridge_multi: false,
             }),
         }
+    }
+
+    #[test]
+    fn status_exposes_ssh_agent_registration() {
+        let server = running_server(Some("test"), None);
+        let value = serde_json::to_value(server_status_json(&server)).unwrap();
+        assert_eq!(value["capabilities"]["ssh_agent_registration"], false);
     }
 
     #[test]

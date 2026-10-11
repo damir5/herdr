@@ -275,12 +275,15 @@ pub struct SessionConfig {
     /// Resume supported AI-agent panes into their native conversation sessions
     /// when restoring a Herdr session. Default: true.
     pub resume_agents_on_restore: bool,
+    /// Milliseconds between automatic agent restores. Zero disables spacing.
+    pub startup_per_agent_delay_ms: u32,
 }
 
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             resume_agents_on_restore: true,
+            startup_per_agent_delay_ms: 100,
         }
     }
 }
@@ -399,17 +402,16 @@ pub fn kind_for_config_env_var(var: &str) -> Option<&'static str> {
 /// (`$HOME/.claude`, `$HOME/.codex`, `$HOME/.omp/agent`,
 /// `$HOME/.kimi-code`). OMP honors its two native directory overrides so the
 /// integration installer, transcript verifier, and launched runtime all resolve
-/// one authoritative account home. `None` when `HOME` is unset or the kind has
-/// no config-home lever.
+/// one authoritative account home. `None` when a home-relative path needs an
+/// unset `HOME`, or the kind has no config-home lever.
 pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
     if kind == "omp" {
-        let home = PathBuf::from(std::env::var_os("HOME")?);
         if let Some(agent_dir) =
             std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
         {
             let agent_dir = PathBuf::from(agent_dir);
             return Some(if let Ok(relative) = agent_dir.strip_prefix("~") {
-                home.join(relative)
+                PathBuf::from(std::env::var_os("HOME")?).join(relative)
             } else {
                 agent_dir
             });
@@ -418,7 +420,13 @@ pub fn default_config_dir(kind: &str) -> Option<PathBuf> {
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(".omp"));
-        return Some(home.join(config_dir).join("agent"));
+        return Some(if config_dir.is_absolute() {
+            config_dir.join("agent")
+        } else {
+            PathBuf::from(std::env::var_os("HOME")?)
+                .join(config_dir)
+                .join("agent")
+        });
     }
     let sub = match kind {
         "claude" => ".claude",
@@ -544,8 +552,9 @@ pub struct LoadedConfig {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct KeysConfig {
-    /// Prefix key to enter prefix mode (e.g. "ctrl+b", "f12", "esc").
-    pub prefix: String,
+    /// Prefix key(s) to enter prefix mode (e.g. "ctrl+b", "f12", "esc", or an
+    /// array to accept several).
+    pub prefix: BindingConfig,
     /// Open keybinding help. Default: "prefix+?"
     pub help: BindingConfig,
     /// Open settings. Default: "prefix+s"
@@ -618,6 +627,7 @@ pub struct KeysConfig {
     pub rename_pane: BindingConfig,
     /// Open the focused pane scrollback in $EDITOR. Default: "prefix+e".
     pub edit_scrollback: BindingConfig,
+    pub clear_pane: BindingConfig,
     /// Enter keyboard copy mode for the focused pane. Default: "prefix+[".
     pub copy_mode: BindingConfig,
     /// Focus the pane to the left. Default: "prefix+h".
@@ -676,7 +686,12 @@ pub struct KeysConfig {
 #[serde(default)]
 pub(crate) struct KeysConfigOverlay {
     #[serde(skip_serializing_if = "Option::is_none")]
-    prefix: Option<String>,
+    prefix: Option<BindingConfig>,
+    /// Additional prefix keys published for cross-version compatibility.
+    /// Older clients parse `prefix` as a single string and ignore this field;
+    /// new clients merge it into the effective prefix list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_prefixes: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     help: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -749,6 +764,7 @@ pub(crate) struct KeysConfigOverlay {
     rename_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     edit_scrollback: Option<BindingConfig>,
+    clear_pane: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     copy_mode: Option<BindingConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -800,8 +816,13 @@ pub(crate) struct KeysConfigOverlay {
 }
 
 impl KeysConfigOverlay {
-    pub(crate) fn set_prefix(&mut self, prefix: String) {
-        self.prefix = Some(prefix);
+    pub(crate) fn set_prefixes(&mut self, prefixes: &[super::keybinds::KeyCombo]) {
+        let mut labels = prefixes
+            .iter()
+            .map(|combo| super::keybinds::format_key_combo(*combo));
+        self.prefix = Some(BindingConfig::One(labels.next().unwrap_or_default()));
+        let extra: Vec<String> = labels.collect();
+        self.extra_prefixes = (!extra.is_empty()).then_some(BindingConfig::Many(extra));
     }
 }
 
@@ -813,6 +834,25 @@ impl<'de> Deserialize<'de> for KeysConfig {
         let input = KeysConfigOverlay::deserialize(deserializer)?;
         let mut keys = KeysConfig::default();
 
+        let prefix_was_supplied = input.prefix.is_some() || input.extra_prefixes.is_some();
+        let mut prefix_values = Vec::new();
+        if let Some(prefix) = input.prefix {
+            prefix_values.extend(prefix.into_values());
+        }
+        if let Some(extra) = input.extra_prefixes {
+            prefix_values.extend(extra.into_values());
+        }
+        if prefix_was_supplied {
+            // An explicitly empty list stays empty so prefix validation rejects
+            // it and a reload keeps the current keybindings.
+            keys.prefix = match prefix_values.len() {
+                0 => BindingConfig::Many(Vec::new()),
+                1 => BindingConfig::One(prefix_values.remove(0)),
+                _ => BindingConfig::Many(prefix_values),
+            };
+            keys.user_fields.insert("prefix");
+        }
+
         macro_rules! apply_field {
             ($field:ident) => {
                 if let Some(value) = input.$field {
@@ -822,7 +862,6 @@ impl<'de> Deserialize<'de> for KeysConfig {
             };
         }
 
-        apply_field!(prefix);
         apply_field!(help);
         apply_field!(settings);
         apply_field!(new_workspace);
@@ -859,6 +898,7 @@ impl<'de> Deserialize<'de> for KeysConfig {
         apply_field!(close_tab);
         apply_field!(rename_pane);
         apply_field!(edit_scrollback);
+        apply_field!(clear_pane);
         apply_field!(copy_mode);
         apply_field!(focus_pane_left);
         apply_field!(focus_pane_down);
@@ -963,6 +1003,7 @@ impl KeysConfig {
         copy_effective_action_field!(close_tab, keybinds.close_tab);
         copy_effective_action_field!(rename_pane, keybinds.rename_pane);
         copy_effective_action_field!(edit_scrollback, keybinds.edit_scrollback);
+        copy_effective_action_field!(clear_pane, keybinds.clear_pane);
         copy_effective_action_field!(copy_mode, keybinds.copy_mode);
         copy_effective_action_field!(focus_pane_left, keybinds.focus_pane_left);
         copy_effective_action_field!(focus_pane_down, keybinds.focus_pane_down);
@@ -1411,7 +1452,7 @@ pub(crate) fn is_install_machine_id(machine_id: &str) -> bool {
 /// The listener, outbound transports (TCP/SSH), and peer connection handling
 /// land in later parts of the federation work; these fields are declared now so
 /// the `[federation]` config section parses and defaults cleanly.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default)]
 pub struct FederationConfig {
     /// Accept inbound federation connections. Default: false.
@@ -1435,6 +1476,72 @@ pub struct FederationConfig {
     /// state remain owned by the endpoint catalog.
     #[serde(default, deserialize_with = "deserialize_saved_machine_policies")]
     pub saved_machines: BTreeMap<crate::client::endpoint::ProfileId, FederationSavedMachinePolicy>,
+    /// Named sessions (`herdr --session <name>`) that federate like the default
+    /// session. Every session reads this machine-wide config, so by default
+    /// only the default session coordinates saved machines, polls outbound
+    /// peers, and binds `listen_addr`; other named sessions remain reachable
+    /// as a remote coordinator's SSH target. `"default"` is accepted and
+    /// redundant.
+    #[serde(default, deserialize_with = "deserialize_federation_named_sessions")]
+    pub named_sessions: Vec<String>,
+}
+
+impl FederationConfig {
+    /// Whether the server for `session` (`None` = default session) runs this
+    /// federation config: the default session always does, a named session
+    /// only when listed in `named_sessions`.
+    pub(crate) fn federates_session(&self, session: Option<&str>) -> bool {
+        session.is_none_or(|name| {
+            name == crate::session::DEFAULT_SESSION_NAME
+                || self.named_sessions.iter().any(|listed| listed == name)
+        })
+    }
+
+    /// The federation config the server for `session` actually runs.
+    ///
+    /// A named session that is not listed in `named_sessions` keeps no
+    /// coordinator role, no outbound explicit peers, and no inbound listener:
+    /// the default session's server already polls every saved machine and owns
+    /// `listen_addr`. Remote-side settings such as
+    /// `reverse_coordinator_machine_id` stay in effect. Returns
+    /// `Cow::Owned` only when the session rule actually suppressed something.
+    pub(crate) fn for_session(&self, session: Option<&str>) -> std::borrow::Cow<'_, Self> {
+        let suppresses = self.coordinator
+            || self.listen
+            || self.peers.iter().any(|peer| peer.endpoint.is_some());
+        if !suppresses || self.federates_session(session) {
+            return std::borrow::Cow::Borrowed(self);
+        }
+        std::borrow::Cow::Owned(Self {
+            listen: false,
+            coordinator: false,
+            peers: self
+                .peers
+                .iter()
+                .filter(|peer| peer.endpoint.is_none())
+                .cloned()
+                .collect(),
+            reverse_coordinator_machine_id: self.reverse_coordinator_machine_id.clone(),
+            listen_addr: self.listen_addr.clone(),
+            saved_machines: self.saved_machines.clone(),
+            named_sessions: self.named_sessions.clone(),
+        })
+    }
+}
+
+fn deserialize_federation_named_sessions<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let sessions = Vec::<String>::deserialize(deserializer)?;
+    for session in &sessions {
+        crate::session::validate_name(session).map_err(|error| {
+            de::Error::custom(format!(
+                "federation.named_sessions entry {session:?} is invalid: {error}"
+            ))
+        })?;
+    }
+    Ok(sessions)
 }
 
 fn deserialize_explicit_federation_peers<'de, D>(
@@ -1628,7 +1735,7 @@ pub struct ExperimentalConfig {
 impl Default for KeysConfig {
     fn default() -> Self {
         Self {
-            prefix: "ctrl+b".into(),
+            prefix: BindingConfig::one("ctrl+b"),
             help: BindingConfig::one("prefix+?"),
             settings: BindingConfig::one("prefix+s"),
             new_workspace: BindingConfig::one("prefix+shift+n"),
@@ -1665,6 +1772,7 @@ impl Default for KeysConfig {
             close_tab: BindingConfig::one("prefix+shift+x"),
             rename_pane: BindingConfig::one("prefix+shift+p"),
             edit_scrollback: BindingConfig::one("prefix+e"),
+            clear_pane: BindingConfig::default(),
             copy_mode: BindingConfig::one("prefix+["),
             focus_pane_left: BindingConfig::one("prefix+h"),
             focus_pane_down: BindingConfig::one("prefix+j"),
@@ -1907,6 +2015,109 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(error.contains("must use federation.saved_machines"));
+    }
+
+    fn coordinator_federation_config(named_sessions: &str) -> FederationConfig {
+        toml::from_str(&format!(
+            r#"
+                coordinator = true
+                listen = true
+                listen_addr = "127.0.0.1:7020"
+                reverse_coordinator_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                named_sessions = {named_sessions}
+
+                [[peers]]
+                alias = "laptop"
+                token_file = "/etc/herdr/peers/laptop.token"
+
+                [[peers]]
+                alias = "build"
+                endpoint = "tcp://build.internal:7020"
+                token_file = "/etc/herdr/peers/build.token"
+
+                [saved_machines."0123456789abcdef0123456789abcdef"]
+                expected_machine_id = "machine_0123456789abcdef0123456789abcdef"
+            "#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn federation_for_unlisted_named_session_drops_coordinator_outbound_and_listener() {
+        let config = coordinator_federation_config(r#"["ops"]"#);
+        let effective = config.for_session(Some("work"));
+
+        assert!(matches!(effective, std::borrow::Cow::Owned(_)));
+        assert!(!effective.coordinator);
+        assert!(!effective.listen);
+        assert_eq!(
+            effective
+                .peers
+                .iter()
+                .map(|peer| peer.alias.as_str())
+                .collect::<Vec<_>>(),
+            ["laptop"],
+            "only the inbound-only peer survives; no outbound polling"
+        );
+        // Remote-side acceptance and trust policy stay, so the session remains
+        // a valid SSH target and `machine status` reads "coordinator disabled".
+        assert_eq!(
+            effective.reverse_coordinator_machine_id,
+            config.reverse_coordinator_machine_id
+        );
+        assert_eq!(effective.saved_machines, config.saved_machines);
+    }
+
+    #[test]
+    fn federation_for_listed_named_session_is_unchanged() {
+        let config = coordinator_federation_config(r#"["ops", "work"]"#);
+        let effective = config.for_session(Some("work"));
+
+        assert!(matches!(effective, std::borrow::Cow::Borrowed(_)));
+        assert!(effective.coordinator && effective.listen);
+        assert_eq!(effective.peers.len(), 2);
+    }
+
+    #[test]
+    fn federation_for_default_session_is_unchanged() {
+        let config = coordinator_federation_config("[]");
+        for session in [None, Some(crate::session::DEFAULT_SESSION_NAME)] {
+            let effective = config.for_session(session);
+            assert!(matches!(effective, std::borrow::Cow::Borrowed(_)));
+            assert!(effective.coordinator && effective.listen);
+            assert_eq!(effective.peers.len(), 2);
+        }
+
+        // `"default"` in the list is redundant and harmless.
+        let redundant = coordinator_federation_config(r#"["default"]"#);
+        assert!(redundant.federates_session(None));
+        assert!(!redundant.federates_session(Some("work")));
+    }
+
+    #[test]
+    fn federation_session_rule_is_silent_when_nothing_is_suppressed() {
+        let config: FederationConfig = toml::from_str(
+            r#"
+                reverse_coordinator_machine_id = "machine_0123456789abcdef0123456789abcdef"
+                [[peers]]
+                alias = "laptop"
+                token_file = "/etc/herdr/peers/laptop.token"
+            "#,
+        )
+        .unwrap();
+        assert!(matches!(
+            config.for_session(Some("work")),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn federation_named_sessions_reject_invalid_names() {
+        let error = toml::from_str::<FederationConfig>(r#"named_sessions = ["../escape"]"#)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("federation.named_sessions"), "{error}");
+        assert!(toml::from_str::<FederationConfig>(r#"named_sessions = [""]"#).is_err());
     }
 
     #[test]
@@ -2292,13 +2503,16 @@ new_cwd = "~/Projects"
     fn resume_agents_on_restore_defaults_on_and_parses() {
         let default_config = Config::default();
         assert!(default_config.session.resume_agents_on_restore);
+        assert_eq!(default_config.session.startup_per_agent_delay_ms, 100);
 
         let toml = r#"
 [session]
 resume_agents_on_restore = false
+startup_per_agent_delay_ms = 0
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert!(!config.session.resume_agents_on_restore);
+        assert_eq!(config.session.startup_per_agent_delay_ms, 0);
     }
 
     #[test]

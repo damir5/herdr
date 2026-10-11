@@ -69,6 +69,8 @@ pub enum Method {
     ServerStagedUpdate(EmptyParams),
     #[serde(rename = "server.apply_staged_update")]
     ServerApplyStagedUpdate(EmptyParams),
+    #[serde(rename = "server.ssh_agent.register")]
+    ServerSshAgentRegister(ServerSshAgentRegisterParams),
     #[serde(rename = "server.agent_manifests")]
     ServerAgentManifests(EmptyParams),
     #[serde(rename = "server.reload_agent_manifests")]
@@ -83,6 +85,8 @@ pub enum Method {
     CommandInvoke(CommandInvokeParams),
     #[serde(rename = "notifications.register_device")]
     NotificationsRegisterDevice(NotificationsRegisterDeviceParams),
+    #[serde(rename = "notifications.unregister_device")]
+    NotificationsUnregisterDevice(NotificationsUnregisterDeviceParams),
     #[serde(rename = "notifications.register_activity")]
     NotificationsRegisterActivity(NotificationsRegisterActivityParams),
     #[serde(rename = "notifications.unregister_activity")]
@@ -121,6 +125,8 @@ pub enum Method {
     GuestList(GuestListParams),
     #[serde(rename = "guest.revoke")]
     GuestRevoke(GuestRevokeParams),
+    #[serde(rename = "guest.update")]
+    GuestUpdate(GuestUpdateParams),
     #[serde(rename = "guest.audit")]
     GuestAudit(GuestAuditParams),
     /// Internal only: resolve an agent and its live-agent check for the guest gate.
@@ -192,6 +198,8 @@ pub enum Method {
     AgentArchive(AgentArchiveParams),
     #[serde(rename = "agent.unarchive")]
     AgentUnarchive(AgentUnarchiveParams),
+    #[serde(rename = "agent.forget")]
+    AgentForget(AgentForgetParams),
     #[serde(rename = "agent.view.set")]
     AgentViewSet(AgentViewSetParams),
     #[serde(rename = "agent.view.clear")]
@@ -246,6 +254,8 @@ pub enum Method {
     PaneResize(PaneResizeParams),
     #[serde(rename = "pane.scroll")]
     PaneScroll(PaneScrollParams),
+    #[serde(rename = "pane.clear")]
+    PaneClear(PaneTarget),
     #[serde(rename = "pane.edit_scrollback")]
     PaneEditScrollback(PaneTarget),
     #[serde(rename = "pane.selection.read")]
@@ -282,27 +292,6 @@ pub enum Method {
     PaneSendInput(PaneSendInputParams),
     #[serde(rename = "pane.read")]
     PaneRead(PaneReadParams),
-    #[serde(rename = "pane.graphics.set")]
-    PaneGraphicsSet(PaneGraphicsSetParams),
-    #[serde(rename = "pane.graphics.clear")]
-    PaneGraphicsClear(PaneGraphicsClearParams),
-    #[serde(rename = "pane.graphics.info")]
-    PaneGraphicsInfo(PaneTarget),
-    #[serde(rename = "pane.graphics.stream")]
-    #[schemars(skip)]
-    PaneGraphicsStream(PaneGraphicsStreamParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamSet(PaneGraphicsSetParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamDirect(PaneGraphicsDirectParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamOpen(PaneGraphicsStreamParams),
-    #[serde(skip)]
-    #[schemars(skip)]
-    PaneGraphicsStreamClose(PaneGraphicsStreamParams),
     #[serde(rename = "pane.stream")]
     #[schemars(skip)]
     PaneStream(PaneStreamParams),
@@ -313,7 +302,9 @@ pub enum Method {
     #[schemars(skip)]
     PaneStreamClose(PaneStreamParams),
     /// Internal only: drop one viewer's width lease on every pane, as its
-    /// `pane.stream` closing would (the guest gate, on revoke).
+    /// `pane.stream` closing would (the guest gate, on revoke). Unix-only, like
+    /// the guest gate that is its only sender.
+    #[cfg(unix)]
     #[serde(skip)]
     #[schemars(skip)]
     PanePtyLeaseRelease(PanePtyLeaseReleaseParams),

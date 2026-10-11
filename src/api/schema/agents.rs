@@ -95,6 +95,15 @@ pub struct AgentUnarchiveParams {
     pub fresh: bool,
 }
 
+/// `agent.forget` — permanently drop an archived agent's record (issue #291).
+/// Only herdr's resume pointer is removed; the harness transcript and session
+/// files on disk are left untouched. Live agents are refused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct AgentForgetParams {
+    /// The archived agent's name or terminal id.
+    pub target: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct AgentViewSetParams {
     pub source: String,
@@ -385,6 +394,9 @@ pub struct AgentInfo {
     /// state restarts). The app derives a compact "5m/2h/3d" badge from `now - this` (#173).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_since_unix_ms: Option<u64>,
+    /// The current idle transition completed work, independently of who has viewed it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion_seq: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

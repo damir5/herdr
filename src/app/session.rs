@@ -52,7 +52,11 @@ impl App {
                 &self.state.archived_agents,
             );
             let history = self.persist_pane_history.then(|| {
-                crate::persist::capture_history(&self.state.workspaces, &self.terminal_runtimes)
+                crate::persist::capture_history(
+                    &snapshot,
+                    &self.state.workspaces,
+                    &self.terminal_runtimes,
+                )
             });
             SessionSaveJob::Save { snapshot, history }
         }

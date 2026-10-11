@@ -1,6 +1,6 @@
 //! Outbound `pane.stream` server: a persistent server->client raw PTY byte
-//! firehose. Structurally cloned from `pane_graphics_stream::serve` but running
-//! the opposite direction — it never reads frames from the client, it drains a
+//! firehose. Unlike the inbound streams (`pane_input_stream`,
+//! `gram_upload_stream`) it never reads frames from the client: it drains a
 //! pane's bounded [`OutputRing`] and writes newline-delimited JSON frames.
 //!
 //! Lifecycle: dispatch `PaneStreamOpen` to the app (validate + attach + publish

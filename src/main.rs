@@ -23,7 +23,7 @@ mod config;
 mod copy_mode;
 mod detect;
 mod events;
-mod ghostty;
+use ghostty_vt as ghostty;
 #[cfg(unix)]
 mod guest;
 mod handoff_runtime;
@@ -37,7 +37,7 @@ mod metadata_tokens;
 mod noninteractive_process;
 mod pairing;
 mod pane;
-mod pane_graphics_files;
+use ghostty_vt::pane_graphics_files;
 mod persist;
 mod platform;
 mod plugin_command;
@@ -178,6 +178,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # close_tab = "prefix+shift+x"
 # rename_pane = "prefix+shift+p"
 # edit_scrollback = "prefix+e"
+# clear_pane = ""                  # unbound; e.g. "prefix+ctrl+k"
 # focus_pane_left = "prefix+h"
 # focus_pane_down = "prefix+j"
 # focus_pane_up = "prefix+k"
@@ -398,6 +399,8 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # Resume supported AI-agent panes into their native conversation sessions after
 # a Herdr server restart. Requires official integrations that report session refs.
 # resume_agents_on_restore = true
+# Milliseconds between automatic agent restores; 0 starts them without spacing.
+# startup_per_agent_delay_ms = 100
 
 [remote]
 # Whether herdr manages the ssh config used for `herdr --remote`.
@@ -515,6 +518,10 @@ fn main() -> io::Result<()> {
             std::process::exit(2);
         }
     };
+    #[cfg(windows)]
+    if let Some(result) = platform::maybe_activate_desktop_notification(&raw_args) {
+        return result;
+    }
     if let Some(outcome) = cli::maybe_run_machine(&raw_args) {
         return finish_cli(outcome);
     }
@@ -556,6 +563,9 @@ fn main() -> io::Result<()> {
     // this with herdr's own SSH federation, but the app is an out-of-repo
     // consumer that had not migrated, so every upgraded host stopped answering
     // it. Keep it until the app ships on `remote-api-bridge`; see #206.
+    // `api-bridge --multi` keeps one bridge process per app session and
+    // forwards newline-delimited requests (#294; advertised as the
+    // `api_bridge_multi` ping capability).
     if args.get(1).map(String::as_str) == Some("api-bridge") {
         return remote::run_api_client_bridge(&args[2..]);
     }

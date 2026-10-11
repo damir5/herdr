@@ -456,6 +456,47 @@ impl App {
             .ok_or(AgentUnarchiveError::NoResumablePlan)
     }
 
+    /// Forget an archived agent (issue #291): drop its record from
+    /// `AppState.archived_agents` and persist that, returning the record as
+    /// `agent.list` rendered it. Only herdr's resume pointer goes; the harness
+    /// transcript and session files on disk are deliberately left alone.
+    ///
+    /// Resolves exactly like `unarchive_agent_target` — the first archived record
+    /// whose name or terminal id matches — so the two never disagree about which
+    /// record a target names. A target that only matches a LIVE agent is refused:
+    /// forgetting is for archived records, and a live agent has to be archived first.
+    pub(super) fn forget_archived_agent(
+        &mut self,
+        target: &str,
+    ) -> Result<crate::api::schema::AgentInfo, AgentForgetError> {
+        let Some(index) = self
+            .state
+            .archived_agents
+            .iter()
+            .position(|record| archived_matches_target(record, target))
+        else {
+            let live = matches!(
+                self.resolve_agent_target(target),
+                Ok(_) | Err(TerminalTargetError::Ambiguous { .. })
+            ) || self
+                .state
+                .terminals
+                .get(target)
+                .is_some_and(|terminal| terminal.is_agent_terminal());
+            return Err(if live {
+                AgentForgetError::Live
+            } else {
+                AgentForgetError::NotFound
+            });
+        };
+
+        let record = self.state.archived_agents.remove(index);
+        self.state.mark_session_dirty();
+        self.schedule_session_save();
+
+        Ok(archived_agent_info(&record))
+    }
+
     /// The public id of a LIVE pane already running the given session, if any.
     ///
     /// Walks panes rather than `state.terminals`, because a terminal can linger detached
@@ -715,6 +756,22 @@ impl App {
                 message: format!(
                     "pane {pane} is already running this session; retire it first, or retry with --fresh to start a clean agent"
                 ),
+            },
+        }
+    }
+
+    pub(super) fn agent_forget_error_body(
+        &self,
+        err: AgentForgetError,
+    ) -> crate::api::schema::ErrorBody {
+        match err {
+            AgentForgetError::NotFound => crate::api::schema::ErrorBody {
+                code: "agent_not_found".into(),
+                message: "no archived agent matches that name or terminal id".into(),
+            },
+            AgentForgetError::Live => crate::api::schema::ErrorBody {
+                code: "archived_agent_not_found".into(),
+                message: "that agent is live, not archived; only archived agents can be forgotten — archive it first".into(),
             },
         }
     }
@@ -1026,6 +1083,7 @@ impl App {
             interactive_ready: terminal.managed_agent_interactive_ready(),
             state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
             status_since_unix_ms: terminal.agent_status_since_unix_ms,
+            completion_seq: terminal.last_agent_completion_seq,
             cwd: pane.cwd,
             foreground_cwd: pane.foreground_cwd,
             revision: pane.revision,
@@ -1256,6 +1314,13 @@ pub(super) enum AgentUnarchiveError {
     },
 }
 
+pub(super) enum AgentForgetError {
+    /// Nothing — archived or live — answers to the target.
+    NotFound,
+    /// The target names a live agent, which has no archive record to forget.
+    Live,
+}
+
 /// True when an archived record is addressed by `target` — its agent name or its
 /// stored terminal id.
 fn archived_matches_target(record: &crate::persist::ArchivedAgentSnapshot, target: &str) -> bool {
@@ -1300,6 +1365,7 @@ fn archived_agent_info(
         interactive_ready: false,
         state_change_seq: 0,
         status_since_unix_ms: None,
+        completion_seq: None,
         cwd: Some(record.cwd.display().to_string()),
         foreground_cwd: None,
         revision: 0,

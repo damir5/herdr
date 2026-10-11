@@ -6,6 +6,8 @@ mod host;
 mod process;
 mod restart_policy;
 mod saved;
+#[cfg(unix)]
+mod ssh_agent;
 
 #[cfg(unix)]
 pub(crate) use api_bridge_unix::run_api_client_bridge;

@@ -1098,6 +1098,12 @@
             "pane_id": {
               "type": "string"
             },
+            "restore_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -1693,6 +1699,19 @@
               ]
             },
             "target": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "target"
+          ],
+          "type": "object"
+        },
+        "AgentForgetParams": {
+          "description": "`agent.forget` — permanently drop an archived agent's record (issue #291).\nOnly herdr's resume pointer is removed; the harness transcript and session\nfiles on disk are left untouched. Live agents are refused.",
+          "properties": {
+            "target": {
+              "description": "The archived agent's name or terminal id.",
               "type": "string"
             }
           },
@@ -2895,15 +2914,21 @@
           "type": "object"
         },
         "GramMarkReadParams": {
-          "description": "`gram.mark_read` — the owner marks an agent->owner message read.",
+          "description": "`gram.mark_read` — the owner marks agent->owner messages read: `id`, `ids`\nor both. An unknown id marks nothing and answers `not_found`. A guest marks\nits own read state only, never the owner's.",
           "properties": {
             "id": {
-              "type": "string"
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "ids": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
             }
           },
-          "required": [
-            "id"
-          ],
           "type": "object"
         },
         "GramPostParams": {
@@ -3016,6 +3041,23 @@
                 "params"
               ],
               "type": "object"
+            },
+            {
+              "description": "A HerdrUp guest's post to an agent on the relaying machine.",
+              "properties": {
+                "kind": {
+                  "const": "post",
+                  "type": "string"
+                },
+                "params": {
+                  "$ref": "#/schemas/request/$defs/GramRelayPostParams"
+                }
+              },
+              "required": [
+                "kind",
+                "params"
+              ],
+              "type": "object"
             }
           ]
         },
@@ -3032,6 +3074,37 @@
           "required": [
             "peer_alias",
             "call"
+          ],
+          "type": "object"
+        },
+        "GramRelayPostParams": {
+          "description": "A HerdrUp guest's post relayed by the machine that serves the guest: `to`\nmust name one of that machine's agents, and the message is labeled\n`<guest> (via HerdrUp)`.",
+          "properties": {
+            "file": {
+              "anyOf": [
+                {
+                  "$ref": "#/schemas/request/$defs/GramFileUpload"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "guest": {
+              "description": "The guest's name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`.",
+              "type": "string"
+            },
+            "text": {
+              "type": "string"
+            },
+            "to": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "text",
+            "to",
+            "guest"
           ],
           "type": "object"
         },
@@ -3148,6 +3221,11 @@
             "owner_name": {
               "type": "string"
             },
+            "share_gram": {
+              "default": false,
+              "description": "Share the agent's Gram with the guest: every Gram the agent sends from\nthe moment the guest accepts, with its files and push notifications.\nDefault: false.",
+              "type": "boolean"
+            },
             "target": {
               "description": "Agent pane id or agent name. The agent must be named, running and have a\nstable harness session.",
               "type": "string"
@@ -3204,6 +3282,29 @@
               ]
             }
           },
+          "type": "object"
+        },
+        "GuestUpdateParams": {
+          "description": "`guest.update`: change an accepted guest's settings.",
+          "properties": {
+            "guest_id": {
+              "type": "string"
+            },
+            "machine": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "share_gram": {
+              "description": "Share the agent's Gram with this guest (see `guest.invite.create`).",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "guest_id",
+            "share_gram"
+          ],
           "type": "object"
         },
         "IntegrationInstallParams": {
@@ -3513,6 +3614,18 @@
           ],
           "type": "object"
         },
+        "NotificationsUnregisterDeviceParams": {
+          "description": "Stop pushing to a device registered with `notifications.register_device`.\nA guest removes only its own registration.",
+          "properties": {
+            "device_token": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "device_token"
+          ],
+          "type": "object"
+        },
         "OutputMatch": {
           "oneOf": [
             {
@@ -3716,110 +3829,6 @@
           },
           "required": [
             "direction"
-          ],
-          "type": "object"
-        },
-        "PaneGraphicsClearParams": {
-          "properties": {
-            "layer_id": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "pane_id": {
-              "type": "string"
-            }
-          },
-          "required": [
-            "pane_id"
-          ],
-          "type": "object"
-        },
-        "PaneGraphicsFormat": {
-          "enum": [
-            "png",
-            "rgb",
-            "rgba",
-            "bgra"
-          ],
-          "type": "string"
-        },
-        "PaneGraphicsPlacementParams": {
-          "properties": {
-            "grid_cols": {
-              "default": 0,
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "grid_rows": {
-              "default": 0,
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "viewport_col": {
-              "default": 0,
-              "format": "int32",
-              "type": "integer"
-            },
-            "viewport_row": {
-              "default": 0,
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          "type": "object"
-        },
-        "PaneGraphicsSetParams": {
-          "properties": {
-            "data_base64": {
-              "default": "",
-              "type": "string"
-            },
-            "format": {
-              "$ref": "#/schemas/request/$defs/PaneGraphicsFormat"
-            },
-            "image_height": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "image_width": {
-              "format": "uint32",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "layer_id": {
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "pane_id": {
-              "type": "string"
-            },
-            "placement": {
-              "$ref": "#/schemas/request/$defs/PaneGraphicsPlacementParams",
-              "default": {
-                "grid_cols": 0,
-                "grid_rows": 0,
-                "viewport_col": 0,
-                "viewport_row": 0
-              }
-            },
-            "z_index": {
-              "default": 0,
-              "format": "int32",
-              "type": "integer"
-            }
-          },
-          "required": [
-            "pane_id",
-            "format",
-            "image_width",
-            "image_height"
           ],
           "type": "object"
         },
@@ -4148,6 +4157,16 @@
             "pane_id": {
               "type": "string"
             },
+            "resume_argv": {
+              "description": "Command that resumes this agent's session after a Herdr restart. The\nfirst element must be a plain command name.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
+            },
             "seq": {
               "format": "uint64",
               "minimum": 0,
@@ -4204,6 +4223,16 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "resume_argv": {
+              "description": "Command that resumes this agent's session after a Herdr restart. The\nfirst element must be a plain command name.",
+              "items": {
+                "type": "string"
+              },
+              "type": [
+                "array",
+                "null"
+              ]
             },
             "seq": {
               "format": "uint64",
@@ -5207,6 +5236,18 @@
           },
           "type": "object"
         },
+        "ServerSshAgentRegisterParams": {
+          "properties": {
+            "socket_path": {
+              "description": "Absolute remote-host agent socket. Registration lasts until this API connection closes.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "socket_path"
+          ],
+          "type": "object"
+        },
         "SplitDirection": {
           "enum": [
             "right",
@@ -6141,6 +6182,22 @@
         {
           "properties": {
             "method": {
+              "const": "server.ssh_agent.register",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/ServerSshAgentRegisterParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "server.agent_manifests",
               "type": "string"
             },
@@ -6242,6 +6299,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/NotificationsRegisterDeviceParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "notifications.unregister_device",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/NotificationsUnregisterDeviceParams"
             }
           },
           "required": [
@@ -6517,6 +6590,22 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/GuestRevokeParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
+              "const": "guest.update",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/GuestUpdateParams"
             }
           },
           "required": [
@@ -7056,6 +7145,22 @@
         {
           "properties": {
             "method": {
+              "const": "agent.forget",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/AgentForgetParams"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "agent.view.set",
               "type": "string"
             },
@@ -7488,6 +7593,22 @@
         {
           "properties": {
             "method": {
+              "const": "pane.clear",
+              "type": "string"
+            },
+            "params": {
+              "$ref": "#/schemas/request/$defs/PaneTarget"
+            }
+          },
+          "required": [
+            "method",
+            "params"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "method": {
               "const": "pane.edit_scrollback",
               "type": "string"
             },
@@ -7765,54 +7886,6 @@
             },
             "params": {
               "$ref": "#/schemas/request/$defs/PaneReadParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "pane.graphics.set",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneGraphicsSetParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "pane.graphics.clear",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneGraphicsClearParams"
-            }
-          },
-          "required": [
-            "method",
-            "params"
-          ],
-          "type": "object"
-        },
-        {
-          "properties": {
-            "method": {
-              "const": "pane.graphics.info",
-              "type": "string"
-            },
-            "params": {
-              "$ref": "#/schemas/request/$defs/PaneTarget"
             }
           },
           "required": [
@@ -8643,6 +8716,12 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "restore_error": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
@@ -10108,6 +10187,12 @@
             "pane_id": {
               "type": "string"
             },
+            "restore_error": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "revision": {
               "format": "uint64",
               "minimum": 0,
@@ -11046,6 +11131,15 @@
                 }
               ],
               "description": "Present only for archived agents (issue #173). Its presence is the\nload-bearing signal that this agent is archived; absent means active, so\nolder clients that ignore the field see a normal (active) agent list."
+            },
+            "completion_seq": {
+              "description": "The current idle transition completed work, independently of who has viewed it.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
             },
             "composer": {
               "$ref": "#/schemas/success_response/$defs/ComposerInfo",
@@ -12775,6 +12869,13 @@
             "id": {
               "type": "string"
             },
+            "machine_label": {
+              "description": "Display label of the federated machine a relayed Gram came from, when\n`from` is `<alias>/<name>` and that machine has a label: the same label\nthe machine's agents carry as `machine_label`. Resolved when read, so it\nfollows a rename and covers Grams stored before it. Absent for local\nGrams, for an alias without a label, and from older daemons.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
             "origin_id": {
               "default": "",
               "description": "Install-stable identity of the daemon/store that wrote this message (see\n[`crate::persist::gram::GramItem::origin_id`]). Stable across daemon\nrestarts; empty for messages written by an older build.",
@@ -13060,13 +13161,8 @@
               "type": "string"
             },
             {
-              "const": "read",
-              "description": "The guest read the granted agent's scrollback (at most once a minute).",
-              "type": "string"
-            },
-            {
-              "const": "resize",
-              "description": "The guest resized the granted agent's terminal (at most once a minute).",
+              "const": "gram_file",
+              "description": "The guest opened a shared Gram's file.",
               "type": "string"
             }
           ]
@@ -13154,6 +13250,11 @@
             },
             "revoked": {
               "type": "boolean"
+            },
+            "share_gram": {
+              "default": false,
+              "description": "The guest sees the agent's Gram: every Gram the agent sent from\n`created_ms` on, with its files and push notifications.",
+              "type": "boolean"
             }
           },
           "required": [
@@ -13193,6 +13294,11 @@
             },
             "owner_name": {
               "type": "string"
+            },
+            "share_gram": {
+              "default": false,
+              "description": "The guest will see the agent's Gram (see `guest.invite.create`).",
+              "type": "boolean"
             },
             "used_by": {
               "description": "Guest id that accepted this invite, once used.",
@@ -13782,6 +13888,12 @@
             },
             "pane_id": {
               "type": "string"
+            },
+            "restore_error": {
+              "type": [
+                "string",
+                "null"
+              ]
             },
             "revision": {
               "format": "uint64",
@@ -16111,108 +16223,6 @@
             },
             {
               "properties": {
-                "revision": {
-                  "format": "uint64",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "sequence": {
-                  "format": "uint64",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "type": {
-                  "const": "pane_graphics_frame_ack",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "type",
-                "sequence",
-                "revision"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
-                "cell_height_px": {
-                  "format": "uint32",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "cell_width_px": {
-                  "format": "uint32",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "file_frame_damage": {
-                  "default": false,
-                  "description": "Accepts damage metadata while still consuming a complete canonical file.",
-                  "type": "boolean"
-                },
-                "file_frame_direct_max_bytes": {
-                  "format": "uint",
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                },
-                "file_frame_directory": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "file_frame_formats": {
-                  "items": {
-                    "type": "string"
-                  },
-                  "type": "array"
-                },
-                "file_frame_max_bytes": {
-                  "format": "uint",
-                  "minimum": 0,
-                  "type": [
-                    "integer",
-                    "null"
-                  ]
-                },
-                "file_frame_transport": {
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "max_layers_per_pane": {
-                  "default": 0,
-                  "format": "uint",
-                  "minimum": 0,
-                  "type": "integer"
-                },
-                "pane_visible": {
-                  "description": "True only when this pane is on the currently rendered terminal surface.",
-                  "type": "boolean"
-                },
-                "pixel_mouse": {
-                  "default": false,
-                  "type": "boolean"
-                },
-                "type": {
-                  "const": "pane_graphics_info",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "type",
-                "cell_width_px",
-                "cell_height_px",
-                "pane_visible"
-              ],
-              "type": "object"
-            },
-            {
-              "properties": {
                 "explain": true,
                 "type": {
                   "const": "agent_explain",
@@ -16396,6 +16406,23 @@
               "required": [
                 "type",
                 "closed_streams"
+              ],
+              "type": "object"
+            },
+            {
+              "description": "The guest after `guest.update`.",
+              "properties": {
+                "guest": {
+                  "$ref": "#/schemas/success_response/$defs/GuestInfo"
+                },
+                "type": {
+                  "const": "guest_updated",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "type",
+                "guest"
               ],
               "type": "object"
             },
@@ -17127,6 +17154,11 @@
         },
         "ServerCapabilities": {
           "properties": {
+            "agent_forget": {
+              "default": false,
+              "description": "Supports `agent.forget` (remove an archived agent's record).",
+              "type": "boolean"
+            },
             "agent_session_transfer": {
               "default": false,
               "description": "The server can transactionally transfer visible session history between\nClaude Code, Codex, and OMP in the same logical pane.",
@@ -17138,6 +17170,11 @@
                 "$ref": "#/schemas/success_response/$defs/AgentSessionTransferHarness"
               },
               "type": "array"
+            },
+            "api_bridge_multi": {
+              "default": false,
+              "description": "`herdr api-bridge --multi` forwards newline-delimited requests over one\nlong-lived bridge process instead of one process per request.",
+              "type": "boolean"
             },
             "detached_server_daemon": {
               "default": false,
@@ -17173,6 +17210,11 @@
             "pane_input_stream": {
               "default": false,
               "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
+              "type": "boolean"
+            },
+            "ssh_agent_registration": {
+              "default": false,
+              "description": "Supports connection-scoped `server.ssh_agent.register` on the local JSON API.",
               "type": "boolean"
             },
             "surface_interest": {

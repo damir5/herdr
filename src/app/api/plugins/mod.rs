@@ -3352,6 +3352,7 @@ action = "missing"
                 agent_session_path: None,
                 agent_session_cursor: None,
                 agent_process_pid: None,
+                resume_argv: None,
             },
         );
 

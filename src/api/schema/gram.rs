@@ -139,10 +139,22 @@ pub struct GramGrabParams {
     pub grabbed_by: Option<String>,
 }
 
-/// `gram.mark_read` — the owner marks an agent->owner message read.
+/// `gram.mark_read` — the owner marks agent->owner messages read: `id`, `ids`
+/// or both. An unknown id marks nothing and answers `not_found`. A guest marks
+/// its own read state only, never the owner's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct GramMarkReadParams {
-    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ids: Vec<String>,
+}
+
+impl GramMarkReadParams {
+    /// Every id named, `id` first.
+    pub fn targets(&self) -> impl Iterator<Item = &str> {
+        self.id.iter().chain(&self.ids).map(String::as_str)
+    }
 }
 
 /// `gram.delete` — remove a message from the store for good.
@@ -226,6 +238,21 @@ pub enum GramRelayCall {
     UploadChunk(GramUploadChunkParams),
     GetFileChunk(GramGetFileChunkParams),
     Delete(GramDeleteParams),
+    /// A HerdrUp guest's post to an agent on the relaying machine.
+    Post(GramRelayPostParams),
+}
+
+/// A HerdrUp guest's post relayed by the machine that serves the guest: `to`
+/// must name one of that machine's agents, and the message is labeled
+/// `<guest> (via HerdrUp)`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+pub struct GramRelayPostParams {
+    pub text: String,
+    pub to: String,
+    /// The guest's name, `^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$`.
+    pub guest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file: Option<GramFileUpload>,
 }
 /// File attached to a gram message, as returned to clients. Metadata only — fetch
 /// the bytes with `gram.get_file`.
@@ -262,6 +289,13 @@ pub struct GramMessageInfo {
     /// restarts; empty for messages written by an older build.
     #[serde(default)]
     pub origin_id: String,
+    /// Display label of the federated machine a relayed Gram came from, when
+    /// `from` is `<alias>/<name>` and that machine has a label: the same label
+    /// the machine's agents carry as `machine_label`. Resolved when read, so it
+    /// follows a rename and covers Grams stored before it. Absent for local
+    /// Grams, for an alias without a label, and from older daemons.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_label: Option<String>,
 }
 
 /// Where an effective Gram relay setting came from.

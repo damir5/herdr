@@ -1,11 +1,11 @@
 //! Process-wide registry of live `pane.stream` output rings, keyed by public
 //! pane id.
 //!
-//! Mirrors `pane_graphics_stream`'s `REGISTERED_STREAMS`: the app loop installs a
-//! `Weak` handle when a viewer attaches so the connection thread can reach the
-//! shared ring and drain raw bytes without routing every byte back through the
-//! single-threaded app. Only the app loop mutates the map (attach/detach are
-//! serialized there), while connection threads only look rings up.
+//! The app loop installs a `Weak` handle when a viewer attaches so the
+//! connection thread can reach the shared ring and drain raw bytes without
+//! routing every byte back through the single-threaded app. Only the app loop
+//! mutates the map (attach/detach are serialized there), while connection
+//! threads only look rings up.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, Weak};

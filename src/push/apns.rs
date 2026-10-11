@@ -332,6 +332,8 @@ mod tests {
             pane_id: "w1-1".to_string(),
             workspace_id: "w_1".to_string(),
             kind: PushKind::Finished,
+            #[cfg(unix)]
+            guest_scope: None,
         }
     }
 

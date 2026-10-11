@@ -230,6 +230,7 @@ impl ClientShellState {
         endpoint_id: ClientEndpointId,
         outcome: &mut ClientShellInput,
     ) -> bool {
+        self.pending_workspace_highlight = None;
         self.pending_agent_reveal = None;
         let online = self.endpoint_is_online(&endpoint_id);
         if !online && !endpoint_id.is_local() {
@@ -255,6 +256,11 @@ impl ClientShellState {
         target: ClientEndpointFocusTarget,
         outcome: &mut ClientShellInput,
     ) -> bool {
+        #[cfg(windows)]
+        if !self.notification_target_is_current(&endpoint_id, &target) {
+            return false;
+        }
+        self.pending_workspace_highlight = None;
         self.pending_agent_reveal = None;
         let online = self.endpoint_is_online(&endpoint_id);
         if !online && !endpoint_id.is_local() {
@@ -278,6 +284,12 @@ impl ClientShellState {
                     crate::api::schema::Method::TabFocus(crate::api::schema::TabTarget { tab_id })
                 }
                 ClientEndpointFocusTarget::Pane(pane_id) => {
+                    crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
+                        pane_id,
+                    })
+                }
+                #[cfg(windows)]
+                ClientEndpointFocusTarget::Notification { pane_id, .. } => {
                     crate::api::schema::Method::PaneFocus(crate::api::schema::PaneTarget {
                         pane_id,
                     })

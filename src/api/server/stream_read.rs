@@ -1,13 +1,12 @@
-//! Line/length framing reads for the held-open streaming connections.
+//! Line framing reads for the held-open streaming connections.
 //!
-//! Three streaming modules read newline-delimited frames off a connection the
-//! server thread owns for the channel's lifetime: `pane.graphics.stream`
-//! (`pane_graphics_stream`), `pane.input.stream` (`pane_input_stream`), and
-//! `gram.upload.stream` (`gram_upload_stream`). Each needs the same three
-//! properties — a deadline on a partially written frame, a stop check against
-//! both the server's `running` flag and the channel's own `stream_active`, and a
-//! platform fallback when the transport cannot take a receive timeout — so the
-//! machinery lives here once instead of once per module.
+//! Two streaming modules read newline-delimited frames off a connection the
+//! server thread owns for the channel's lifetime: `pane.input.stream`
+//! (`pane_input_stream`) and `gram.upload.stream` (`gram_upload_stream`). Each
+//! needs the same three properties — a deadline on a partially written frame, a
+//! stop check against both the server's `running` flag and the channel's own
+//! `stream_active`, and a platform fallback when the transport cannot take a
+//! receive timeout — so the machinery lives here once instead of once per module.
 //!
 //! What stays at the call site: the byte cap, the idle/total deadlines, and the
 //! frame `label` used in the timeout messages. Those are per-protocol decisions
@@ -45,11 +44,11 @@ pub(super) fn stream_is_running(running: &AtomicBool, stream_active: &AtomicBool
 /// oversize errors (e.g. `"input frame"` -> `"timed out reading input frame"`).
 ///
 /// Byte-at-a-time is deliberate here and matches the daemon's own
-/// `read_initial_request_line`: `pane.graphics.stream` reads a header LINE and
-/// then a binary body off the same connection, so a reader that over-reads past
-/// the newline would swallow body bytes. A channel whose frames are all text
-/// should use [`LineReader`] instead — one syscall per byte costs ~1 MB/s, which
-/// is fine for keystrokes and ruinous for a 700 KB upload frame.
+/// `read_initial_request_line`: a reader that over-reads past the newline would
+/// swallow bytes that belong to whatever reads the connection next. A channel
+/// whose frames are all text should use [`LineReader`] instead — one syscall per
+/// byte costs ~1 MB/s, which is fine for keystrokes and ruinous for a 700 KB
+/// upload frame.
 pub(super) fn read_line(
     stream: &mut ApiStream,
     running: &Arc<AtomicBool>,
@@ -292,71 +291,6 @@ fn oversize_or_line(
         ));
     }
     Ok(Some(line))
-}
-
-/// Read exactly `len` bytes of a length-prefixed frame body. `None` means the
-/// peer closed (or the channel stopped) before any body byte arrived; a close
-/// mid-body is an error, because the frame header already promised the bytes.
-pub(super) fn read_exact(
-    stream: &mut ApiStream,
-    len: usize,
-    running: &Arc<AtomicBool>,
-    stream_active: &Arc<AtomicBool>,
-    idle_timeout: Duration,
-    total_timeout: Duration,
-    label: &str,
-) -> std::io::Result<Option<Vec<u8>>> {
-    with_timed_reads(stream, |stream, mut wait| {
-        let mut data = Vec::new();
-        let mut chunk = vec![0_u8; BODY_READ_CHUNK_BYTES.min(len)];
-        let total_deadline = Instant::now() + total_timeout;
-        let mut idle_deadline = Instant::now() + idle_timeout;
-
-        while data.len() < len {
-            if !stream_is_running(running, stream_active) {
-                return Ok(None);
-            }
-            ensure_before_deadlines(
-                Some(idle_deadline),
-                Some(total_deadline),
-                &format!("timed out reading {label}"),
-            )?;
-            let remaining = len - data.len();
-            let read_len = remaining.min(chunk.len());
-            match stream.read(&mut chunk[..read_len]) {
-                Ok(0) if wait.zero_read_needs_a_close_probe() && !stream.peer_closed()? => {
-                    wait.after_retry(Some(idle_deadline), Some(total_deadline));
-                    continue;
-                }
-                Ok(0) if data.is_empty() => return Ok(None),
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "stream ended mid-frame",
-                    ));
-                }
-                Ok(n) => {
-                    wait.on_progress();
-                    let now = Instant::now();
-                    if now >= total_deadline {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!("timed out reading {label}"),
-                        ));
-                    }
-                    data.extend_from_slice(&chunk[..n]);
-                    idle_deadline = now + idle_timeout;
-                }
-                Err(err) if read_should_retry(&err) => {
-                    wait.after_retry(Some(idle_deadline), Some(total_deadline));
-                }
-                Err(err) if is_connection_closed_error(&err) && data.is_empty() => return Ok(None),
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(Some(data))
-    })
 }
 
 #[derive(Clone, Copy)]

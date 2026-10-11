@@ -73,6 +73,144 @@ fn state_with_remote() -> (ClientShellState, ClientEndpointId) {
     (state, endpoint_id)
 }
 
+#[cfg(windows)]
+#[test]
+fn system_notification_clicks_keep_endpoint_and_boot_identity() {
+    let (mut state, remote) = state_with_remote();
+    state.config.toast_delivery = crate::config::ToastDelivery::System;
+    state.config.toast_delay_seconds = 0;
+    state.outer_focused = Some(false);
+    for endpoint_id in [ClientEndpointId::Local, remote.clone()] {
+        let (effects, _) = state.receive_notification(
+            &endpoint_id,
+            SemanticNotification {
+                kind: SemanticNotificationKind::Custom,
+                title: "test".into(),
+                body: None,
+                sound: None,
+                agent: None,
+                workspace_id: Some("ws_1".into()),
+                tab_id: Some("tab_1".into()),
+                pane_id: Some("pane_1".into()),
+                position: None,
+            },
+            std::time::Instant::now(),
+        );
+        let [ClientShellNotificationEffect::System {
+            target: Some(target),
+            ..
+        }] = effects.as_slice()
+        else {
+            panic!("system effect must retain notification target");
+        };
+        let target = target.clone();
+        assert_eq!(target.endpoint_id, endpoint_id);
+        let outcome = state.activate_system_notification(target.clone());
+        assert!(
+            !outcome.actions.is_empty(),
+            "a current target must navigate"
+        );
+        if endpoint_id == remote {
+            assert!(
+                matches!(&outcome.actions[..], [ClientShellAction::ActivateEndpoint {
+                endpoint_id: id, target: Some(ClientEndpointFocusTarget::Notification { pane_id, boot_id }),
+            }] if id == &remote && pane_id == "pane_1" && boot_id == "remote-boot")
+            );
+        }
+        state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Reconnecting);
+        assert!(state
+            .activate_system_notification(target.clone())
+            .actions
+            .is_empty());
+        state.set_endpoint_status(&endpoint_id, ClientEndpointStatus::Online);
+        assert!(
+            !state
+                .activate_system_notification(target.clone())
+                .actions
+                .is_empty(),
+            "same-boot reconnect remains valid"
+        );
+        let endpoint = state
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .unwrap();
+        let snapshot = endpoint.snapshot.as_mut().unwrap();
+        snapshot.boot_id = "replacement-boot".into();
+        assert!(
+            state
+                .activate_system_notification(target.clone())
+                .actions
+                .is_empty(),
+            "same pane ID from another boot must not navigate"
+        );
+        let endpoint = state
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.endpoint_id == endpoint_id)
+            .unwrap();
+        let snapshot = endpoint.snapshot.as_mut().unwrap();
+        snapshot.boot_id = target.boot_id.clone();
+        snapshot.panes.clear();
+        assert!(
+            state
+                .activate_system_notification(target.clone())
+                .actions
+                .is_empty(),
+            "closed pane must not navigate"
+        );
+        if endpoint_id == remote {
+            state.set_endpoint_catalog(&[]);
+            assert!(
+                state
+                    .activate_system_notification(target)
+                    .actions
+                    .is_empty(),
+                "removed profile must not navigate"
+            );
+        }
+    }
+}
+
+#[test]
+fn machine_diagnostic_badge_reopens_notice_without_collapsing_machine() {
+    let (mut state, id) = state_with_remote();
+    state.set_endpoint_status(&id, ClientEndpointStatus::Attention);
+    state.set_machine_diagnostic(&id, "Permission denied (keyboard-interactive)".into());
+    for _ in 0..2 {
+        state.compose(120, 40).unwrap();
+        let hit = state
+            .hits
+            .machines
+            .iter()
+            .find(|hit| hit.endpoint_id == id)
+            .unwrap();
+        let mouse = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: hit.status_badge.x,
+            row: hit.status_badge.y,
+            modifiers: KeyModifiers::NONE,
+        };
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Mouse(mouse)]);
+        assert!(outcome.repaint);
+        assert!(!state.collapsed_endpoints.contains(&id));
+        let notice = state.visible_endpoint_notice.take().unwrap();
+        assert!(notice.body.contains("Permission denied"));
+        assert!(notice
+            .title
+            .contains("herdr machine reconnect 0123456789abcdef0123456789abcdef"));
+    }
+    state.set_endpoint_status(&id, ClientEndpointStatus::Online);
+    state.compose(120, 40).unwrap();
+    assert!(!state.machine_diagnostics.required_for(
+        state
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.endpoint_id == id)
+            .unwrap()
+    ));
+}
+
 fn state_with_scrollable_agents() -> (ClientShellState, ClientEndpointId) {
     let (mut state, remote) = state_with_remote();
     for endpoint_id in [ClientEndpointId::Local, remote.clone()] {
@@ -2056,18 +2194,16 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
     assert!(rows.iter().all(|row| match row.target {
         ClientNavigatorTarget::Machine { .. } => row.depth == 0 && row.status.is_none(),
         ClientNavigatorTarget::Workspace { .. } => row.depth == 1 && row.status.is_none(),
-        ClientNavigatorTarget::Tab { .. } => row.depth == 2 && row.status.is_none(),
-        ClientNavigatorTarget::Pane { .. } => row.depth == 3 && row.status.is_some(),
+        ClientNavigatorTarget::Pane { .. } => row.depth == 2 && row.status.is_some(),
     }));
     assert_eq!(rows.iter().filter(|row| row.current).count(), 1);
 
     let frame = state.compose(106, 30).expect("federated navigator");
     for (rect, target) in &state.hits.navigator_rows {
         let expected = match target {
-            ClientNavigatorTarget::Machine { .. } => " ▾ ",
-            ClientNavigatorTarget::Workspace { .. } => "   ▾ ",
-            ClientNavigatorTarget::Tab { .. } => "     └── ",
-            ClientNavigatorTarget::Pane { .. } => "        └── ",
+            ClientNavigatorTarget::Machine { .. } => " ",
+            ClientNavigatorTarget::Workspace { .. } => "   ",
+            ClientNavigatorTarget::Pane { .. } => "   └─ ",
         };
         let prefix = frame.cells[rect.y as usize * frame.width as usize + rect.x as usize..]
             .iter()
@@ -2105,8 +2241,7 @@ fn navigator_uses_machine_parents_only_for_federated_clients() {
         .all(|row| !matches!(row.target, ClientNavigatorTarget::Machine { .. })));
     assert!(rows.iter().all(|row| match row.target {
         ClientNavigatorTarget::Workspace { .. } => row.depth == 0,
-        ClientNavigatorTarget::Tab { .. } => row.depth == 1,
-        ClientNavigatorTarget::Pane { .. } => row.depth == 2,
+        ClientNavigatorTarget::Pane { .. } => row.depth == 1,
         ClientNavigatorTarget::Machine { .. } => false,
     }));
 }
@@ -2140,10 +2275,6 @@ fn navigator_keeps_saved_machine_visible_before_metadata_arrives() {
     assert!(!rows.iter().any(|row| match &row.target {
         ClientNavigatorTarget::Machine { .. } => false,
         ClientNavigatorTarget::Workspace {
-            endpoint_id: target,
-            ..
-        }
-        | ClientNavigatorTarget::Tab {
             endpoint_id: target,
             ..
         }
@@ -2497,7 +2628,32 @@ fn collapsed_aggregate_workspace_status_uses_its_status_color() {
 }
 
 #[test]
-fn navigator_foreign_tab_selection_keeps_the_tab_target() {
+fn navigator_workspace_arrows_cross_machine_headings_without_activating_them() {
+    let (mut state, endpoint_id) = state_with_remote();
+    state.open_navigator_overlay();
+    for (key, expected_endpoint) in [
+        (KeyCode::Right, endpoint_id),
+        (KeyCode::Left, ClientEndpointId::Local),
+    ] {
+        let outcome = state.handle_raw_events(vec![RawInputEvent::Key(
+            crate::input::TerminalKey::new(key, KeyModifiers::empty()),
+        )]);
+        assert!(outcome.actions.is_empty());
+        let Some(ClientShellOverlay::Navigator(navigator)) = &state.overlay else {
+            panic!("navigator");
+        };
+        assert_eq!(
+            navigator.selected,
+            Some(ClientNavigatorTarget::Pane {
+                endpoint_id: expected_endpoint,
+                pane_id: "pane_1".into(),
+            })
+        );
+    }
+}
+
+#[test]
+fn navigator_foreign_workspace_heading_keeps_the_workspace_target() {
     let (mut state, endpoint_id) = state_with_remote();
     state.open_navigator_overlay();
     let selected = {
@@ -2510,15 +2666,14 @@ fn navigator_foreign_tab_selection_keeps_the_tab_target() {
             .find(|row| {
                 matches!(
                     &row.target,
-                    ClientNavigatorTarget::Tab {
+                    ClientNavigatorTarget::Workspace {
                         endpoint_id: target_endpoint,
-                        tab_id,
-                        ..
-                    } if target_endpoint == &endpoint_id && tab_id == "tab_1"
+                        workspace_id,
+                    } if target_endpoint == &endpoint_id && workspace_id == "ws_1"
                 )
             })
             .map(|row| row.target.clone())
-            .expect("remote tab row")
+            .expect("remote workspace heading")
     };
     if let Some(ClientShellOverlay::Navigator(navigator)) = state.overlay.as_mut() {
         navigator.selected = Some(selected);
@@ -2531,7 +2686,7 @@ fn navigator_foreign_tab_selection_keeps_the_tab_target() {
         outcome.actions.as_slice(),
         [ClientShellAction::ActivateEndpoint {
             endpoint_id: activated,
-            target: Some(ClientEndpointFocusTarget::Tab(tab_id)),
-        }] if activated == &endpoint_id && tab_id == "tab_1"
+            target: Some(ClientEndpointFocusTarget::Workspace(workspace_id)),
+        }] if activated == &endpoint_id && workspace_id == "ws_1"
     ));
 }

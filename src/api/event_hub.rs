@@ -46,6 +46,12 @@ pub struct MissedEvents {
     pub last: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EventHistoryError {
+    Lost,
+    Unavailable,
+}
+
 impl EventHub {
     /// Retained events shared by every subscriber. Subscription streams drain
     /// everything new every 100 ms, so only a reader that stops reading (a
@@ -100,21 +106,30 @@ impl EventHub {
         self.read_batch(cursor, true)
     }
 
-    /// [`Self::read_after`] without the events the federation relay pushed:
-    /// what this server serves to a coordinator that relays it.
-    pub fn read_local_after(&self, cursor: u64) -> EventBatch {
-        self.read_batch(cursor, false)
-    }
-
     fn read_batch(&self, cursor: u64, include_relayed: bool) -> EventBatch {
-        let Ok(state) = self.inner.lock() else {
-            return EventBatch {
+        self.read_checked(cursor, include_relayed)
+            .unwrap_or_else(|_| EventBatch {
                 head: cursor,
                 missed: None,
                 events: Vec::new(),
-            };
-        };
-        state.batch_after(cursor, include_relayed)
+            })
+    }
+
+    /// [`Self::read_after`] (or, without `include_relayed`, only the events
+    /// this server produced itself) that reports a poisoned history as
+    /// [`EventHistoryError::Unavailable`] instead of an empty batch. A batch
+    /// whose `missed` is set is what [`EventHistoryError::Lost`] describes; the
+    /// subscription stream decides whether that ends the stream.
+    pub(super) fn read_checked(
+        &self,
+        cursor: u64,
+        include_relayed: bool,
+    ) -> Result<EventBatch, EventHistoryError> {
+        let state = self
+            .inner
+            .lock()
+            .map_err(|_| EventHistoryError::Unavailable)?;
+        Ok(state.batch_after(cursor, include_relayed))
     }
 
     pub fn current_sequence(&self) -> u64 {
@@ -204,7 +219,7 @@ mod tests {
         hub.push_relayed(focused("peer/w1"));
         hub.push(focused("local-2"));
 
-        let local = hub.read_local_after(0);
+        let local = hub.read_checked(0, false).unwrap();
         assert_eq!(local.head, 3);
         assert_eq!(
             local
@@ -227,15 +242,57 @@ mod tests {
         }
 
         // Seen through the local event; only relayed events were lost since.
-        assert_eq!(hub.read_local_after(1).missed, None);
+        assert_eq!(hub.read_checked(1, false).unwrap().missed, None);
         assert_eq!(
             hub.read_after(1).missed,
             Some(MissedEvents { first: 2, last: 3 })
         );
         // A local reader that had not seen the local event did miss it.
         assert_eq!(
-            hub.read_local_after(0).missed,
+            hub.read_checked(0, false).unwrap().missed,
             Some(MissedEvents { first: 1, last: 1 })
         );
+    }
+
+    #[test]
+    fn checked_history_distinguishes_retained_boundary_from_lost_events() {
+        let hub = EventHub::default();
+        let empty = hub.read_checked(0, true).unwrap();
+        assert!(empty.events.is_empty() && empty.missed.is_none());
+        for index in 0..EventHub::MAX_EVENTS {
+            hub.push(focused(&index.to_string()));
+        }
+        let full = hub.read_checked(0, true).unwrap();
+        assert_eq!(full.missed, None);
+        assert_eq!(full.events.len(), EventHub::MAX_EVENTS);
+        hub.push(focused("overflow"));
+        assert_eq!(
+            hub.read_checked(0, true).unwrap().missed,
+            Some(MissedEvents { first: 1, last: 1 })
+        );
+        let retained = hub.read_checked(1, true).unwrap();
+        assert_eq!(retained.missed, None);
+        assert_eq!(retained.events.len(), EventHub::MAX_EVENTS);
+        assert_eq!(retained.events.first().unwrap().0, 2);
+        assert_eq!(retained.events.last().unwrap().0, hub.current_sequence());
+        assert!(hub
+            .read_checked(hub.current_sequence(), true)
+            .unwrap()
+            .events
+            .is_empty());
+    }
+
+    #[test]
+    fn checked_history_reports_unavailable_instead_of_empty_after_poison() {
+        let hub = EventHub::default();
+        assert!(std::panic::catch_unwind(|| {
+            let _guard = hub.inner.lock().unwrap();
+            panic!("poison the test event history");
+        })
+        .is_err());
+        assert!(matches!(
+            hub.read_checked(0, true),
+            Err(EventHistoryError::Unavailable)
+        ));
     }
 }

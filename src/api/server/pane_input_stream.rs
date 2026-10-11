@@ -15,8 +15,8 @@
 //! preserves order by construction.
 //!
 //! The line-framing read machinery lives in `stream_read`, shared with
-//! `pane_graphics_stream.rs` and `gram_upload_stream.rs`; only this channel's
-//! own byte cap and deadlines are set here.
+//! `gram_upload_stream.rs`; only this channel's own byte cap and deadlines are
+//! set here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -31,7 +31,7 @@ use crate::ipc::is_connection_closed_error;
 
 use super::stream_read::{read_line, stream_is_running};
 use super::{
-    api_response_outcome, dispatch_stream_open, dispatch_to_app_with_timeout, write_json_line,
+    api_response_outcome, dispatch_to_app_with_timeout, write_json_line,
     write_json_line_allow_disconnect, write_text_line_allow_disconnect, APP_RESPONSE_TIMEOUT,
 };
 
@@ -104,14 +104,13 @@ fn serve_with_open_timeout(
 
     // Open handshake: validate the pane exists (and reject an unknown pane) before
     // upgrading the connection into a held-open frame loop.
-    let open_response = dispatch_stream_open(
+    let open_response = dispatch_to_app_with_timeout(
         Request {
             id: request_id.clone(),
             method: Method::PaneInputStreamOpen(params),
         },
         api_tx,
-        open_timeout,
-        Arc::clone(&stream_active),
+        Some(open_timeout),
     );
     if api_response_outcome(&open_response) != "ok" {
         stream_active.store(false, Ordering::Release);

@@ -207,7 +207,7 @@ impl App {
                     return encode_success(
                         id,
                         ResponseResult::GramSent {
-                            message: gram_item_to_info(item),
+                            message: gram_item_to_info(item, &self.gram_machine_labels()),
                             store_id,
                         },
                     );
@@ -228,14 +228,16 @@ impl App {
                     read_by_owner: false,
                     file,
                     origin_id: store_id.clone(),
+                    // Relayed from another machine: never a local agent's Gram.
+                    sender: None,
                 };
                 match crate::persist::gram::append(item.clone()) {
                     Ok(_) => {
-                        self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                        self.emit_apns_gram_message(&item);
                         encode_success(
                             id,
                             ResponseResult::GramSent {
-                                message: gram_item_to_info(item),
+                                message: gram_item_to_info(item, &self.gram_machine_labels()),
                                 store_id,
                             },
                         )
@@ -279,7 +281,57 @@ impl App {
                 };
                 self.handle_gram_delete_for(id, delete.id, Some(identity))
             }
+            GramRelayCall::Post(post) => {
+                // Only a HerdrUp guest's post, and only to an agent of the
+                // relaying machine: that machine serves the agent's guest. It
+                // names the agent as it knows it; here that agent is
+                // `<alias>/<name>`, as the federation roster qualifies it and
+                // as the agent's own relayed list and file reads identify it.
+                let to = post.to.trim();
+                let qualified = format!("{alias}/{to}");
+                if !crate::guest::store::valid_guest_name(&post.guest)
+                    || to.is_empty()
+                    || to.contains('/')
+                    || !self.relay_agent_named(&alias, &qualified)
+                {
+                    return encode_error(
+                        id,
+                        "forbidden",
+                        "a relayed post comes from a guest to one of this machine's agents",
+                    );
+                }
+                let file = post.file.map(|mut file| {
+                    file.upload_id = relay_upload_id(&alias, &file.upload_id);
+                    file
+                });
+                let params = GramPostParams {
+                    text: post.text,
+                    to: Some(qualified),
+                    file,
+                    from: Some(crate::guest::post_from(&post.guest)),
+                };
+                self.store_gram_post(id, params, false)
+            }
         }
+    }
+
+    /// Whether a reachable agent of peer `alias` has this qualified name.
+    #[cfg(unix)]
+    fn relay_agent_named(&self, alias: &str, name: &str) -> bool {
+        let prefix = format!("{alias}/");
+        !name.is_empty()
+            && self
+                .federation
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .merged_agents()
+                .into_iter()
+                .any(|agent| {
+                    agent.pane_id.starts_with(&prefix)
+                        && agent.name.as_deref() == Some(name)
+                        && agent.reachability
+                            == Some(crate::api::federation_store::Reachability::Reachable)
+                })
     }
 
     pub(super) fn handle_gram_send(&mut self, id: String, params: GramSendParams) -> String {
@@ -303,6 +355,10 @@ impl App {
             Ok(file) => file,
             Err(err) => return err,
         };
+        let sender = params
+            .caller_pane_id
+            .as_deref()
+            .and_then(|pane| self.caller_sender(pane));
         let item = GramItem {
             id: message_id,
             direction: StoredDirection::AgentToOwner,
@@ -315,15 +371,16 @@ impl App {
             read_by_owner: false,
             file,
             origin_id: store_id.clone(),
+            sender,
         };
 
         match crate::persist::gram::append(item.clone()) {
             Ok(_) => {
-                self.emit_apns_gram_message(&from, text, item.file.as_ref());
+                self.emit_apns_gram_message(&item);
                 encode_success(
                     id,
                     ResponseResult::GramSent {
-                        message: gram_item_to_info(item),
+                        message: gram_item_to_info(item, &self.gram_machine_labels()),
                         store_id,
                     },
                 )
@@ -337,6 +394,13 @@ impl App {
     }
 
     pub(super) fn handle_gram_post(&mut self, id: String, params: GramPostParams) -> String {
+        self.store_gram_post(id, params, true)
+    }
+
+    /// Store an owner-to-agent post. `check_live` refuses a `to` that names no
+    /// live agent here; a relayed post names an agent of the relaying machine
+    /// instead, checked by the caller.
+    fn store_gram_post(&mut self, id: String, params: GramPostParams, check_live: bool) -> String {
         let text = params.text.trim();
         if let Some(err) = validate_text(&id, text, params.file.is_some()) {
             return err;
@@ -357,7 +421,7 @@ impl App {
         // A direct message must name a live agent, else it would be visible to no
         // one and never expire — a silent black hole. Omit `to` for the shared
         // queue instead.
-        if let Some(target) = &to {
+        if let Some(target) = to.as_ref().filter(|_| check_live) {
             if !self.is_live_agent_name(target) {
                 return encode_error(
                     id,
@@ -388,13 +452,15 @@ impl App {
             read_by_owner: true,
             file,
             origin_id: store_id.clone(),
+            sender: None,
         };
 
         match crate::persist::gram::append(item.clone()) {
             Ok(_) => encode_success(
                 id,
                 ResponseResult::GramSent {
-                    message: gram_item_to_info(item),
+                    // An owner post names no sender machine.
+                    message: gram_item_to_info(item, &MachineLabels::new()),
                     store_id,
                 },
             ),
@@ -480,9 +546,13 @@ impl App {
         // Read-all affordance describe the inbox, not the window the client happens
         // to be holding.
         let unread_count = filtered.iter().filter(|item| is_unread(item)).count();
+        let labels = self.gram_machine_labels();
         // Store order is oldest-first; clients want newest-first.
-        let mut messages: Vec<GramMessageInfo> =
-            filtered.into_iter().rev().map(gram_item_to_info).collect();
+        let mut messages: Vec<GramMessageInfo> = filtered
+            .into_iter()
+            .rev()
+            .map(|item| gram_item_to_info(item, &labels))
+            .collect();
         let store_id = crate::persist::machine::get_or_create();
         // Over the FULL list, not the page, so a paging client can keep polling the
         // head for a few hundred bytes.
@@ -586,7 +656,8 @@ impl App {
             Ok((Ok(item), _)) => encode_success(
                 id,
                 ResponseResult::GramGrabbed {
-                    message: gram_item_to_info(item),
+                    // A claimed queue item is an owner post: no sender machine.
+                    message: gram_item_to_info(item, &MachineLabels::new()),
                 },
             ),
             Ok((Err(GrabError::NotFound), _)) => {
@@ -613,18 +684,25 @@ impl App {
             return gram_unavailable(id);
         }
 
-        let target_id = params.id.clone();
-        // Returns (found, changed); a re-mark of an already-read message is found
-        // but changes nothing, so it does not rewrite the store.
+        let targets: Vec<String> = params.targets().map(str::to_string).collect();
+        if targets.is_empty() {
+            return encode_error(id, "invalid_params", "pass id or ids");
+        }
+        // Returns (found, changed): every id must exist before any is marked,
+        // and a re-mark of already-read messages does not rewrite the store.
         let outcome = crate::persist::gram::update_if_changed(move |items| {
-            match items.iter_mut().find(|item| item.id == target_id) {
-                Some(item) => {
-                    let changed = !item.read_by_owner;
-                    item.read_by_owner = true;
-                    (true, changed)
-                }
-                None => (false, false),
+            if !targets
+                .iter()
+                .all(|target| items.iter().any(|item| &item.id == target))
+            {
+                return (false, false);
             }
+            let mut changed = false;
+            for item in items.iter_mut().filter(|item| targets.contains(&item.id)) {
+                changed |= !item.read_by_owner;
+                item.read_by_owner = true;
+            }
+            (true, changed)
         });
         match outcome {
             Ok((true, _)) => encode_success(id, ResponseResult::Ok {}),
@@ -888,6 +966,18 @@ impl App {
             .or_else(|| self.public_pane_id(ws_idx, pane_id))
     }
 
+    /// The terminal and agent kind behind a caller pane, recorded on the Gram
+    /// it sends so a guest's view follows the agent, not a reusable name.
+    fn caller_sender(&self, caller_pane_id: &str) -> Option<crate::persist::gram::GramSender> {
+        let (ws_idx, pane_id) = self.parse_pane_id(caller_pane_id)?;
+        let terminal_id = self.state.workspaces.get(ws_idx)?.terminal_id(pane_id)?;
+        let terminal = self.state.terminals.get(terminal_id)?;
+        Some(crate::persist::gram::GramSender {
+            terminal_id: terminal_id.to_string(),
+            agent: terminal.effective_agent_label().map(str::to_string),
+        })
+    }
+
     /// Whether some live terminal has this exact unique agent name. Used to reject
     /// a direct `gram.post` to a nonexistent agent instead of black-holing it.
     fn is_live_agent_name(&self, name: &str) -> bool {
@@ -927,31 +1017,107 @@ impl App {
     /// A sibling of `emit_apns_agent_notifications`: detached, best-effort, guarded
     /// by `crate::push::may_deliver`. The alert deep-links to the app's Gram page, so
     /// it carries no pane/workspace id (the payload's `gram` marker signals this).
-    fn emit_apns_gram_message(&self, from: &str, text: &str, file: Option<&GramFile>) {
+    fn emit_apns_gram_message(&self, item: &GramItem) {
         if self.no_session || !crate::push::may_deliver(&self.state.push_config) {
             return;
         }
-        let title =
-            super::sanitized_notification_text(from, 80).unwrap_or_else(|| "New gram".to_string());
-        let mut body = super::sanitized_notification_text(text, 240).unwrap_or_default();
-        // Note an attachment so a file-only (or captioned) gram reads sensibly on
-        // the lock screen. The name is already a sanitized basename.
-        if let Some(file) = file {
-            let hint = format!("📎 {}", file.name);
-            body = if body.is_empty() {
-                hint
-            } else {
-                format!("{body}\n{hint}")
-            };
+        let labels = self.gram_machine_labels();
+        crate::push::dispatch(
+            self.state.push_config.clone(),
+            vec![gram_push_notification(
+                item,
+                sender_machine_label(item, &labels),
+            )],
+        );
+    }
+
+    /// Display label of each federated machine by routing alias: the label the
+    /// federation store stamps on that machine's cached agents and workspaces.
+    /// A machine whose label is only its alias has none.
+    fn gram_machine_labels(&self) -> MachineLabels {
+        self.federation
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .peers()
+            .filter_map(|(alias, entry)| {
+                entry
+                    .agents
+                    .iter()
+                    .filter_map(|agent| agent.machine_label.as_deref())
+                    .chain(
+                        entry
+                            .workspaces
+                            .iter()
+                            .filter_map(|workspace| workspace.machine_label.as_deref()),
+                    )
+                    .map(str::trim)
+                    .find(|label| !label.is_empty() && *label != alias)
+                    .map(|label| (alias.to_owned(), label.to_owned()))
+            })
+            .collect()
+    }
+}
+
+/// Federated machines' display labels by routing alias.
+type MachineLabels = std::collections::HashMap<String, String>;
+
+/// The label of the federated machine a relayed Gram came from: `from` is
+/// `<alias>/<name>` and `alias` has a label. `None` for a local Gram, an
+/// owner post, or an alias without a label.
+fn sender_machine_label<'a>(item: &GramItem, labels: &'a MachineLabels) -> Option<&'a str> {
+    if item.direction != StoredDirection::AgentToOwner {
+        return None;
+    }
+    let (alias, name) = item.from.split_once('/')?;
+    if name.is_empty() {
+        return None;
+    }
+    labels.get(alias).map(String::as_str)
+}
+
+/// The alert for a new Gram to the owner. It deep-links to the app's Gram
+/// page, so it carries no pane or workspace id. A Gram from a labeled
+/// federated machine names it the way remote agent alerts do:
+/// "llm-opt on Jerry's Mac Studio".
+pub(crate) fn gram_push_notification(
+    item: &GramItem,
+    machine_label: Option<&str>,
+) -> crate::push::PushNotification {
+    let sender = match machine_label {
+        Some(label) => {
+            let name = item
+                .from
+                .split_once('/')
+                .map_or(item.from.as_str(), |(_, name)| name);
+            format!("{name} on {label}")
         }
-        let notification = crate::push::PushNotification {
-            title,
-            body,
-            pane_id: String::new(),
-            workspace_id: String::new(),
-            kind: crate::push::PushKind::Gram,
+        None => item.from.clone(),
+    };
+    let title =
+        super::sanitized_notification_text(&sender, 80).unwrap_or_else(|| "New gram".to_string());
+    let mut body = super::sanitized_notification_text(&item.text, 240).unwrap_or_default();
+    // Note an attachment so a file-only (or captioned) gram reads sensibly on
+    // the lock screen. The name is already a sanitized basename.
+    if let Some(file) = &item.file {
+        let hint = format!("📎 {}", file.name);
+        body = if body.is_empty() {
+            hint
+        } else {
+            format!("{body}\n{hint}")
         };
-        crate::push::dispatch(self.state.push_config.clone(), vec![notification]);
+    }
+    crate::push::PushNotification {
+        title,
+        body,
+        pane_id: String::new(),
+        workspace_id: String::new(),
+        kind: crate::push::PushKind::Gram,
+        #[cfg(unix)]
+        guest_scope: Some(crate::guest::push::GuestScope::Gram {
+            from: item.from.clone(),
+            sender: item.sender.clone(),
+            gram_id: item.id.clone(),
+        }),
     }
 }
 
@@ -1113,7 +1279,8 @@ fn gram_unavailable(id: String) -> String {
     )
 }
 
-fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
+fn gram_item_to_info(item: GramItem, labels: &MachineLabels) -> GramMessageInfo {
+    let machine_label = sender_machine_label(&item, labels).map(str::to_owned);
     GramMessageInfo {
         id: item.id,
         direction: match item.direction {
@@ -1134,6 +1301,7 @@ fn gram_item_to_info(item: GramItem) -> GramMessageInfo {
             sha256: file.sha256,
         }),
         origin_id: item.origin_id,
+        machine_label,
     }
 }
 
@@ -1274,6 +1442,7 @@ mod tests {
             read_by_owner: true,
             file: None,
             origin_id: "machine_test".to_string(),
+            sender: None,
         }
     }
 
@@ -1481,7 +1650,10 @@ mod tests {
     fn gram_item_to_info_carries_origin_id_to_the_wire() {
         let mut item = owner_shared("m1");
         item.origin_id = "machine_abc123".to_string();
-        assert_eq!(gram_item_to_info(item).origin_id, "machine_abc123");
+        assert_eq!(
+            gram_item_to_info(item, &MachineLabels::new()).origin_id,
+            "machine_abc123"
+        );
     }
 
     #[test]
@@ -1578,7 +1750,7 @@ mod tests {
     /// and the whole store ships every 6 seconds, which is the bug being fixed.
     #[test]
     fn list_digest_is_stable_for_the_same_answer() {
-        let messages = vec![gram_item_to_info(owner_shared("g1"))];
+        let messages = vec![gram_item_to_info(owner_shared("g1"), &MachineLabels::new())];
         assert_eq!(
             list_digest("store-1", &messages),
             list_digest("store-1", &messages)
@@ -1590,13 +1762,13 @@ mod tests {
     /// field at once, including ones added later.
     #[test]
     fn list_digest_changes_with_content_and_with_the_store() {
-        let base = vec![gram_item_to_info(owner_shared("g1"))];
+        let base = vec![gram_item_to_info(owner_shared("g1"), &MachineLabels::new())];
         let mut read = owner_shared("g1");
         read.read_by_owner = false;
-        let flipped = vec![gram_item_to_info(read)];
+        let flipped = vec![gram_item_to_info(read, &MachineLabels::new())];
         let two = vec![
-            gram_item_to_info(owner_shared("g1")),
-            gram_item_to_info(owner_shared("g2")),
+            gram_item_to_info(owner_shared("g1"), &MachineLabels::new()),
+            gram_item_to_info(owner_shared("g2"), &MachineLabels::new()),
         ];
 
         let digest = list_digest("store-1", &base);
@@ -2041,6 +2213,92 @@ mod tests {
         assert_eq!(answer["error"]["code"], "invalid_params");
     }
 
+    /// A federated machine's agent as the coordinator caches it, stamped with
+    /// the machine's label.
+    fn labeled_peer_agent(alias: &str, label: &str) -> crate::api::schema::AgentInfo {
+        serde_json::from_value(serde_json::json!({
+            "terminal_id": format!("{alias}/t1"),
+            "name": format!("{alias}/llm-opt"),
+            "agent": "omp",
+            "agent_status": "idle",
+            "workspace_id": format!("{alias}/w1"),
+            "tab_id": format!("{alias}/w1:t1"),
+            "pane_id": format!("{alias}/w1-1"),
+            "focused": false,
+            "revision": 1,
+            "machine_id": alias,
+            "machine_label": label,
+            "reachability": "reachable",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn owner_list_labels_only_grams_relayed_from_a_labeled_machine() {
+        const STUDIO: &str = "8195b6326f748f4da1945364a4e205b9";
+        let sent = |id: &str, from: &str| GramItem {
+            direction: StoredDirection::AgentToOwner,
+            from: from.to_string(),
+            to: None,
+            read_by_owner: false,
+            ..owner_shared(id)
+        };
+        let mut post = owner_shared("post");
+        post.to = Some(format!("{STUDIO}/llm-opt"));
+        let items = [
+            sent("relayed", &format!("{STUDIO}/llm-opt")),
+            sent("unknown", "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f/llm-opt"),
+            // An explicit peer without a display label is labeled by its alias.
+            sent("bare", "home/builder"),
+            sent("local", "llm-local"),
+            post,
+        ];
+        let answer = with_gram_store(&items, |app| {
+            {
+                let mut store = app.federation.lock().unwrap();
+                for (alias, label) in [(STUDIO, "Jerry's Mac Studio"), ("home", "home")] {
+                    store.set_peer(
+                        alias,
+                        crate::api::federation_store::PeerCacheEntry::reachable(
+                            vec![labeled_peer_agent(alias, label)],
+                            std::time::Instant::now(),
+                        ),
+                    );
+                }
+            }
+            list(app, GramListParams::default())
+        });
+        let messages = answer["result"]["messages"].as_array().unwrap();
+        let mut labels: Vec<_> = messages
+            .iter()
+            .map(|message| {
+                (
+                    message["id"].as_str().unwrap(),
+                    message["from"].as_str().unwrap(),
+                    message
+                        .get("machine_label")
+                        .and_then(|label| label.as_str()),
+                )
+            })
+            .collect();
+        labels.sort_unstable();
+        assert_eq!(
+            labels,
+            [
+                ("bare", "home/builder", None),
+                ("local", "llm-local", None),
+                ("post", "owner", None),
+                (
+                    "relayed",
+                    "8195b6326f748f4da1945364a4e205b9/llm-opt",
+                    Some("Jerry's Mac Studio")
+                ),
+                ("unknown", "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f/llm-opt", None),
+            ],
+            "{answer}"
+        );
+    }
+
     #[cfg(unix)]
     mod relay_reload {
         use super::*;
@@ -2205,6 +2463,174 @@ mod tests {
             reload(&mut app, &path, "");
             assert_eq!(crate::api::gram_relay::policy().remote_socket(), None);
             assert_eq!(status(&app)["remote"]["accepting"], serde_json::Value::Null);
+        }
+
+        /// A coordinator allowing `PEER`, whose roster has `llm-opt` in pane
+        /// `w1-1` and `other-agent` in `w1-2`, merged as the coordinator's
+        /// federation poll merges them: every name and id `PEER/`-qualified.
+        fn coordinator() -> App {
+            let (mut app, path) = app_with_config_file();
+            reload(
+                &mut app,
+                &path,
+                &format!("[gram_relay]\npeers = [\"{PEER}\"]\n"),
+            );
+            let presentation = crate::api::federation_manager::PeerPresentation {
+                profile_id: Some(PEER.into()),
+                label: "Jerrys-Mac-Studio".into(),
+            };
+            let agent = |pane: &str, name: &str| -> crate::api::schema::AgentInfo {
+                let local = serde_json::from_value(serde_json::json!({
+                    "terminal_id": format!("term_65c2c15717c84.{pane}"),
+                    "name": name,
+                    "agent": "omp",
+                    "agent_status": "idle",
+                    "workspace_id": "w1",
+                    "tab_id": "w1:t1",
+                    "pane_id": pane,
+                    "focused": false,
+                    "revision": 1,
+                }))
+                .unwrap();
+                crate::api::prefix_remote_agent(PEER, &presentation, local).unwrap()
+            };
+            app.federation.lock().unwrap().set_peer(
+                PEER,
+                crate::api::federation_store::PeerCacheEntry::reachable(
+                    vec![agent("w1-1", "llm-opt"), agent("w1-2", "other-agent")],
+                    std::time::Instant::now(),
+                ),
+            );
+            app
+        }
+
+        fn relay(app: &mut App, call: serde_json::Value) -> serde_json::Value {
+            let call: GramRelayCall = serde_json::from_value(call).unwrap();
+            serde_json::from_str(&app.handle_gram_relay(
+                "relay".into(),
+                GramRelayParams {
+                    peer_alias: PEER.into(),
+                    call,
+                },
+            ))
+            .unwrap()
+        }
+
+        fn guest_post(to: &str, guest: &str) -> serde_json::Value {
+            serde_json::json!({"kind": "post", "params": {"text": "notes", "to": to, "guest": guest}})
+        }
+
+        #[test]
+        fn a_relayed_guest_post_reaches_the_remote_agent_with_its_file() {
+            let mut app = coordinator();
+            let staged = relay(
+                &mut app,
+                serde_json::json!({"kind": "upload_chunk", "params": {"upload_id": "guest-g-up", "offset": 0, "data_base64": "aGVsbG8="}}),
+            );
+            assert_eq!(staged["result"]["type"], "ok", "{staged}");
+            let posted = relay(
+                &mut app,
+                serde_json::json!({"kind": "post", "params": {"text": "notes", "to": "llm-opt", "guest": "plotarmordev", "file": {"upload_id": "guest-g-up", "name": "a.txt", "mime": "text/plain"}}}),
+            );
+            let message = &posted["result"]["message"];
+            assert_eq!(message["direction"], "owner_to_agent", "{posted}");
+            // Addressed as the coordinator names that machine's agent.
+            assert_eq!(message["to"], format!("{PEER}/llm-opt"));
+            let id = message["id"].as_str().unwrap();
+
+            let listed = relay(
+                &mut app,
+                serde_json::json!({"kind": "list", "params": {"caller_pane_id": "w1-1"}}),
+            );
+            let found = listed["result"]["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|item| item["id"] == id)
+                .cloned()
+                .unwrap_or_else(|| panic!("the agent lists the guest's post: {listed}"));
+            assert_eq!(found["from"], "plotarmordev (via HerdrUp)");
+            let chunk = relay(
+                &mut app,
+                serde_json::json!({"kind": "get_file_chunk", "params": {"id": id, "offset": 0, "caller_pane_id": "w1-1"}}),
+            );
+            assert_eq!(chunk["result"]["data_base64"], "aGVsbG8=", "{chunk}");
+
+            let others = relay(
+                &mut app,
+                serde_json::json!({"kind": "list", "params": {"caller_pane_id": "w1-2"}}),
+            );
+            assert!(
+                !others.to_string().contains(id),
+                "another agent does not see it: {others}"
+            );
+        }
+
+        #[test]
+        fn relayed_posts_are_only_guest_posts_to_the_peers_own_agents() {
+            let mut app = coordinator();
+            for call in [
+                guest_post("llm-opt", ""),
+                guest_post("llm-opt", "owner (via HerdrUp)"),
+                guest_post("not-on-the-peer", "plotarmordev"),
+                guest_post("", "plotarmordev"),
+                // The remote names its own agent; a qualified name is not one.
+                guest_post(&format!("{PEER}/llm-opt"), "plotarmordev"),
+            ] {
+                let answer = relay(&mut app, call.clone());
+                assert_eq!(answer["error"]["code"], "forbidden", "{call} -> {answer}");
+            }
+            let answer = relay(&mut app, guest_post("other-agent", "friend"));
+            assert_eq!(answer["result"]["type"], "gram_sent", "{answer}");
+        }
+
+        #[test]
+        fn a_relayed_gram_carries_its_machine_label_to_lists_and_the_owner_push() {
+            let mut app = coordinator();
+            app.state.push_config = crate::config::PushConfig {
+                mode: crate::config::PushMode::Direct,
+                enabled: true,
+                key_path: Some("/tmp/AuthKey.p8".to_string()),
+                key_id: Some("ABC123DEFG".to_string()),
+                team_id: Some("TEAM123456".to_string()),
+                topic: Some("app.herdr.ios".to_string()),
+                ..crate::config::PushConfig::default()
+            };
+            let capture = crate::push::test_sink::Capture::install();
+
+            let sent = relay(
+                &mut app,
+                serde_json::json!({"kind": "send", "params": {"text": "build done", "caller_pane_id": "w1-1"}}),
+            );
+            let message = &sent["result"]["message"];
+            assert_eq!(message["from"], format!("{PEER}/llm-opt"), "{sent}");
+            assert_eq!(message["machine_label"], "Jerrys-Mac-Studio", "{sent}");
+            let id = message["id"].as_str().unwrap();
+
+            let alerts = capture.take().alerts;
+            assert_eq!(alerts.len(), 1, "{alerts:?}");
+            assert_eq!(alerts[0].title, "llm-opt on Jerrys-Mac-Studio");
+            assert_eq!(alerts[0].body, "build done");
+
+            let owner: serde_json::Value = serde_json::from_str(
+                &app.handle_gram_list("owner".into(), GramListParams::default()),
+            )
+            .unwrap();
+            let agent = relay(
+                &mut app,
+                serde_json::json!({"kind": "list", "params": {"caller_pane_id": "w1-1"}}),
+            );
+            for answer in [owner, agent] {
+                let listed = answer["result"]["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"] == id)
+                    .cloned()
+                    .unwrap_or_else(|| panic!("the relayed Gram is listed: {answer}"));
+                assert_eq!(listed["from"], format!("{PEER}/llm-opt"));
+                assert_eq!(listed["machine_label"], "Jerrys-Mac-Studio", "{answer}");
+            }
         }
     }
 }

@@ -120,10 +120,18 @@ impl RemoteAgent {
             status: agent.agent_status,
             agent: agent.agent.clone(),
             alert: AlertContext {
-                title_agent: agent
-                    .agent
-                    .as_deref()
-                    .map(|label| super::push_title_agent(agent.name.as_deref(), label).to_owned()),
+                // The poll stores remote names alias-qualified ("<machine-id>/llm-opt")
+                // so they can be addressed; the title names the machine separately, so
+                // it takes the agent's own name. Without this the title starts with a
+                // 32-character machine id and iOS truncates everything after it.
+                title_agent: agent.agent.as_deref().map(|label| {
+                    let name = agent.name.as_deref().map(|name| {
+                        name.strip_prefix(alias)
+                            .and_then(|rest| rest.strip_prefix('/'))
+                            .unwrap_or(name)
+                    });
+                    super::push_title_agent(name, label).to_owned()
+                }),
                 machine: agent
                     .machine_label
                     .clone()
@@ -149,18 +157,12 @@ fn detect_state(status: AgentStatus) -> crate::detect::AgentState {
 
 /// The alert a remote pane's status change calls for, if any; only agent
 /// panes notify.
-fn transition_kind(
-    previous: AgentStatus,
-    previous_agent: Option<&str>,
-    agent: &RemoteAgent,
-) -> Option<PushKind> {
+fn transition_kind(previous: AgentStatus, agent: &RemoteAgent) -> Option<PushKind> {
     agent.agent.as_ref()?;
-    let toast = crate::app::actions::notification_toast_for_state_change_with_agent_labels(
+    let toast = crate::app::actions::notification_toast_for_state_change(
         false,
         detect_state(previous),
         detect_state(agent.status),
-        previous_agent,
-        agent.agent.as_deref(),
     );
     super::push_kind_for(false, toast)
 }
@@ -193,6 +195,8 @@ impl RemoteTransition {
             pane_id: self.pane_id,
             workspace_id: self.alert.workspace_id,
             kind: self.kind,
+            #[cfg(unix)]
+            guest_scope: None,
         })
     }
 }
@@ -291,7 +295,7 @@ impl RemotePushTracker {
             let kind = if seeding {
                 None
             } else {
-                transition_kind(AgentStatus::Unknown, None, &agent)
+                transition_kind(AgentStatus::Unknown, &agent)
             };
             if let Some(kind) = kind {
                 transitions.push(RemoteTransition {
@@ -323,7 +327,7 @@ impl RemotePushTracker {
         let kind = if exited {
             None
         } else {
-            transition_kind(seen.status, seen.agent.as_deref(), &agent)
+            transition_kind(seen.status, &agent)
         };
         // A finish that comes with a release waits for a possible exit; the
         // release is spent by the status change it causes.
@@ -468,12 +472,14 @@ mod tests {
         app
     }
 
-    /// A remote agent as the poll stores it: ids alias-qualified, machine
-    /// fields stamped by the coordinator.
+    /// A remote agent as the poll stores it (`prefix_remote_agent`): ids and the
+    /// name alias-qualified, machine fields stamped by the coordinator. `name` is
+    /// the agent's own name; the alias is the pane id's prefix.
     fn remote_agent(pane_id: &str, name: &str, status: AgentStatus) -> AgentInfo {
+        let alias = pane_id.split_once('/').map_or(PEER, |(alias, _)| alias);
         serde_json::from_value(serde_json::json!({
             "terminal_id": format!("{PEER}/t1"),
-            "name": name,
+            "name": format!("{alias}/{name}"),
             "agent": "claude",
             "agent_status": status,
             "workspace_id": format!("{PEER}/w1"),

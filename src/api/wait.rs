@@ -1107,6 +1107,7 @@ mod tests {
             interactive_ready: true,
             state_change_seq,
             status_since_unix_ms: None,
+            completion_seq: None,
             cwd: None,
             foreground_cwd: None,
             revision: 1,

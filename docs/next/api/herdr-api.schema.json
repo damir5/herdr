@@ -1066,6 +1066,16 @@
                 "null"
               ]
             },
+            "input_modes": {
+              "description": "DEC private input modes that are on (1 cursor keys, 9/1000/1002/1003 mouse tracking,\n1004 focus, 1005/1006/1016 mouse encoding, 1007 alternate scroll, 2004 bracketed paste).",
+              "items": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
             "input_pending": {
               "type": "boolean"
             },
@@ -8685,6 +8695,16 @@
                 "null"
               ]
             },
+            "input_modes": {
+              "description": "DEC private input modes that are on (1 cursor keys, 9/1000/1002/1003 mouse tracking,\n1004 focus, 1005/1006/1016 mouse encoding, 1007 alternate scroll, 2004 bracketed paste).",
+              "items": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
+            },
             "input_pending": {
               "type": "boolean"
             },
@@ -10154,6 +10174,16 @@
                 "string",
                 "null"
               ]
+            },
+            "input_modes": {
+              "description": "DEC private input modes that are on (1 cursor keys, 9/1000/1002/1003 mouse tracking,\n1004 focus, 1005/1006/1016 mouse encoding, 1007 alternate scroll, 2004 bracketed paste).",
+              "items": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
             },
             "input_pending": {
               "type": "boolean"
@@ -13856,6 +13886,16 @@
                 "string",
                 "null"
               ]
+            },
+            "input_modes": {
+              "description": "DEC private input modes that are on (1 cursor keys, 9/1000/1002/1003 mouse tracking,\n1004 focus, 1005/1006/1016 mouse encoding, 1007 alternate scroll, 2004 bracketed paste).",
+              "items": {
+                "format": "uint16",
+                "maximum": 65535,
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": "array"
             },
             "input_pending": {
               "type": "boolean"

@@ -1255,6 +1255,7 @@ fn worktree_request_and_response_round_trip() {
                 turn_epoch: None,
                 scroll: None,
                 alternate_screen: false,
+                input_modes: Vec::new(),
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1703,6 +1704,7 @@ fn create_response_round_trips_with_root_pane() {
                 turn_epoch: None,
                 scroll: None,
                 alternate_screen: false,
+                input_modes: Vec::new(),
                 revision: 0,
             },
         },

@@ -153,6 +153,32 @@ pub struct InputState {
     pub color_scheme_reporting: bool,
 }
 
+impl InputState {
+    /// DEC private input modes that are on, so an API client attaching mid-session can restore them.
+    pub fn decset_modes(self) -> Vec<u16> {
+        use crate::input::{MouseProtocolEncoding as E, MouseProtocolMode as M};
+        let mut modes = Vec::new();
+        if self.application_cursor { modes.push(1); }
+        match self.mouse_protocol_mode {
+            M::None => {}
+            M::Press => modes.push(9),
+            M::PressRelease => modes.push(1000),
+            M::ButtonMotion => modes.push(1002),
+            M::AnyMotion => modes.push(1003),
+        }
+        if self.focus_reporting { modes.push(1004); }
+        match self.mouse_protocol_encoding {
+            E::Default => {}
+            E::Utf8 => modes.push(1005),
+            E::Sgr => modes.push(1006),
+            E::SgrPixels => modes.push(1016),
+        }
+        if self.mouse_alternate_scroll { modes.push(1007); }
+        if self.bracketed_paste { modes.push(2004); }
+        modes
+    }
+}
+
 #[cfg(test)]
 impl InputState {
     pub fn mouse_reporting_enabled(self) -> bool {
@@ -3808,6 +3834,23 @@ mod tests {
     use super::*;
     use ratatui::{layout::Rect, style::Color};
     use tokio::sync::mpsc;
+
+    #[test]
+    fn decset_modes_let_a_late_api_client_route_the_wheel_like_the_program_asked() {
+        // A client that attaches to a running full-screen program never sees its DECSETs.
+        let state = InputState {
+            alternate_screen: true,
+            application_cursor: false,
+            bracketed_paste: true,
+            focus_reporting: false,
+            mouse_protocol_mode: crate::input::MouseProtocolMode::AnyMotion,
+            mouse_protocol_encoding: crate::input::MouseProtocolEncoding::Sgr,
+            mouse_alternate_scroll: false,
+            modify_other_keys: false,
+            color_scheme_reporting: false,
+        };
+        assert_eq!(state.decset_modes(), vec![1003, 1006, 2004]);
+    }
 
     #[test]
     fn plain_page_keys_host_scroll_for_shell_like_decckm_with_bracketed_paste() {

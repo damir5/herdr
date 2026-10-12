@@ -206,6 +206,7 @@ fn pane_scroll_result(
                 viewport_rows,
             }),
             alternate_screen: false,
+            input_modes: Vec::new(),
             revision: 0,
         },
     }

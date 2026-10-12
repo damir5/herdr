@@ -3151,6 +3151,7 @@ mod tests {
             turn_epoch: Some(9),
             scroll: None,
             alternate_screen: false,
+            input_modes: Vec::new(),
             revision: 0,
         }
     }

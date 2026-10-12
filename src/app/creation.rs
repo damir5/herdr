@@ -471,6 +471,11 @@ impl App {
             .and_then(|runtime| runtime.active_screen())
             .map(|screen| screen == crate::ghostty::ActiveScreen::Alternate)
             .unwrap_or(false);
+        let input_modes = self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .map(|runtime| runtime.input_modes())
+            .unwrap_or_default();
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -574,6 +579,7 @@ impl App {
             turn_epoch: terminal.is_agent_terminal().then_some(terminal.turn_epoch),
             scroll,
             alternate_screen,
+            input_modes,
             revision: terminal.revision,
         })
     }

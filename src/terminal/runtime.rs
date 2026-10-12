@@ -359,6 +359,14 @@ impl TerminalRuntime {
         self.0.alternate_screen_active()
     }
 
+    /// See `InputState::decset_modes`.
+    pub fn input_modes(&self) -> Vec<u16> {
+        #[cfg(unix)]
+        return self.0.input_state().map(|state| state.decset_modes()).unwrap_or_default();
+        #[cfg(not(unix))]
+        Vec::new()
+    }
+
     pub fn active_screen(&self) -> Option<crate::ghostty::ActiveScreen> {
         self.0.active_screen()
     }

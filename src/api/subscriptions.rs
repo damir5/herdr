@@ -1114,6 +1114,7 @@ mod tests {
             turn_epoch: None,
             scroll,
             alternate_screen: false,
+            input_modes: Vec::new(),
             revision: 0,
         }
     }

@@ -112,7 +112,7 @@ fn spawn_server(
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_DROVER_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -156,7 +156,7 @@ fn spawn_herdr_auto(
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_DROVER_ENV");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -261,7 +261,7 @@ fn session_attach_without_terminal_leaves_no_session() {
             .env("XDG_CONFIG_HOME", &config_home)
             .env("XDG_RUNTIME_DIR", &runtime_dir)
             .env_remove("HERDR_CONFIG_PATH")
-            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_DROVER_ENV")
             .env_remove("HERDR_SESSION")
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_CLIENT_SOCKET_PATH")
@@ -604,7 +604,7 @@ fn auto_detect_default_socket_path_from_config_dir() {
     cmd.env("XDG_CONFIG_HOME", &config_home);
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_DROVER_ENV");
     // Explicitly remove socket overrides to test default path resolution.
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -713,7 +713,7 @@ fn auto_detect_respects_nested_guard_before_auto_attach() {
         .env("XDG_RUNTIME_DIR", &runtime_dir)
         .env("HERDR_SOCKET_PATH", &api_socket)
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
-        .env("HERDR_ENV", "1")
+        .env("HERDR_DROVER_ENV", "1")
         .output()
         .unwrap();
 

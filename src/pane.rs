@@ -224,6 +224,9 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
             cmd.env_remove(var);
         }
     }
+    // A server started from a system herdr pane inherits its marker; drop it so a
+    // system herdr can run inside our panes.
+    cmd.env_remove("HERDR_ENV");
     cmd.env(crate::HERDR_ENV_VAR, crate::HERDR_ENV_VALUE);
     crate::integration::apply_pane_base_env(cmd);
     crate::platform::apply_pane_runtime_marker(cmd);

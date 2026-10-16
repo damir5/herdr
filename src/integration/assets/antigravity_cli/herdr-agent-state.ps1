@@ -17,7 +17,7 @@ function Exit-Hook {
 }
 
 if ($Action -ne "session") { Exit-Hook }
-if ($env:HERDR_ENV -ne "1") { Exit-Hook }
+if ($env:HERDR_DROVER_ENV -ne "1") { Exit-Hook }
 if ([string]::IsNullOrWhiteSpace($env:HERDR_PANE_ID)) { Exit-Hook }
 
 $inputText = [Console]::In.ReadToEnd()

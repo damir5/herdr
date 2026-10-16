@@ -18,7 +18,7 @@ emit_and_exit() {
 }
 
 [ "${1:-}" = "session" ] || emit_and_exit
-[ "${HERDR_ENV:-}" = "1" ] || emit_and_exit
+[ "${HERDR_DROVER_ENV:-}" = "1" ] || emit_and_exit
 [ -n "${HERDR_SOCKET_PATH:-}" ] || emit_and_exit
 [ -n "${HERDR_PANE_ID:-}" ] || emit_and_exit
 command -v python3 >/dev/null 2>&1 || emit_and_exit

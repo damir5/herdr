@@ -8,7 +8,7 @@
 import net from "node:net";
 import path from "node:path";
 
-const HERDR_ENV = process.env.HERDR_ENV;
+const HERDR_DROVER_ENV = process.env.HERDR_DROVER_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
 const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
@@ -20,7 +20,7 @@ const source = "herdr:omp";
 const nestedOmpSession = process.env.OMPCODE === "1";
 
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession;
+  return HERDR_DROVER_ENV === "1" && !!socketPath && !!paneId && !nestedOmpSession;
 }
 
 let requestQueue = Promise.resolve();

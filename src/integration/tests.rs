@@ -3938,7 +3938,7 @@ fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     let mut child = Command::new("sh")
         .arg(&installed.hook_path)
         .arg("session")
-        .env("HERDR_ENV", "1")
+        .env("HERDR_DROVER_ENV", "1")
         .env("HERDR_PANE_ID", "w1:p2")
         .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
         .env("HERDR_BIN_PATH", &fake_herdr)

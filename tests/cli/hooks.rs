@@ -89,7 +89,7 @@ fn run_shell_hook_with_env(
     command
         .arg(hook_path)
         .args(args)
-        .env("HERDR_ENV", "1")
+        .env("HERDR_DROVER_ENV", "1")
         .env("HERDR_SOCKET_PATH", &socket_path)
         .env("HERDR_PANE_ID", "p_test")
         .env_remove("CODEX_THREAD_ID")

@@ -135,7 +135,7 @@ function ownsLocalLifecycle() {
 export const HerdrAgentStatePlugin = async () => {
   if (
     !ownsLocalLifecycle() ||
-    process.env.HERDR_ENV !== "1" ||
+    process.env.HERDR_DROVER_ENV !== "1" ||
     !process.env.HERDR_SOCKET_PATH ||
     !process.env.HERDR_PANE_ID
   ) {

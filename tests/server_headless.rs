@@ -145,7 +145,7 @@ fn spawn_server_with_relay(
     cmd.env("HERDR_SOCKET_PATH", api_socket_path);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_DROVER_ENV");
     if let Some(socket) = relay_socket {
         cmd.env("HERDR_GRAM_REVERSE_SOCKET", socket);
     } else {
@@ -734,7 +734,7 @@ fn duplicate_server_start_fails_gracefully() {
     cmd.env("HERDR_SOCKET_PATH", &api_socket);
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
-    cmd.env_remove("HERDR_ENV");
+    cmd.env_remove("HERDR_DROVER_ENV");
 
     let mut child2 = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child2.process_id());

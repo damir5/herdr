@@ -4,7 +4,7 @@
 # HERDR_INTEGRATION_ID=copilot
 # HERDR_INTEGRATION_VERSION=3
 
-if ($env:HERDR_ENV -ne "1") { exit 0 }
+if ($env:HERDR_DROVER_ENV -ne "1") { exit 0 }
 if ([string]::IsNullOrWhiteSpace($env:HERDR_PANE_ID)) { exit 0 }
 if ([string]::IsNullOrWhiteSpace($env:HERDR_SOCKET_PATH)) { exit 0 }
 

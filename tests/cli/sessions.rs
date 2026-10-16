@@ -239,7 +239,7 @@ fn dead_server_cli_reports_one_session_aware_json_line() {
         .env("HERDR_SOCKET_PATH", &stale_socket)
         .env("HERDR_SESSION", "unrelated")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
-        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_DROVER_ENV")
         .output()
         .unwrap();
     assert_server_not_running(stale, &stale_socket, "herdr");

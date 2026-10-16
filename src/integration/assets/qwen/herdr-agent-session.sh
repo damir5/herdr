@@ -4,7 +4,7 @@
 # HERDR_INTEGRATION_VERSION=1
 
 [ "${1:-}" = "session" ] || exit 0
-[ "${HERDR_ENV:-}" = "1" ] || exit 0
+[ "${HERDR_DROVER_ENV:-}" = "1" ] || exit 0
 [ -n "${HERDR_PANE_ID:-}" ] || exit 0
 [ -n "${HERDR_SOCKET_PATH:-}" ] || exit 0
 if [ -n "${HERDR_BIN_PATH:-}" ]; then

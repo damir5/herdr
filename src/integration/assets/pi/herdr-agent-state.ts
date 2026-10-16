@@ -8,7 +8,7 @@
 import net from "node:net";
 import path from "node:path";
 
-const HERDR_ENV = process.env.HERDR_ENV;
+const HERDR_DROVER_ENV = process.env.HERDR_DROVER_ENV;
 const socketPath = process.env.HERDR_SOCKET_PATH;
 const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
@@ -16,7 +16,7 @@ const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:pi";
 
 function enabled() {
-  return HERDR_ENV === "1" && !!socketPath && !!paneId;
+  return HERDR_DROVER_ENV === "1" && !!socketPath && !!paneId;
 }
 
 function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {

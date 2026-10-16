@@ -114,7 +114,7 @@ exit 255
         .env("FAKE_SSH_ADVANCED", &advanced_path)
         .env("FAKE_SSH_FIRST_DONE", &first_done_path)
         .env("HERDR_CONFIG_PATH", temp_dir.join("config.toml"))
-        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_DROVER_ENV")
         .env_remove("HERDR_SESSION")
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")

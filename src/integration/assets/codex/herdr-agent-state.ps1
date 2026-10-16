@@ -7,7 +7,7 @@
 param([string]$Action = "")
 
 if ($Action -notin @("session", "working", "idle")) { exit 0 }
-if ($env:HERDR_ENV -ne "1") { exit 0 }
+if ($env:HERDR_DROVER_ENV -ne "1") { exit 0 }
 if ([string]::IsNullOrWhiteSpace($env:HERDR_PANE_ID)) { exit 0 }
 
 $inputText = [Console]::In.ReadToEnd()

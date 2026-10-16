@@ -15,7 +15,7 @@ _INTERACTIVE_PLATFORMS = {"cli", "tui", "desktop", "acp"}
 
 
 def _pane_id() -> str | None:
-    if os.environ.get("HERDR_ENV") != "1":
+    if os.environ.get("HERDR_DROVER_ENV") != "1":
         return None
     return os.environ.get("HERDR_PANE_ID", "").strip() or None
 

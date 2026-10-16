@@ -280,7 +280,7 @@ fn root_and_command_group_help_point_agents_to_plain_text_docs() {
             .args(args)
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_CLIENT_SOCKET_PATH")
-            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_DROVER_ENV")
             .output()
             .unwrap();
         assert!(output.status.success(), "herdr {} failed", args.join(" "));
@@ -377,7 +377,7 @@ fn completion_command_prints_zsh_script_without_session_startup() {
         .args(["completion", "zsh"])
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
-        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_DROVER_ENV")
         .output()
         .unwrap();
 
@@ -556,7 +556,7 @@ fn explicit_client_command_respects_nested_guard() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("client")
-        .env("HERDR_ENV", "1")
+        .env("HERDR_DROVER_ENV", "1")
         .env("XDG_CONFIG_HOME", &base)
         .env_remove("HERDR_CONFIG_PATH")
         .output()
@@ -576,7 +576,7 @@ fn explicit_client_command_respects_nested_guard() {
 fn removed_show_changelog_flag_fails_before_nested_guard() {
     let output = Command::new(env!("CARGO_BIN_EXE_herdr"))
         .arg("--show-changelog")
-        .env("HERDR_ENV", "1")
+        .env("HERDR_DROVER_ENV", "1")
         .output()
         .unwrap();
 

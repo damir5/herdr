@@ -1535,7 +1535,7 @@ fn scrub_herdr_runtime_env(command: &mut Command) {
         crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
         crate::session::SESSION_ENV_VAR,
         "HERDR_BIN_PATH",
-        "HERDR_ENV",
+        crate::HERDR_ENV_VAR,
         "HERDR_WORKSPACE_ID",
         "HERDR_TAB_ID",
         "HERDR_PANE_ID",

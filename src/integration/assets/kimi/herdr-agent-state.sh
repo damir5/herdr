@@ -9,7 +9,7 @@ case "$action" in
   *) exit 0 ;;
 esac
 
-[ "${HERDR_ENV:-}" = "1" ] || exit 0
+[ "${HERDR_DROVER_ENV:-}" = "1" ] || exit 0
 [ -n "${HERDR_SOCKET_PATH:-}" ] || exit 0
 [ -n "${HERDR_PANE_ID:-}" ] || exit 0
 command -v python3 >/dev/null 2>&1 || exit 0

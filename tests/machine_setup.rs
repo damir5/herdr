@@ -178,7 +178,7 @@ fn setup_options(
         String::from_utf8(status.stdout).unwrap(),
     );
     for name in [
-        "HERDR_ENV",
+        "HERDR_DROVER_ENV",
         "HERDR_SESSION",
         "HERDR_SOCKET_PATH",
         "HERDR_CLIENT_SOCKET_PATH",
@@ -306,7 +306,7 @@ fn machine_add_accepts_help_argument_order() {
     command.env("XDG_STATE_HOME", root.join("state"));
     command.env("XDG_RUNTIME_DIR", &root);
     for name in [
-        "HERDR_ENV",
+        "HERDR_DROVER_ENV",
         "HERDR_SESSION",
         "HERDR_SOCKET_PATH",
         "HERDR_CLIENT_SOCKET_PATH",

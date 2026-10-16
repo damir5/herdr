@@ -1,6 +1,6 @@
 use std::io;
 
-pub(crate) const HERDR_ENV_VAR: &str = "HERDR_ENV";
+pub(crate) const HERDR_ENV_VAR: &str = "HERDR_DROVER_ENV";
 pub(crate) const HERDR_ENV_VALUE: &str = "1";
 const NESTED_HERDR_MESSAGES: [&str; 6] = [
     "inception detected. we need to go deeper... said no one ever.",

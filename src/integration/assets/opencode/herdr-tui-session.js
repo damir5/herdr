@@ -71,7 +71,7 @@ export default {
 };
 
 async function tui(api) {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
+  if (process.env.HERDR_DROVER_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
 
   let disposed = false;
   let context;
@@ -404,7 +404,7 @@ async function tui(api) {
 }
 
 function setup(api) {
-  if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
+  if (process.env.HERDR_DROVER_ENV !== "1" || !process.env.HERDR_SOCKET_PATH || !process.env.HERDR_PANE_ID) return;
 
   let disposed = false;
   let selected;

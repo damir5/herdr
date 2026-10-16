@@ -104,6 +104,7 @@ impl HeadlessServer {
             &self.app.state.archived_agents,
         );
 
+        let now = std::time::Instant::now();
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
             let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
@@ -116,6 +117,12 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .and_then(|terminal| terminal.handoff_agent_state());
+            handoff_runtime.metadata = self
+                .app
+                .state
+                .terminals
+                .get(terminal_id)
+                .map(|terminal| terminal.handoff_metadata(now));
             let has_agent_session = self
                 .app
                 .state
@@ -138,6 +145,20 @@ impl HeadlessServer {
             params.expected_protocol,
             params.expected_version,
             self.api_window_title.clone(),
+            self.app
+                .state
+                .workspaces
+                .iter()
+                .map(|workspace| {
+                    (
+                        workspace.id.clone(),
+                        crate::metadata_tokens::HandoffWorkspaceMetadata {
+                            tokens: workspace.metadata_tokens.handoff(now),
+                            sequences: workspace.metadata_token_sequences.clone(),
+                        },
+                    )
+                })
+                .collect(),
         );
         let mut import_child = match crate::server::handoff::spawn_handoff_import(
             import_exe.as_deref(),

@@ -101,6 +101,55 @@ impl MetadataTokens {
             .retain(|_, token| token.expires_at.is_none_or(|deadline| deadline > now));
         self.entries.len() != before
     }
+
+    /// Live tokens with their remaining lifetime; an `Instant` means nothing in
+    /// another process.
+    pub(crate) fn handoff(&self, now: Instant) -> Vec<HandoffToken> {
+        self.entries
+            .iter()
+            .filter(|(_, token)| token.expires_at.is_none_or(|deadline| deadline > now))
+            .map(|(key, token)| HandoffToken {
+                key: key.clone(),
+                value: token.value.clone(),
+                expires_in_ms: token
+                    .expires_at
+                    .map(|deadline| deadline.duration_since(now).as_millis() as u64),
+            })
+            .collect()
+    }
+
+    pub(crate) fn from_handoff(tokens: Vec<HandoffToken>, now: Instant) -> Self {
+        let entries = tokens
+            .into_iter()
+            .map(|token| {
+                let expires_at = token
+                    .expires_in_ms
+                    .and_then(|ms| now.checked_add(Duration::from_millis(ms)));
+                (
+                    token.key,
+                    MetadataToken {
+                        value: token.value,
+                        expires_at,
+                    },
+                )
+            })
+            .collect();
+        Self { entries }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandoffToken {
+    key: String,
+    value: String,
+    expires_in_ms: Option<u64>,
+}
+
+/// Workspace tokens carried across a live handoff, keyed by workspace id.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandoffWorkspaceMetadata {
+    pub tokens: Vec<HandoffToken>,
+    pub sequences: HashMap<String, u64>,
 }
 
 #[cfg(test)]

@@ -598,6 +598,10 @@ fn restore_tab(
         let handoff_agent_state = imported_runtime
             .as_ref()
             .and_then(|imported| imported.state.agent_state.clone());
+        #[cfg(unix)]
+        let handoff_metadata = imported_runtime
+            .as_ref()
+            .and_then(|imported| imported.state.metadata.clone());
         let pending_native_agent_restore = if was_imported {
             None
         } else {
@@ -765,6 +769,13 @@ fn restore_tab(
                 if let Some(agent_state) = handoff_agent_state {
                     terminal.restore_handoff_agent_state(agent_state);
                 }
+                #[cfg(unix)]
+                if let Some(metadata) = handoff_metadata {
+                    terminal.restore_handoff_metadata(metadata, std::time::Instant::now());
+                }
+                // The runtime holds the title an imported pane had; the cached
+                // copy only updates when the terminal reports a new one.
+                terminal.set_terminal_title(runtime.terminal_title());
                 panes.insert(*id, PaneState::new(terminal_id.clone()));
                 terminal_runtimes.insert(terminal_id, runtime);
                 terminals.push(terminal);
@@ -2329,6 +2340,110 @@ mod tests {
         assert!(
             handoff_runtimes.is_empty(),
             "handoff restore should not replace pending native agent resume with a shell runtime"
+        );
+    }
+
+    // Fleet labels panes by terminal title and shows the Claude cache clock from
+    // metadata tokens; a live handoff must not blank either until the next report.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn live_handoff_preserves_title_metadata_and_tokens() {
+        let ttl = std::time::Duration::from_secs(600);
+        let (snapshot, _) = snapshot_with_saved_pane_history();
+        let (events, _events_rx) = mpsc::channel(32);
+        let (workspaces, mut terminals, runtimes) = restore(
+            &snapshot,
+            None,
+            24,
+            80,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            false,
+            events.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        );
+        let runtime = runtimes.values().next().unwrap();
+        runtime.test_process_pty_bytes(b"\x1b]2;build\x07");
+        let terminal = terminals.values_mut().next().unwrap();
+        terminal
+            .set_agent_metadata(crate::terminal::AgentMetadataReport {
+                source: "custom:test".into(),
+                agent_label: None,
+                applies_to_source: None,
+                title: Some("meta title".into()),
+                display_agent: None,
+                state_labels: HashMap::new(),
+                clear_title: false,
+                clear_display_agent: false,
+                clear_state_labels: false,
+                ttl: Some(ttl),
+                seq: Some(7),
+            })
+            .unwrap();
+        terminal.metadata_tokens.patch(
+            HashMap::from([("cache_expires".to_string(), Some("123".to_string()))]),
+            Some(ttl),
+            std::time::Instant::now(),
+        );
+
+        let runtimes = crate::terminal::TerminalRuntimeRegistry::from(runtimes);
+        let snapshot = crate::persist::capture(&workspaces, &terminals, &runtimes, Some(0), 0, &[]);
+        let pane_id = workspaces[0].tabs[0].panes.keys().next().copied().unwrap();
+        let runtime = runtimes.values().next().unwrap();
+        runtime
+            .pause_handoff_reader(std::time::Duration::from_secs(2))
+            .unwrap();
+        let mut state = runtime.handoff_runtime_state(pane_id.raw());
+        state.metadata = Some(
+            terminals
+                .values()
+                .next()
+                .unwrap()
+                .handoff_metadata(std::time::Instant::now()),
+        );
+        let state = serde_json::from_value(serde_json::to_value(state).unwrap()).unwrap();
+        let mut imports = HashMap::from([(
+            pane_id.raw(),
+            crate::handoff_runtime::ImportedHandoffRuntime {
+                master_fd: runtime.duplicate_handoff_fd().unwrap(),
+                state,
+            },
+        )]);
+        let (_, restored_terminals, restored_runtimes) = restore_handoff(
+            &snapshot,
+            4096,
+            test_restore_shell(),
+            crate::config::ShellModeConfig::NonLogin,
+            &mut imports,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        drop(restored_runtimes);
+        drop(runtimes);
+        let restored = restored_terminals.values().next().unwrap();
+
+        assert_eq!(restored.terminal_title.as_deref(), Some("build"));
+        assert_eq!(restored.effective_title().as_deref(), Some("meta title"));
+        assert_eq!(
+            restored.metadata_tokens.values(),
+            HashMap::from([("cache_expires".to_string(), "123".to_string())])
+        );
+        let remaining = restored
+            .metadata_tokens
+            .next_expiry()
+            .unwrap()
+            .saturating_duration_since(std::time::Instant::now());
+        assert!(
+            remaining > ttl - std::time::Duration::from_secs(10),
+            "tokens keep their remaining lifetime, got {remaining:?}"
+        );
+        assert!(
+            !restored.metadata_report_sequence_is_fresh("custom:test", Some(7)),
+            "a report older than the carried one stays rejected"
         );
     }
 

@@ -47,6 +47,10 @@ pub(crate) struct HandoffManifest {
     /// Absent from manifests written before this field existed.
     #[serde(default)]
     pub api_window_title: Option<String>,
+    /// Workspace metadata tokens by workspace id. Absent from older manifests.
+    #[serde(default)]
+    pub workspace_metadata:
+        std::collections::HashMap<String, crate::metadata_tokens::HandoffWorkspaceMetadata>,
 }
 
 #[cfg(unix)]
@@ -307,6 +311,10 @@ pub(crate) fn manifest_for(
     expected_protocol: Option<u32>,
     expected_version: Option<String>,
     api_window_title: Option<String>,
+    workspace_metadata: std::collections::HashMap<
+        String,
+        crate::metadata_tokens::HandoffWorkspaceMetadata,
+    >,
 ) -> HandoffManifest {
     HandoffManifest {
         version: HANDOFF_VERSION,
@@ -317,6 +325,7 @@ pub(crate) fn manifest_for(
         snapshot,
         panes,
         api_window_title,
+        workspace_metadata,
     }
 }
 
@@ -550,6 +559,7 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            Default::default(),
         );
 
         assert_eq!(manifest.api_window_title.as_deref(), Some("deploying"));
@@ -563,6 +573,7 @@ mod tests {
             None,
             None,
             Some("deploying".to_string()),
+            Default::default(),
         );
         let mut value = serde_json::to_value(&manifest).expect("manifest should serialize");
         value

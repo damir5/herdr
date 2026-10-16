@@ -173,6 +173,15 @@ fn run_handoff_import_server(socket_path: &Path, token: &str) -> io::Result<()> 
             &received.manifest.snapshot,
             &mut imports,
         )?;
+        let now = std::time::Instant::now();
+        for workspace in &mut app.state.workspaces {
+            if let Some(metadata) = received.manifest.workspace_metadata.remove(&workspace.id) {
+                workspace.metadata_tokens =
+                    crate::metadata_tokens::MetadataTokens::from_handoff(metadata.tokens, now);
+                workspace.metadata_token_sequences = metadata.sequences;
+            }
+        }
+        app.sync_agent_metadata_deadline();
         crate::server::handoff::report_restored(&mut received.stream)?;
         if std::env::var("HERDR_TEST_HANDOFF_IMPORT_FAIL").as_deref() == Ok("after_restored") {
             return Err(io::Error::other(

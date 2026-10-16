@@ -53,7 +53,131 @@ impl EffectivePresentation {
     }
 }
 
+/// Pane metadata carried across a live handoff. Times are stored as ages
+/// relative to the export, because an `Instant` means nothing in another process.
+#[cfg(unix)]
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandoffPaneMetadata {
+    entries: Vec<HandoffAgentMetadata>,
+    tokens: Vec<crate::metadata_tokens::HandoffToken>,
+    report_sequences: HashMap<String, u64>,
+    /// Source to agent label.
+    report_agents: HashMap<String, String>,
+    token_sequence_sources: Vec<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct HandoffAgentMetadata {
+    source: String,
+    agent_label: Option<String>,
+    applies_to_source: Option<String>,
+    title: Option<String>,
+    display_agent: Option<String>,
+    state_labels: HashMap<String, String>,
+    reported_ms_ago: u64,
+    title_reported_ms_ago: Option<u64>,
+    display_agent_reported_ms_ago: Option<u64>,
+    state_label_reported_ms_ago: HashMap<String, u64>,
+    ttl_ms: Option<u64>,
+    expiry_event_pending: bool,
+}
+
+#[cfg(unix)]
+fn age_ms(at: Instant, now: Instant) -> u64 {
+    now.saturating_duration_since(at).as_millis() as u64
+}
+
+#[cfg(unix)]
+fn from_age_ms(ms: u64, now: Instant) -> Instant {
+    now.checked_sub(Duration::from_millis(ms)).unwrap_or(now)
+}
+
 impl TerminalState {
+    #[cfg(unix)]
+    pub(crate) fn handoff_metadata(&self, now: Instant) -> HandoffPaneMetadata {
+        HandoffPaneMetadata {
+            entries: self
+                .agent_metadata
+                .values()
+                .filter(|metadata| !self.agent_metadata_is_expired(metadata, now))
+                .map(|metadata| HandoffAgentMetadata {
+                    source: metadata.source.clone(),
+                    agent_label: metadata.agent_label.clone(),
+                    applies_to_source: metadata.applies_to_source.clone(),
+                    title: metadata.title.clone(),
+                    display_agent: metadata.display_agent.clone(),
+                    state_labels: metadata.state_labels.clone(),
+                    reported_ms_ago: age_ms(metadata.reported_at, now),
+                    title_reported_ms_ago: metadata.title_reported_at.map(|at| age_ms(at, now)),
+                    display_agent_reported_ms_ago: metadata
+                        .display_agent_reported_at
+                        .map(|at| age_ms(at, now)),
+                    state_label_reported_ms_ago: metadata
+                        .state_label_reported_at
+                        .iter()
+                        .map(|(state, at)| (state.clone(), age_ms(*at, now)))
+                        .collect(),
+                    ttl_ms: metadata.ttl.map(|ttl| ttl.as_millis() as u64),
+                    expiry_event_pending: metadata.expiry_event_pending,
+                })
+                .collect(),
+            tokens: self.metadata_tokens.handoff(now),
+            report_sequences: self.metadata_report_sequences.clone(),
+            report_agents: self
+                .metadata_report_agents
+                .iter()
+                .map(|(source, agent)| (source.clone(), crate::detect::agent_label(*agent).into()))
+                .collect(),
+            token_sequence_sources: self
+                .metadata_token_sequence_sources
+                .iter()
+                .cloned()
+                .collect(),
+        }
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn restore_handoff_metadata(&mut self, snapshot: HandoffPaneMetadata, now: Instant) {
+        self.agent_metadata = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let metadata = AgentMetadata {
+                    source: entry.source,
+                    agent_label: entry.agent_label,
+                    applies_to_source: entry.applies_to_source,
+                    title: entry.title,
+                    display_agent: entry.display_agent,
+                    state_labels: entry.state_labels,
+                    reported_at: from_age_ms(entry.reported_ms_ago, now),
+                    title_reported_at: entry.title_reported_ms_ago.map(|ms| from_age_ms(ms, now)),
+                    display_agent_reported_at: entry
+                        .display_agent_reported_ms_ago
+                        .map(|ms| from_age_ms(ms, now)),
+                    state_label_reported_at: entry
+                        .state_label_reported_ms_ago
+                        .into_iter()
+                        .map(|(state, ms)| (state, from_age_ms(ms, now)))
+                        .collect(),
+                    ttl: entry.ttl_ms.map(Duration::from_millis),
+                    expiry_event_pending: entry.expiry_event_pending,
+                };
+                (metadata.source.clone(), metadata)
+            })
+            .collect();
+        self.metadata_tokens =
+            crate::metadata_tokens::MetadataTokens::from_handoff(snapshot.tokens, now);
+        self.metadata_report_sequences = snapshot.report_sequences;
+        self.metadata_report_agents = snapshot
+            .report_agents
+            .into_iter()
+            .filter_map(|(source, label)| Some((source, crate::detect::parse_agent_label(&label)?)))
+            .collect();
+        self.metadata_token_sequence_sources =
+            snapshot.token_sequence_sources.into_iter().collect();
+    }
+
     pub(crate) fn metadata_report_sequence_is_fresh(&self, source: &str, seq: Option<u64>) -> bool {
         crate::metadata_tokens::sequence_is_fresh(&self.metadata_report_sequences, source, seq)
     }

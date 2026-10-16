@@ -140,6 +140,8 @@ fn truncate_turn_message(message: String) -> (String, bool) {
 #[path = "metadata.rs"]
 mod metadata;
 pub use metadata::{AgentMetadata, AgentMetadataReport, EffectivePresentation};
+#[cfg(unix)]
+pub(crate) use metadata::HandoffPaneMetadata;
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct HookAuthority {

@@ -608,6 +608,9 @@ pub struct PaneInfo {
     /// 1004 focus, 1005/1006/1016 mouse encoding, 1007 alternate scroll, 2004 bracketed paste).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub input_modes: Vec<u16>,
+    /// Kitty keyboard protocol flags the running program has on (0 when it uses legacy keys).
+    #[serde(default, skip_serializing_if = "super::is_zero_u16")]
+    pub kitty_keyboard_flags: u16,
     pub revision: u64,
 }
 

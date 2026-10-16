@@ -1256,6 +1256,7 @@ fn worktree_request_and_response_round_trip() {
                 scroll: None,
                 alternate_screen: false,
                 input_modes: Vec::new(),
+                kitty_keyboard_flags: 0,
                 revision: 0,
             },
             worktree: WorktreeInfo {
@@ -1705,6 +1706,7 @@ fn create_response_round_trips_with_root_pane() {
                 scroll: None,
                 alternate_screen: false,
                 input_modes: Vec::new(),
+                kitty_keyboard_flags: 0,
                 revision: 0,
             },
         },

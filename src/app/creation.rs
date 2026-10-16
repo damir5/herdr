@@ -476,6 +476,14 @@ impl App {
             .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
             .map(|runtime| runtime.input_modes())
             .unwrap_or_default();
+        let kitty_keyboard_flags = match self
+            .state
+            .runtime_for_pane_in_workspace(&self.terminal_runtimes, ws_idx, pane_id)
+            .map(|runtime| runtime.keyboard_protocol())
+        {
+            Some(crate::input::KeyboardProtocol::Kitty { flags }) => flags,
+            _ => 0,
+        };
         let focused = self.state.active == Some(ws_idx)
             && ws.active_tab == tab_idx
             && ws
@@ -580,6 +588,7 @@ impl App {
             scroll,
             alternate_screen,
             input_modes,
+            kitty_keyboard_flags,
             revision: terminal.revision,
         })
     }

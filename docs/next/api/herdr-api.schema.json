@@ -1089,6 +1089,13 @@
                 }
               ]
             },
+            "kitty_keyboard_flags": {
+              "description": "Kitty keyboard protocol flags the running program has on (0 when it uses legacy keys).",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
             "label": {
               "type": [
                 "string",
@@ -8718,6 +8725,13 @@
                 }
               ]
             },
+            "kitty_keyboard_flags": {
+              "description": "Kitty keyboard protocol flags the running program has on (0 when it uses legacy keys).",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
+            },
             "label": {
               "type": [
                 "string",
@@ -10197,6 +10211,13 @@
                   "type": "null"
                 }
               ]
+            },
+            "kitty_keyboard_flags": {
+              "description": "Kitty keyboard protocol flags the running program has on (0 when it uses legacy keys).",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
             },
             "label": {
               "type": [
@@ -13909,6 +13930,13 @@
                   "type": "null"
                 }
               ]
+            },
+            "kitty_keyboard_flags": {
+              "description": "Kitty keyboard protocol flags the running program has on (0 when it uses legacy keys).",
+              "format": "uint16",
+              "maximum": 65535,
+              "minimum": 0,
+              "type": "integer"
             },
             "label": {
               "type": [

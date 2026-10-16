@@ -244,6 +244,7 @@ fn reply_to_probe(request: ApiRequestMessage) {
                 scroll: None,
                 alternate_screen: false,
                 input_modes: Vec::new(),
+                kitty_keyboard_flags: 0,
                 revision: 0,
             },
         },

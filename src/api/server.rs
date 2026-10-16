@@ -3152,6 +3152,7 @@ mod tests {
             scroll: None,
             alternate_screen: false,
             input_modes: Vec::new(),
+            kitty_keyboard_flags: 0,
             revision: 0,
         }
     }

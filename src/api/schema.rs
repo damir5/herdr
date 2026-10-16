@@ -38,6 +38,10 @@ pub use tabs::*;
 pub use workspaces::*;
 pub use worktrees::*;
 
+fn is_zero_u16(value: &u16) -> bool {
+    *value == 0
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }

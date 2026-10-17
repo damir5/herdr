@@ -553,6 +553,8 @@ pub struct PaneReleaseAgentParams {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneInfo {
+    #[serde(default)]
+    pub state_change_seq: u64,
     pub pane_id: String,
     pub terminal_id: String,
     pub workspace_id: String,

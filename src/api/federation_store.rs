@@ -624,6 +624,8 @@ impl PeerCacheEntry {
 /// The `pane.agent_status_changed` payload describing `agent`'s current state.
 pub fn agent_status_event(agent: &AgentInfo) -> PaneAgentStatusChangedEvent {
     PaneAgentStatusChangedEvent {
+        terminal_id: agent.terminal_id.clone(),
+        state_change_seq: agent.state_change_seq,
         pane_id: agent.pane_id.clone(),
         workspace_id: agent.workspace_id.clone(),
         agent_status: agent.agent_status,
@@ -643,6 +645,10 @@ pub fn agent_status_event(agent: &AgentInfo) -> PaneAgentStatusChangedEvent {
 /// forward ([`PeerCacheEntry::clamp_turn`]), a resync is authoritative, and a
 /// poll only takes a relayed baseline newer than itself.
 fn apply_status_event(agent: &mut AgentInfo, event: &PaneAgentStatusChangedEvent) {
+    if !event.terminal_id.is_empty() {
+        agent.terminal_id.clone_from(&event.terminal_id);
+    }
+    agent.state_change_seq = event.state_change_seq;
     agent.agent_status = event.agent_status;
     agent.input_pending = event.input_pending;
     agent.input_prompt_kind = event.input_prompt_kind;
@@ -967,6 +973,23 @@ mod tests {
 
     fn status(pane_id: &str, status: AgentStatus) -> PaneAgentStatusChangedEvent {
         agent_status_event(&pane_agent(pane_id, status))
+    }
+
+    #[test]
+    fn status_events_carry_sequence_and_legacy_events_keep_terminal_identity() {
+        let mut agent = pane_agent("w1:p1", AgentStatus::Working);
+        agent.state_change_seq = 41;
+        let mut event = agent_status_event(&agent);
+        assert_eq!(event.terminal_id, agent.terminal_id);
+        assert_eq!(event.state_change_seq, 41);
+        event.terminal_id.clear();
+        event.state_change_seq = 0;
+        event.agent_status = AgentStatus::Idle;
+        let terminal_id = agent.terminal_id.clone();
+        apply_status_event(&mut agent, &event);
+        assert_eq!(agent.terminal_id, terminal_id);
+        assert_eq!(agent.agent_status, AgentStatus::Idle);
+        assert_eq!(agent.state_change_seq, 0);
     }
 
     fn cached_status(store: &FederationStore, pane_id: &str) -> AgentStatus {

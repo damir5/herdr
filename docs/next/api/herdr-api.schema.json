@@ -820,11 +820,21 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "state_change_seq": {
+                  "default": 0,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "state_labels": {
                   "additionalProperties": {
                     "type": "string"
                   },
                   "type": "object"
+                },
+                "terminal_id": {
+                  "default": "",
+                  "type": "string"
                 },
                 "title": {
                   "type": [
@@ -1135,6 +1145,12 @@
                   "type": "null"
                 }
               ]
+            },
+            "state_change_seq": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "state_labels": {
               "additionalProperties": {
@@ -8602,11 +8618,21 @@
             "pane_id": {
               "type": "string"
             },
+            "state_change_seq": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "state_labels": {
               "additionalProperties": {
                 "type": "string"
               },
               "type": "object"
+            },
+            "terminal_id": {
+              "default": "",
+              "type": "string"
             },
             "title": {
               "type": [
@@ -8771,6 +8797,12 @@
                   "type": "null"
                 }
               ]
+            },
+            "state_change_seq": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "state_labels": {
               "additionalProperties": {
@@ -9854,11 +9886,21 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "state_change_seq": {
+                  "default": 0,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "state_labels": {
                   "additionalProperties": {
                     "type": "string"
                   },
                   "type": "object"
+                },
+                "terminal_id": {
+                  "default": "",
+                  "type": "string"
                 },
                 "title": {
                   "type": [
@@ -10089,11 +10131,21 @@
             "pane_id": {
               "type": "string"
             },
+            "state_change_seq": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
             "state_labels": {
               "additionalProperties": {
                 "type": "string"
               },
               "type": "object"
+            },
+            "terminal_id": {
+              "default": "",
+              "type": "string"
             },
             "title": {
               "type": [
@@ -10258,6 +10310,12 @@
                   "type": "null"
                 }
               ]
+            },
+            "state_change_seq": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "state_labels": {
               "additionalProperties": {
@@ -12593,11 +12651,21 @@
                 "pane_id": {
                   "type": "string"
                 },
+                "state_change_seq": {
+                  "default": 0,
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "state_labels": {
                   "additionalProperties": {
                     "type": "string"
                   },
                   "type": "object"
+                },
+                "terminal_id": {
+                  "default": "",
+                  "type": "string"
                 },
                 "title": {
                   "type": [
@@ -13977,6 +14045,12 @@
                   "type": "null"
                 }
               ]
+            },
+            "state_change_seq": {
+              "default": 0,
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
             },
             "state_labels": {
               "additionalProperties": {

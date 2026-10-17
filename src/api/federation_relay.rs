@@ -483,6 +483,8 @@ impl PeerRelay {
 
 fn status_envelope(event: PaneAgentStatusChangedEvent) -> EventEnvelope {
     let PaneAgentStatusChangedEvent {
+        terminal_id,
+        state_change_seq,
         pane_id,
         workspace_id,
         agent_status,
@@ -498,6 +500,8 @@ fn status_envelope(event: PaneAgentStatusChangedEvent) -> EventEnvelope {
     EventEnvelope {
         event: EventKind::PaneAgentStatusChanged,
         data: EventData::PaneAgentStatusChanged {
+            terminal_id,
+            state_change_seq,
             pane_id,
             workspace_id,
             agent_status,
@@ -719,14 +723,21 @@ pub(crate) fn qualify_remote_event(
             pane_id,
             workspace_id,
             ..
+        } => {
+            qualify_id(alias, pane_id)?;
+            qualify_id(alias, workspace_id)?;
         }
-        | EventData::PaneAgentStatusChanged {
+        EventData::PaneAgentStatusChanged {
             pane_id,
             workspace_id,
+            terminal_id,
             ..
         } => {
             qualify_id(alias, pane_id)?;
             qualify_id(alias, workspace_id)?;
+            if !terminal_id.is_empty() {
+                qualify_id(alias, terminal_id)?;
+            }
         }
         EventData::PaneMoved {
             previous_pane_id,
@@ -872,6 +883,7 @@ mod tests {
             EventKind::PaneAgentStatusChanged => json!({
                 "type": "pane_agent_status_changed", "pane_id": "w1:p1", "workspace_id": "w1",
                 "agent_status": "blocked", "turn": 3, "turn_epoch": 1,
+                "terminal_id": "term_1", "state_change_seq": 41,
             }),
             EventKind::PaneTurnCompleted => json!({
                 "type": "pane_turn_completed", "pane": pane("w1:p1"), "turn": 3, "turn_epoch": 1,
@@ -976,6 +988,9 @@ mod tests {
                 assert_eq!(machine["machine_id"], "box", "{kind:?}");
                 assert_eq!(machine["machine_label"], "Build box", "{kind:?}");
                 assert_eq!(machine["machine_profile_id"], "profile-box", "{kind:?}");
+            }
+            if let EventData::PaneAgentStatusChanged { state_change_seq, .. } = &qualified.data {
+                assert_eq!(*state_change_seq, 41);
             }
             if let EventData::LayoutUpdated { layout } = &qualified.data {
                 assert_eq!(

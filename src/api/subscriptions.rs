@@ -191,6 +191,8 @@ impl PaneStatusSnapshot {
 
 fn status_event_from_pane(pane: PaneInfo) -> PaneAgentStatusChangedEvent {
     PaneAgentStatusChangedEvent {
+        terminal_id: pane.terminal_id,
+        state_change_seq: pane.state_change_seq,
         pane_id: pane.pane_id,
         workspace_id: pane.workspace_id,
         agent_status: pane.agent_status,
@@ -210,6 +212,8 @@ pub(super) fn status_event_from_hub(event: &EventEnvelope) -> Option<PaneAgentSt
         return None;
     }
     let EventData::PaneAgentStatusChanged {
+        terminal_id,
+        state_change_seq,
         pane_id,
         workspace_id,
         agent_status,
@@ -226,6 +230,8 @@ pub(super) fn status_event_from_hub(event: &EventEnvelope) -> Option<PaneAgentSt
         return None;
     };
     Some(PaneAgentStatusChangedEvent {
+        terminal_id: terminal_id.clone(),
+        state_change_seq: *state_change_seq,
         pane_id: pane_id.clone(),
         workspace_id: workspace_id.clone(),
         agent_status: *agent_status,
@@ -1040,6 +1046,8 @@ mod tests {
         EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
@@ -1071,6 +1079,8 @@ mod tests {
         EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
@@ -1088,6 +1098,7 @@ mod tests {
 
     fn pane_info_with_scroll(scroll: Option<PaneScrollInfo>) -> PaneInfo {
         PaneInfo {
+            state_change_seq: 0,
             pane_id: "pane_1".into(),
             terminal_id: "terminal_1".into(),
             workspace_id: "workspace_1".into(),
@@ -1118,6 +1129,29 @@ mod tests {
             kitty_keyboard_flags: 0,
             revision: 0,
         }
+    }
+
+    #[test]
+    fn status_subscription_preserves_terminal_identity_and_sequence() {
+        let mut pane = pane_info_with_scroll(None);
+        pane.state_change_seq = 41;
+        let initial = status_event_from_pane(pane.clone());
+        assert_eq!(initial.terminal_id, pane.terminal_id);
+        assert_eq!(initial.state_change_seq, 41);
+        let mut envelope = presentation_event(None);
+        let EventData::PaneAgentStatusChanged {
+            terminal_id,
+            state_change_seq,
+            ..
+        } = &mut envelope.data
+        else {
+            panic!("expected status event");
+        };
+        *terminal_id = pane.terminal_id.clone();
+        *state_change_seq = 42;
+        let streamed = status_event_from_hub(&envelope).unwrap();
+        assert_eq!(streamed.terminal_id, pane.terminal_id);
+        assert_eq!(streamed.state_change_seq, 42);
     }
 
     fn pane_status(pane_id: &str, agent_status: AgentStatus) -> PaneInfo {
@@ -1222,6 +1256,8 @@ mod tests {
                     last_input: None,
                     last_sequence: event_hub.current_sequence(),
                     initial_event: Some(PaneAgentStatusChangedEvent {
+                        state_change_seq: 0,
+                        terminal_id: String::new(),
                         pane_id: "pane_1".into(),
                         workspace_id: "workspace_1".into(),
                         agent_status: AgentStatus::Working,
@@ -1397,6 +1433,8 @@ mod tests {
             last_input: Some((false, None)),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
@@ -1446,6 +1484,8 @@ mod tests {
             last_input: Some((true, Some(crate::detect::InputPromptKind::Select))),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
@@ -1502,6 +1542,8 @@ mod tests {
             last_input: Some((false, None)),
             last_sequence: event_hub.current_sequence(),
             initial_event: Some(PaneAgentStatusChangedEvent {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: "pane_1".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,
@@ -1664,6 +1706,8 @@ mod tests {
         event_hub.push(EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: "pane_2".into(),
                 workspace_id: "workspace_1".into(),
                 agent_status: AgentStatus::Working,

@@ -3125,6 +3125,7 @@ mod tests {
         agent_status: crate::api::schema::AgentStatus,
     ) -> crate::api::schema::PaneInfo {
         crate::api::schema::PaneInfo {
+            state_change_seq: 0,
             pane_id: pane_id.into(),
             terminal_id: "term_1".into(),
             workspace_id: "ws_1".into(),
@@ -3894,6 +3895,8 @@ mod tests {
         crate::api::schema::EventEnvelope {
             event: crate::api::schema::EventKind::PaneAgentStatusChanged,
             data: crate::api::schema::EventData::PaneAgentStatusChanged {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: pane_id.into(),
                 workspace_id: "ws_1".into(),
                 agent_status,
@@ -8462,6 +8465,8 @@ mod federation_tests {
         EventEnvelope {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
+                state_change_seq: 0,
+                terminal_id: String::new(),
                 pane_id: pane_id.into(),
                 workspace_id: "w1".into(),
                 agent_status,

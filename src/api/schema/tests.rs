@@ -942,6 +942,8 @@ fn old_agent_status_event_shape_deserializes_without_turn_hints() {
     }))
     .unwrap();
 
+    assert_eq!(event.terminal_id, "");
+    assert_eq!(event.state_change_seq, 0);
     assert_eq!(event.turn, None);
     assert_eq!(event.turn_epoch, None);
     assert!(!event.input_pending);
@@ -1004,6 +1006,7 @@ fn old_pane_info_shape_defaults_alternate_screen_false_and_omits_it() {
     }))
     .unwrap();
 
+    assert_eq!(pane.state_change_seq, 0);
     assert!(!pane.alternate_screen);
     let serialized = serde_json::to_value(pane).unwrap();
     assert!(serialized.get("alternate_screen").is_none());
@@ -1020,6 +1023,8 @@ fn old_event_data_agent_status_shape_defaults_and_omits_the_input_tuple() {
     .unwrap();
 
     let EventData::PaneAgentStatusChanged {
+        terminal_id,
+        state_change_seq,
         input_pending,
         input_prompt_kind,
         ..
@@ -1027,6 +1032,8 @@ fn old_event_data_agent_status_shape_defaults_and_omits_the_input_tuple() {
     else {
         panic!("expected pane agent status event");
     };
+    assert_eq!(terminal_id, "");
+    assert_eq!(*state_change_seq, 0);
     assert!(!input_pending);
     assert_eq!(*input_prompt_kind, None);
     let serialized = serde_json::to_value(event).unwrap();
@@ -1229,6 +1236,7 @@ fn worktree_request_and_response_round_trip() {
                 machine_label: None,
             },
             root_pane: PaneInfo {
+                state_change_seq: 0,
                 pane_id: "w_1-1".into(),
                 terminal_id: "term_1".into(),
                 workspace_id: "w_1".into(),
@@ -1679,6 +1687,7 @@ fn create_response_round_trips_with_root_pane() {
                 machine_label: None,
             },
             root_pane: PaneInfo {
+                state_change_seq: 0,
                 pane_id: "w_1-3".into(),
                 terminal_id: "term_example".into(),
                 workspace_id: "w_1".into(),

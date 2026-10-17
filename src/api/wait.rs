@@ -1045,6 +1045,8 @@ fn wait_matched_response(request_id: &str, event: serde_json::Value) -> String {
             event: EventEnvelope {
                 event: EventKind::PaneAgentStatusChanged,
                 data: EventData::PaneAgentStatusChanged {
+                    terminal_id: data.terminal_id,
+                    state_change_seq: data.state_change_seq,
                     pane_id: data.pane_id,
                     workspace_id: data.workspace_id,
                     agent_status: data.agent_status,

@@ -474,6 +474,10 @@ pub struct PaneOutputMatchedEvent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct PaneAgentStatusChangedEvent {
+    #[serde(default)]
+    pub terminal_id: String,
+    #[serde(default)]
+    pub state_change_seq: u64,
     pub pane_id: String,
     pub workspace_id: String,
     pub agent_status: AgentStatus,
@@ -644,6 +648,10 @@ pub enum EventData {
         final_status: Option<AgentStatus>,
     },
     PaneAgentStatusChanged {
+        #[serde(default)]
+        terminal_id: String,
+        #[serde(default)]
+        state_change_seq: u64,
         pane_id: String,
         workspace_id: String,
         agent_status: AgentStatus,

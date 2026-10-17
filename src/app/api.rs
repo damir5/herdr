@@ -993,11 +993,19 @@ impl App {
             || update.previous_input_prompt_kind != update.input_prompt_kind
         {
             let presentation = update.presentation.clone();
+            let terminal = &self.state.terminals[&self.state.workspaces[update.ws_idx]
+                .pane_state(update.pane_id)
+                .expect("status update pane exists")
+                .attached_terminal_id];
+            let terminal_id = terminal.id.to_string();
+            let state_change_seq = terminal.last_agent_state_change_seq.unwrap_or(0);
             self.emit_event(crate::api::schema::EventEnvelope {
                 event: crate::api::schema::EventKind::PaneAgentStatusChanged,
                 data: crate::api::schema::EventData::PaneAgentStatusChanged {
                     pane_id: pane_id.clone(),
                     workspace_id: workspace_id.clone(),
+                    terminal_id,
+                    state_change_seq,
                     agent_status,
                     input_pending: update.input_pending,
                     input_prompt_kind: update.input_prompt_kind,
@@ -4290,6 +4298,11 @@ mod tests {
                 Some(2),
             )
             .expect("anchored hook report should be accepted");
+        app.state
+            .terminals
+            .get_mut(&terminal_id)
+            .unwrap()
+            .last_agent_state_change_seq = Some(41);
         let baseline_sequence = app.state.terminals[&terminal_id].last_agent_state_change_seq;
         let baseline_event_sequence = event_hub.current_sequence();
 
@@ -4322,6 +4335,18 @@ mod tests {
         );
         let events = event_hub.events_after(baseline_event_sequence);
         assert_eq!(events.len(), 1);
+        let crate::api::schema::EventData::PaneAgentStatusChanged {
+            terminal_id: event_terminal_id,
+            state_change_seq,
+            ..
+        } = &events[0].1.data
+        else {
+            panic!("expected status event");
+        };
+        assert_eq!(event_terminal_id, &agent.terminal_id);
+        assert_eq!(event_terminal_id, &pane.terminal_id);
+        assert_eq!(*state_change_seq, agent.state_change_seq);
+        assert_eq!(*state_change_seq, pane.state_change_seq);
         assert!(matches!(
             &events[0].1.data,
             crate::api::schema::EventData::PaneAgentStatusChanged {

@@ -551,6 +551,7 @@ impl App {
             })
             .unwrap_or_default();
         Some(crate::api::schema::PaneInfo {
+            state_change_seq: terminal.last_agent_state_change_seq.unwrap_or(0),
             pane_id: self.public_pane_id(ws_idx, pane_id)?,
             terminal_id: terminal.id.to_string(),
             workspace_id: self.public_workspace_id(ws_idx),

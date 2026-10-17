@@ -534,7 +534,9 @@ impl App {
             agent_view_override: None,
             sidebar_agents: config.ui.sidebar.agents.clone(),
             sidebar_spaces: config.ui.sidebar.spaces.clone(),
-            next_agent_state_change_seq: 0,
+            // Status sequences keep growing across restarts and live handoffs, which keep terminal IDs.
+            // ponytail: wall-clock seed; a clock stepped back across a restart gives lower numbers until it catches up.
+            next_agent_state_change_seq: actions::current_unix_ms(),
             confirm_close: config.ui.confirm_close,
             pane_borders: config.ui.pane_borders,
             pane_outer_borders: config.ui.pane_outer_borders,
@@ -1169,6 +1171,14 @@ mod tests {
     use crate::workspace::Workspace;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::sync::Mutex;
+
+    // Fleet drops a status reading older than the last one it saw for a terminal ID, and
+    // terminal IDs survive restarts and live handoffs, so a new server must not count from 0.
+    #[test]
+    fn a_new_server_counts_status_changes_past_the_previous_one() {
+        let before = actions::current_unix_ms();
+        assert!(test_app().state.next_agent_state_change_seq >= before);
+    }
 
     fn test_app() -> App {
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();

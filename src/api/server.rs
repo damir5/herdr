@@ -8466,7 +8466,7 @@ mod federation_tests {
             event: EventKind::PaneAgentStatusChanged,
             data: EventData::PaneAgentStatusChanged {
                 state_change_seq: 0,
-                terminal_id: String::new(),
+                terminal_id: format!("t-{pane_id}"),
                 pane_id: pane_id.into(),
                 workspace_id: "w1".into(),
                 agent_status,

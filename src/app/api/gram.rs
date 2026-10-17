@@ -2306,7 +2306,36 @@ mod tests {
         const PEER: &str = "8195b6326f748f4da1945364a4e205b9";
         const COORDINATOR: &str = "machine_f872cca4c7743d39c1fad1fa5a74a087";
 
-        fn app_with_config_file() -> (App, std::path::PathBuf) {
+        struct ConfigFile {
+            previous: Vec<(&'static str, Option<std::ffi::OsString>)>,
+            dir: std::path::PathBuf,
+            _lock: std::sync::MutexGuard<'static, ()>,
+        }
+
+        impl Drop for ConfigFile {
+            fn drop(&mut self) {
+                for (key, value) in self.previous.drain(..) {
+                    match value {
+                        Some(value) => std::env::set_var(key, value),
+                        None => std::env::remove_var(key),
+                    }
+                }
+                crate::api::gram_relay::apply_config(&crate::config::GramRelayConfig::default());
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        }
+
+        fn app_with_config_file() -> (ConfigFile, App, std::path::PathBuf) {
+            let lock = crate::config::test_config_env_lock().lock().unwrap();
+            let previous = [
+                "XDG_CONFIG_HOME",
+                crate::config::CONFIG_PATH_ENV_VAR,
+                crate::api::gram_relay::PEERS_ENV,
+                crate::api::gram_relay::SOCKET_ENV,
+            ]
+            .into_iter()
+            .map(|key| (key, std::env::var_os(key)))
+            .collect();
             let tmp = std::env::temp_dir().join(format!(
                 "herdr-gram-relay-reload-{}-{}",
                 std::process::id(),
@@ -2329,7 +2358,13 @@ mod tests {
                 api_rx,
                 crate::api::EventHub::default(),
             );
-            (app, path)
+            let config = ConfigFile {
+                previous,
+                dir: tmp,
+                _lock: lock,
+            };
+            crate::api::gram_relay::apply_config(&crate::config::GramRelayConfig::default());
+            (config, app, path)
         }
 
         fn reload(
@@ -2367,7 +2402,7 @@ mod tests {
 
         #[test]
         fn reload_grants_then_revokes_a_peer_without_restart() {
-            let (mut app, path) = app_with_config_file();
+            let (_config, mut app, path) = app_with_config_file();
             assert_eq!(relay_list(&mut app)["error"]["code"], "forbidden");
 
             reload(
@@ -2393,7 +2428,7 @@ mod tests {
 
         #[test]
         fn explicit_empty_peers_revoke_a_peer_the_legacy_env_still_names() {
-            let (mut app, path) = app_with_config_file();
+            let (_config, mut app, path) = app_with_config_file();
             std::env::set_var(crate::api::gram_relay::PEERS_ENV, PEER);
             reload(
                 &mut app,
@@ -2415,7 +2450,7 @@ mod tests {
 
         #[test]
         fn invalid_reload_keeps_the_previous_effective_setting() {
-            let (mut app, path) = app_with_config_file();
+            let (_config, mut app, path) = app_with_config_file();
             reload(
                 &mut app,
                 &path,
@@ -2443,7 +2478,7 @@ mod tests {
 
         #[test]
         fn remote_socket_follows_reload() {
-            let (mut app, path) = app_with_config_file();
+            let (_config, mut app, path) = app_with_config_file();
             let own = crate::persist::machine::get_or_create();
             reload(
                 &mut app,
@@ -2468,8 +2503,8 @@ mod tests {
         /// A coordinator allowing `PEER`, whose roster has `llm-opt` in pane
         /// `w1-1` and `other-agent` in `w1-2`, merged as the coordinator's
         /// federation poll merges them: every name and id `PEER/`-qualified.
-        fn coordinator() -> App {
-            let (mut app, path) = app_with_config_file();
+        fn coordinator() -> (ConfigFile, App) {
+            let (config, mut app, path) = app_with_config_file();
             reload(
                 &mut app,
                 &path,
@@ -2501,7 +2536,7 @@ mod tests {
                     std::time::Instant::now(),
                 ),
             );
-            app
+            (config, app)
         }
 
         fn relay(app: &mut App, call: serde_json::Value) -> serde_json::Value {
@@ -2522,7 +2557,7 @@ mod tests {
 
         #[test]
         fn a_relayed_guest_post_reaches_the_remote_agent_with_its_file() {
-            let mut app = coordinator();
+            let (_config, mut app) = coordinator();
             let staged = relay(
                 &mut app,
                 serde_json::json!({"kind": "upload_chunk", "params": {"upload_id": "guest-g-up", "offset": 0, "data_base64": "aGVsbG8="}}),
@@ -2568,7 +2603,7 @@ mod tests {
 
         #[test]
         fn relayed_posts_are_only_guest_posts_to_the_peers_own_agents() {
-            let mut app = coordinator();
+            let (_config, mut app) = coordinator();
             for call in [
                 guest_post("llm-opt", ""),
                 guest_post("llm-opt", "owner (via HerdrUp)"),
@@ -2586,7 +2621,7 @@ mod tests {
 
         #[test]
         fn a_relayed_gram_carries_its_machine_label_to_lists_and_the_owner_push() {
-            let mut app = coordinator();
+            let (_config, mut app) = coordinator();
             app.state.push_config = crate::config::PushConfig {
                 mode: crate::config::PushMode::Direct,
                 enabled: true,

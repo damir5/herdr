@@ -250,7 +250,17 @@ mod tests {
         );
         let lease_b = registry.register(b.clone()).unwrap();
         assert_eq!(fs::read_link(&stable).unwrap(), a);
+        drop(probe);
         drop(listener_a);
+        // A concurrent fork can retain the listener until its child execs.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while live_socket(&a) {
+            assert!(
+                Instant::now() < deadline,
+                "closed agent listener is still live"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert!(fs::metadata(&a).unwrap().file_type().is_socket());
         lease_b.refresh_at(Instant::now() + PROBE_INTERVAL).unwrap();
         assert_eq!(fs::read_link(&stable).unwrap(), b);

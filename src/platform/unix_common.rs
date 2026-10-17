@@ -242,6 +242,7 @@ pub(super) fn read_terminal_grid_size() -> std::io::Result<(u16, u16)> {
     crossterm::terminal::window_size().map(|size| (size.columns, size.rows))
 }
 
+#[cfg(not(test))]
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
     action.sa_sigaction = handler;
@@ -254,10 +255,13 @@ fn set_sigpipe_disposition(handler: libc::sighandler_t) {
 }
 
 pub(crate) fn begin_cli_output() {
+    // Unit tests share their signal disposition with concurrent socket tests.
+    #[cfg(not(test))]
     set_sigpipe_disposition(libc::SIG_DFL);
 }
 
 pub(crate) fn end_cli_output() {
+    #[cfg(not(test))]
     set_sigpipe_disposition(libc::SIG_IGN);
 }
 
@@ -479,6 +483,26 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_output_keeps_broken_pipe_writes_recoverable_in_tests() {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        crate::cli::print_read_response(&serde_json::json!({
+            "result": { "read": { "text": "test output" } }
+        }))
+        .unwrap();
+        let (writer, reader) = UnixStream::pair().unwrap();
+        drop(reader);
+        // A raw write exercises SIGPIPE rather than the standard library's suppression.
+        let written = unsafe { libc::write(writer.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        assert_eq!(written, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EPIPE)
+        );
+    }
 
     #[test]
     fn plugin_pane_pwd_defaults_to_cwd_without_overriding_explicit_env() {

@@ -117,6 +117,7 @@ mod tests {
 
     #[test]
     fn timeout_kills_the_child() {
+        let _env_guard = crate::config::test_config_env_lock().lock().unwrap();
         let mut command = Command::new("sh");
         command
             .arg("-c")
@@ -133,6 +134,7 @@ mod tests {
 
     #[test]
     fn cancellation_kills_the_child() {
+        let _env_guard = crate::config::test_config_env_lock().lock().unwrap();
         let mut command = Command::new("sh");
         command
             .arg("-c")

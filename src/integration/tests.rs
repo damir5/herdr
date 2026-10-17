@@ -101,6 +101,7 @@ fn enforce_agent_version_warns_when_binary_missing() {
 #[cfg(unix)]
 #[test]
 fn enforce_agent_version_rejects_old_version() {
+    let _lock = integration_env_lock();
     let requirement = AgentVersionRequirement {
         label: "kimi code",
         binary: "echo",
@@ -117,6 +118,7 @@ fn enforce_agent_version_rejects_old_version() {
 #[cfg(unix)]
 #[test]
 fn enforce_agent_version_accepts_current_version() {
+    let _lock = integration_env_lock();
     let requirement = AgentVersionRequirement {
         label: "kimi code",
         binary: "echo",

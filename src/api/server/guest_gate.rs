@@ -3843,11 +3843,10 @@ mod tests {
 
     #[test]
     fn the_relay_fixture_leaves_no_relay_behind() {
-        let previous = std::env::var_os(crate::api::gram_relay::SOCKET_ENV);
         let (config, harness, coordinator) = relay_remote("relay-scope");
+        let previous = coordinator._socket.previous.clone();
         drop(coordinator);
         drop(harness);
-        drop(config);
         assert_eq!(
             std::env::var_os(crate::api::gram_relay::SOCKET_ENV),
             previous
@@ -3856,6 +3855,7 @@ mod tests {
             crate::api::gram_relay::policy().remote_socket().is_some(),
             previous.is_some()
         );
+        drop(config);
     }
 
     fn agent_sends_file(harness: &Harness, text: &str, name: &str) -> String {

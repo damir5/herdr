@@ -3186,6 +3186,7 @@ mod tests {
 
     #[tokio::test]
     async fn server_reload_agent_manifests_resets_detection_runtimes() {
+        let _env_guard = crate::config::test_config_env_lock().lock().unwrap();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
             &crate::config::Config::default(),
@@ -3217,6 +3218,7 @@ mod tests {
             .unwrap()
             .is_empty());
 
+        drop(_env_guard);
         tokio::time::timeout(
             std::time::Duration::from_millis(50),
             reset_notify.notified(),

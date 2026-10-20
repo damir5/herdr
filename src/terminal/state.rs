@@ -302,6 +302,10 @@ pub struct TerminalState {
     /// at the moment the watch is discarded.
     pub(crate) prompt_claim_retired: bool,
     pub last_agent_state_change_seq: Option<u64>,
+    /// Working or Blocked state that a short Unknown interrupted. Claude's
+    /// detection passes through Unknown at the end of a turn; the next Idle
+    /// reports this as its previous state so the turn still completes.
+    state_before_unknown: Option<AgentState>,
     /// Wall-clock ms when the agent's CURRENT status began — set at each transition to
     /// a DIFFERENT state. None until the first detected transition. NOT persisted, so it
     /// resets on restore/respawn (time-in-state restarts for a freshly relaunched agent,
@@ -394,6 +398,7 @@ impl TerminalState {
             displaced_submit_unknown: false,
             prompt_claim_retired: false,
             last_agent_state_change_seq: None,
+            state_before_unknown: None,
             agent_status_since_unix_ms: None,
             turn: 0,
             turn_epoch: fresh_turn_epoch_for(TurnCounterResetPath::ServerBoot),
@@ -2898,6 +2903,7 @@ impl TerminalState {
         self.input_prompt_kind = None;
         self.composer_write = None;
         self.last_agent_state_change_seq = None;
+        self.state_before_unknown = None;
         self.agent_status_since_unix_ms = None;
         self.last_agent_completion_seq = None;
         self.launch_argv = None;
@@ -3016,6 +3022,21 @@ impl TerminalState {
         }
 
         self.state = state;
+        let previous_state = if previous_agent_label != agent_label {
+            self.state_before_unknown = None;
+            previous_state
+        } else if state == AgentState::Unknown {
+            if matches!(previous_state, AgentState::Working | AgentState::Blocked) {
+                self.state_before_unknown = Some(previous_state);
+            }
+            previous_state
+        } else {
+            let interrupted = self.state_before_unknown.take();
+            match (previous_state, state, interrupted) {
+                (AgentState::Unknown, AgentState::Idle, Some(interrupted)) => interrupted,
+                _ => previous_state,
+            }
+        };
         Some(EffectiveStateChange {
             previous_agent_label,
             previous_known_agent,

@@ -3375,6 +3375,36 @@ mod tests {
         assert_completion_guard_sequence(false, &[AgentState::Unknown, AgentState::Idle], false);
     }
 
+    // Claude's detection passes through Unknown for a few seconds as a turn ends.
+    #[test]
+    fn completion_guard_work_interrupted_by_unknown_still_completes() {
+        assert_completion_guard_sequence(
+            true,
+            &[AgentState::Working, AgentState::Unknown, AgentState::Idle],
+            true,
+        );
+        assert_completion_guard_sequence(
+            true,
+            &[
+                AgentState::Working,
+                AgentState::Unknown,
+                AgentState::Working,
+                AgentState::Unknown,
+                AgentState::Idle,
+            ],
+            true,
+        );
+    }
+
+    #[test]
+    fn completion_guard_startup_trust_interrupted_by_unknown_is_not_completed_work() {
+        assert_completion_guard_sequence(
+            true,
+            &[AgentState::Blocked, AgentState::Unknown, AgentState::Idle],
+            false,
+        );
+    }
+
     #[test]
     fn completion_guard_first_work_finishes_without_prior_idle() {
         assert_completion_guard_sequence(true, &[AgentState::Working, AgentState::Idle], true);

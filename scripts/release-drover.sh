@@ -23,8 +23,13 @@ case "$zig_version" in
     *) echo "ZIG must be version 0.16; found $zig_version at $ZIG." >&2; exit 1 ;;
 esac
 export ZIG
-# rustup's installer adds ~/.cargo/bin to PATH only in login shells; plain `ssh host cmd` misses it.
-command -v rustup >/dev/null || PATH=$HOME/.cargo/bin:$PATH
+# Installers add ~/.cargo/bin (rustup) and ~/.local/bin (ah) to PATH only in
+# login shells; plain `ssh host cmd` misses them.
+PATH=$PATH:$HOME/.cargo/bin:$HOME/.local/bin
+if [[ $dry_run != 1 ]] && ! command -v ah >/dev/null; then
+    echo 'ah is not on PATH; install Agent Hub before publishing.' >&2
+    exit 1
+fi
 case "$(uname -s)" in
     Darwin) os=darwin ;;
     Linux) os=linux ;;

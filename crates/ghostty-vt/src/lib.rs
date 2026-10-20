@@ -1544,13 +1544,14 @@ impl Terminal {
         start: (u16, u32),
         end: (u16, u32),
         rectangle: bool,
+        unwrap: bool,
     ) -> Result<String, Error> {
         self.read_formatted_selection(
             ghostty_viewport_point(start.0, start.1),
             ghostty_viewport_point(end.0, end.1),
             rectangle,
             FormatterFormat::Vt,
-            false,
+            unwrap,
             true,
         )
     }

@@ -1935,7 +1935,9 @@ impl GhosttyPaneTerminal {
         let mut core = self.core.lock().ok()?;
         let cursor = current_cursor_state(&mut core);
         let cursor = effective_cursor_state(&mut core, cursor)?;
-        let mut ansi = ghostty_visible_ansi(&core).ok()?;
+        // Stream seeds are unwrapped: a soft-wrapped row continues without a line break, so a client
+        // that replays them at the same width wraps the row itself and can reflow it after a resize.
+        let mut ansi = ghostty_visible_ansi(&core, true).ok()?;
         ansi.push_str(&format!(
             "\x1b[{};{}H\x1b[?25{}",
             cursor.y.saturating_add(1),
@@ -1943,7 +1945,7 @@ impl GhosttyPaneTerminal {
             if cursor.visible { 'h' } else { 'l' },
         ));
         let history = (history_lines > 0)
-            .then(|| ghostty_scrollback_ansi(&core.terminal, history_lines).unwrap_or_default());
+            .then(|| ghostty_scrollback_ansi(&core.terminal, history_lines, true).unwrap_or_default());
         let (cursor, resize_id, cols, rows) = ring.capture_offsets();
         Some(super::output_ring::OutputSnapshot {
             ansi,
@@ -2378,7 +2380,7 @@ impl GhosttyPaneTerminal {
         self.core
             .lock()
             .ok()
-            .and_then(|core| ghostty_visible_ansi(&core).ok())
+            .and_then(|core| ghostty_visible_ansi(&core, false).ok())
             .unwrap_or_default()
     }
 
@@ -3031,7 +3033,7 @@ fn ghostty_visible_text(core: &mut GhosttyPaneCore) -> Result<String, crate::gho
     Ok(lines_to_text(lines))
 }
 
-fn ghostty_visible_ansi(core: &GhosttyPaneCore) -> Result<String, crate::ghostty::Error> {
+fn ghostty_visible_ansi(core: &GhosttyPaneCore, unwrap: bool) -> Result<String, crate::ghostty::Error> {
     let rows = core.terminal.rows()?;
     let cols = core.terminal.cols()?;
     if rows == 0 || cols == 0 {
@@ -3041,6 +3043,7 @@ fn ghostty_visible_ansi(core: &GhosttyPaneCore) -> Result<String, crate::ghostty
         (0, 0),
         (cols.saturating_sub(1), u32::from(rows.saturating_sub(1))),
         false,
+        unwrap,
     )
 }
 
@@ -3052,6 +3055,7 @@ fn ghostty_visible_ansi(core: &GhosttyPaneCore) -> Result<String, crate::ghostty
 fn ghostty_scrollback_ansi(
     terminal: &crate::ghostty::Terminal,
     lines: usize,
+    unwrap: bool,
 ) -> Result<String, crate::ghostty::Error> {
     if lines == 0 || terminal.active_screen()? != crate::ghostty::ActiveScreen::Primary {
         return Ok(String::new());
@@ -3066,7 +3070,7 @@ fn ghostty_scrollback_ansi(
         (0, start as u32),
         (cols.saturating_sub(1), (viewport_start - 1) as u32),
         false,
-        false,
+        unwrap,
     )
 }
 
@@ -5422,6 +5426,25 @@ mod tests {
 
         // Screen-only keyframes stay exactly as before.
         assert!(pane.output_snapshot(&ring, 0).unwrap().history.is_none());
+    }
+
+    #[test]
+    fn ghostty_output_snapshot_keeps_soft_wrapped_rows_joined() {
+        // A client replays the seed into its own terminal; a row broken with a line break
+        // there can never rejoin when the client widens, so the seed must keep soft wraps.
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(10, 4, 1024 * 1024).unwrap();
+        terminal.write(b"history-abcdefghijklmn\r\n\r\n\r\n\r\nscreen-abcdefghijklmn\r\n");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+        let ring =
+            super::super::output_ring::OutputRing::new(1, 1024, 10, 4, std::sync::Weak::new());
+
+        let seed = pane.output_snapshot(&ring, 100).unwrap();
+        assert!(seed.ansi.contains("screen-abcdefghijklmn"), "{:?}", seed.ansi);
+        let history = seed.history.unwrap();
+        assert!(history.contains("history-abcdefghijklmn"), "{history:?}");
+        // pane.read keeps the row-per-line form its callers expect.
+        assert!(!pane.visible_ansi().contains("screen-abcdefghijklmn"));
     }
 
     #[test]

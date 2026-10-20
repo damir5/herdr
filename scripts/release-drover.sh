@@ -56,7 +56,7 @@ export CARGO_TARGET_DIR="$work/target"
 export HERDR_BUILD_COMMIT="${version##*.}"
 rustup run 1.96.1 cargo build --release --locked
 cp "$CARGO_TARGET_DIR/release/herdr" "$work/herdr-drover"
-command=(ah release publish herdr-drover "$version" "$os-$arch=$work/herdr-drover")
+command=(ah release publish herdr-drover "$version" "$os-$arch=$work/herdr-drover" --host "${AGENT_HUB_RELEASE_HOST:-raspberrypi}")
 if [[ $dry_run == 1 ]]; then
     printf '%q ' "${command[@]}"
     printf '\n'

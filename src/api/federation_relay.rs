@@ -989,7 +989,10 @@ mod tests {
                 assert_eq!(machine["machine_label"], "Build box", "{kind:?}");
                 assert_eq!(machine["machine_profile_id"], "profile-box", "{kind:?}");
             }
-            if let EventData::PaneAgentStatusChanged { state_change_seq, .. } = &qualified.data {
+            if let EventData::PaneAgentStatusChanged {
+                state_change_seq, ..
+            } = &qualified.data
+            {
                 assert_eq!(*state_change_seq, 41);
             }
             if let EventData::LayoutUpdated { layout } = &qualified.data {

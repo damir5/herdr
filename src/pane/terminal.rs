@@ -158,7 +158,9 @@ impl InputState {
     pub fn decset_modes(self) -> Vec<u16> {
         use crate::input::{MouseProtocolEncoding as E, MouseProtocolMode as M};
         let mut modes = Vec::new();
-        if self.application_cursor { modes.push(1); }
+        if self.application_cursor {
+            modes.push(1);
+        }
         match self.mouse_protocol_mode {
             M::None => {}
             M::Press => modes.push(9),
@@ -166,15 +168,21 @@ impl InputState {
             M::ButtonMotion => modes.push(1002),
             M::AnyMotion => modes.push(1003),
         }
-        if self.focus_reporting { modes.push(1004); }
+        if self.focus_reporting {
+            modes.push(1004);
+        }
         match self.mouse_protocol_encoding {
             E::Default => {}
             E::Utf8 => modes.push(1005),
             E::Sgr => modes.push(1006),
             E::SgrPixels => modes.push(1016),
         }
-        if self.mouse_alternate_scroll { modes.push(1007); }
-        if self.bracketed_paste { modes.push(2004); }
+        if self.mouse_alternate_scroll {
+            modes.push(1007);
+        }
+        if self.bracketed_paste {
+            modes.push(2004);
+        }
         modes
     }
 }

@@ -362,7 +362,11 @@ impl TerminalRuntime {
     /// See `InputState::decset_modes`.
     pub fn input_modes(&self) -> Vec<u16> {
         #[cfg(unix)]
-        return self.0.input_state().map(|state| state.decset_modes()).unwrap_or_default();
+        return self
+            .0
+            .input_state()
+            .map(|state| state.decset_modes())
+            .unwrap_or_default();
         #[cfg(not(unix))]
         Vec::new()
     }

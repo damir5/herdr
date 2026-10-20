@@ -67,6 +67,11 @@ command=(ah release publish herdr-drover "$version" "$os-$arch=$work/herdr-drove
 if [[ $dry_run == 1 ]]; then
     printf '%q ' "${command[@]}"
     printf '\n'
-else
-    "${command[@]}"
+elif ! "${command[@]}"; then
+    # Keep the build so a failed upload does not cost a rebuild.
+    kept=$(mktemp -d)/herdr-drover
+    mv "$work/herdr-drover" "$kept"
+    echo "Publish failed; the binary is kept at $kept. Publish it from a host that reaches the Hub:" >&2
+    echo "ah release publish herdr-drover $version $os-$arch=$kept --host ${AGENT_HUB_RELEASE_HOST:-raspberrypi}" >&2
+    exit 1
 fi

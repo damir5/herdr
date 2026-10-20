@@ -982,6 +982,124 @@ fn devin_manifest_detects_idle_working_and_blocked_states() {
     assert!(permission_prompt.visible_blocker);
 }
 
+// Pi screens below are captures from pi 0.87.1 with pi-powerline-footer
+// (`herdr agent read --source detection`). The status line sits above the
+// editor; widgets render below it. Dialogs replace the editor and use
+// unindented borders.
+fn pi_rule(width: usize) -> String {
+    "─".repeat(width)
+}
+
+fn pi_status_line() -> &'static str {
+    " DeepSeek V4.1 Flash (latest) (CC) | think:high | dir work | ◫ 21k/1.0M (2.1%) AC | cache in: 49k | $0.00"
+}
+
+fn pi_editor_and_widgets(prompt: &str) -> String {
+    let rule = pi_rule(111);
+    format!(
+        "{status}\n {rule}\n >\n {rule}\n ↳ {prompt}\n LSP Inactive\n",
+        status = pi_status_line()
+    )
+}
+
+fn matched_rule_id(explain: &DetectionExplain) -> Option<&str> {
+    explain.matched_rule.as_ref().map(|rule| rule.id.as_str())
+}
+
+fn matched_input_rule_id(explain: &DetectionExplain) -> Option<&str> {
+    explain
+        .matched_input_rule
+        .as_ref()
+        .map(|rule| rule.id.as_str())
+}
+
+#[test]
+fn pi_first_loader_frames_with_bare_working_are_working() {
+    // Until the first token arrives the loader shows a bare "Working",
+    // indented one column.
+    let screen = format!(
+        " Run the bash command: sleep 20. Then reply with just: done\n\n\n ⠇ Working\n\n{}",
+        pi_editor_and_widgets("Run the bash command: sleep 20. Then reply with just: done")
+    );
+    let status = explain(Agent::Pi, &screen);
+    assert_eq!(status.state, AgentState::Working);
+    assert!(status.visible_working);
+}
+
+#[test]
+fn pi_working_status_with_extension_message_is_working() {
+    // Not captured live: working vibes replace the "Working" text and keep
+    // the braille loader frame.
+    let screen = format!(
+        " Run the bash command: sleep 25\n\n ⠹ Consulting the oracle...\n\n{}",
+        pi_editor_and_widgets("Run the bash command: sleep 25")
+    );
+    let status = explain(Agent::Pi, &screen);
+    assert_eq!(status.state, AgentState::Working);
+    assert!(status.visible_working);
+    assert_eq!(matched_rule_id(&status), Some("working_spinner_message"));
+
+    // Not captured live: the default editor embeds the status in its top border.
+    let screen = " Run the tests\n\n── ⠼ Reticulating splines ─────────────────────\n>\n──────────────────────────────────────────────\n~/dev/pi-pack (main)\n↑12k ↓3k $0.42 12.3%/200k (auto)\n";
+    let border = explain(Agent::Pi, screen);
+    assert_eq!(border.state, AgentState::Working);
+    assert_eq!(matched_rule_id(&border), Some("working_spinner_message"));
+}
+
+#[test]
+fn pi_idle_screen_after_tool_run_is_not_working_or_waiting_for_input() {
+    let screen = format!(
+        " Run the bash command: sleep 20. Then reply with just: done\n\n\n ✓ Bash sleep 20\n   ↳ 1 line returned • ctrl+o to show more\n\n done\n\n{}",
+        pi_editor_and_widgets("Run the bash command: sleep 20. Then reply with just: done")
+    );
+    let explain = explain(Agent::Pi, &screen);
+    assert_eq!(explain.state, AgentState::Idle);
+    assert!(!explain.input_pending);
+}
+
+#[test]
+fn pi_extension_confirm_blocks_and_sets_confirm_input() {
+    // ctx.ui.confirm from a tool call: the working line stays above the dialog.
+    let rule = pi_rule(113);
+    let screen = format!(
+        " ⠇ Ask confirm\n\n ⠋ Working... (↓ 23 tokens · 4s)\n\n{status}\n{rule}\n\n Allow interactive shell launch?\n Launch this exact command once?\n\n → Yes\n   No\n\n ↑↓ navigate  enter select  escape/ctrl+c cancel\n\n{rule}\n ↳ Call the ask_confirm tool once, then reply with its result in one line.\n LSP Inactive\n",
+        status = pi_status_line()
+    );
+    let status = explain(Agent::Pi, &screen);
+    assert_eq!(status.state, AgentState::Blocked);
+    assert!(status.visible_blocker);
+    assert_eq!(matched_rule_id(&status), Some("extension_confirm_prompt"));
+    assert!(status.input_pending);
+    assert_eq!(status.input_prompt_kind, Some(InputPromptKind::Confirm));
+    assert_eq!(matched_input_rule_id(&status), Some("extension_confirm"));
+
+    // A confirm opened from a command while idle, with No selected.
+    let screen = format!(
+        "{status}\n{rule}\n\n Allow interactive shell launch?\n Launch this exact command once?\n\n   Yes\n → No\n\n ↑↓ navigate  enter select  escape/ctrl+c cancel\n\n{rule}\n",
+        status = pi_status_line()
+    );
+    let idle_confirm = explain(Agent::Pi, &screen);
+    assert_eq!(idle_confirm.state, AgentState::Blocked);
+    assert_eq!(
+        idle_confirm.input_prompt_kind,
+        Some(InputPromptKind::Confirm)
+    );
+}
+
+#[test]
+fn pi_extension_select_sets_select_input_without_blocking() {
+    let rule = pi_rule(113);
+    let screen = format!(
+        " confirm -> false\n\n{status}\n{rule}\n\n Background Sessions\n\n → s1 (running, 3s)\n   s2 (exited, 1m)\n   s3 (exited, 4m)\n\n ↑↓ navigate  enter select  escape/ctrl+c cancel\n\n{rule}\n",
+        status = pi_status_line()
+    );
+    let explain = explain(Agent::Pi, &screen);
+    assert_eq!(explain.state, AgentState::Idle);
+    assert!(explain.input_pending);
+    assert_eq!(explain.input_prompt_kind, Some(InputPromptKind::Select));
+    assert_eq!(matched_input_rule_id(&explain), Some("extension_select"));
+}
+
 #[test]
 fn manifest_validation_rejects_unknown_fields_empty_rules_invalid_regions_and_regexes() {
     assert!(parse_manifest(

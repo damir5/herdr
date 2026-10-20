@@ -1,8 +1,47 @@
 id = "pi"
-version = "2026.10.01.1"
-min_engine_version = 1
-updated_at = "2026-10-01T00:00:00Z"
+version = "2026.10.20.1"
+min_engine_version = 4
+updated_at = "2026-10-20T00:00:00Z"
 aliases = ["herdr:pi"]
+
+# Extension select and confirm dialogs (ctx.ui.select / ctx.ui.confirm) replace
+# the editor with a bordered list and a fixed footer. `↑↓ navigate` is literal;
+# the select and cancel keys follow the user's keybindings. The selected row
+# starts with `→`. A confirm is the same list with exactly Yes and No.
+[[input_rules]]
+id = "extension_confirm"
+priority = 300
+region = "bottom_non_empty_lines(16)"
+kind = "confirm"
+all = [
+  { line_regex = ['^\s*↑↓ navigate\s+\S.* select\s+\S.* cancel\s*$'] },
+  { line_regex = ['^\s*(?:→\s+)?Yes\s*$'] },
+  { line_regex = ['^\s*(?:→\s+)?No\s*$'] },
+]
+
+[[input_rules]]
+id = "extension_select"
+priority = 250
+region = "bottom_non_empty_lines(16)"
+kind = "select"
+all = [
+  { line_regex = ['^\s*↑↓ navigate\s+\S.* select\s+\S.* cancel\s*$'] },
+  { line_regex = ['^\s*→\s+\S'] },
+]
+
+# Extensions use ctx.ui.confirm for approvals (command launch, subagent
+# authority). The working status line can stay visible above the dialog.
+[[rules]]
+id = "extension_confirm_prompt"
+state = "blocked"
+priority = 900
+region = "bottom_non_empty_lines(16)"
+visible_blocker = true
+all = [
+  { line_regex = ['^\s*↑↓ navigate\s+\S.* select\s+\S.* cancel\s*$'] },
+  { line_regex = ['^\s*(?:→\s+)?Yes\s*$'] },
+  { line_regex = ['^\s*(?:→\s+)?No\s*$'] },
+]
 
 [[rules]]
 id = "working_literal"
@@ -21,7 +60,23 @@ state = "working"
 priority = 100
 region = "bottom_non_empty_lines(12)"
 visible_working = true
+# The first loader frames show a bare "Working", indented one column under
+# pi-powerline-footer.
 any = [
   { line_regex = ['^── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working ─+$'] },
-  { line_regex = ['^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working$'] },
+  { line_regex = ['^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] Working$'] },
+]
+
+# Extensions replace the "Working" text (pi-powerline-footer working vibes end
+# in an ellipsis; pi-cc-extensions appends a timer). The loader keeps its
+# braille frame. Retry, compaction, and `!` bash loaders end with a key hint.
+[[rules]]
+id = "working_spinner_message"
+state = "working"
+priority = 100
+region = "bottom_non_empty_lines(12)"
+visible_working = true
+any = [
+  { line_regex = ['^\s*── [⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] \S.* ─+$'] },
+  { line_regex = ['^\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] \S.*(?:\.\.\.|…|to interrupt\)|to cancel\))'] },
 ]

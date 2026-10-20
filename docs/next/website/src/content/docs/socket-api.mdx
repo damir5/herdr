@@ -281,6 +281,16 @@ pairs to the newly launched process only. Herdr also injects `HERDR_SOCKET_PATH`
 managed pane processes. Herdr-managed variables are authoritative when they
 conflict with caller-provided env.
 
+`workspace.create` and `tab.create` also accept `env_remove`, a list of
+variables the new pane's shell must not inherit from the server. An entry that
+ends in `*` removes every variable with that prefix. Variables in `env` are still
+set. Servers that support it report `capabilities.launch_env_remove: true` from
+`ping`; older servers ignore the field.
+
+```json
+{"id":"req_tab","method":"tab.create","params":{"workspace_id":"w1","env_remove":["CODEX_*","CLAUDECODE"]}}
+```
+
 `pane.swap` supports directional and explicit forms:
 
 ```json

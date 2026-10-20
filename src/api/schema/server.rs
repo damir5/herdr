@@ -67,4 +67,7 @@ pub struct ServerCapabilities {
     /// long-lived bridge process instead of one process per request.
     #[serde(default)]
     pub api_bridge_multi: bool,
+    /// `workspace.create` and `tab.create` accept `env_remove`.
+    #[serde(default)]
+    pub launch_env_remove: bool,
 }

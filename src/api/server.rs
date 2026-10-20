@@ -208,6 +208,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         ssh_agent_registration: false,
         agent_forget: true,
         api_bridge_multi: cfg!(unix),
+        launch_env_remove: true,
     })
 }
 
@@ -3459,6 +3460,7 @@ mod tests {
                 ssh_agent_registration: false,
                 agent_forget: false,
                 api_bridge_multi: false,
+                launch_env_remove: false,
             }),
             None,
             None,

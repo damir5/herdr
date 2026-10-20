@@ -32,6 +32,18 @@ pub(super) fn normalize_launch_env(
     Ok(normalized)
 }
 
+pub(super) fn normalize_env_remove(keys: Vec<String>) -> Result<Vec<String>, (String, String)> {
+    for key in &keys {
+        if key.is_empty() || key.contains('=') || key.contains('\0') {
+            return Err((
+                "invalid_env".into(),
+                format!("env_remove entry {key:?} must be a non-empty key without '=' or NUL"),
+            ));
+        }
+    }
+    Ok(keys)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,5 +69,15 @@ mod tests {
         let env = HashMap::from([("BAD=KEY".to_string(), "value".to_string())]);
 
         assert_eq!(normalize_launch_env(env).unwrap_err().0, "invalid_env");
+    }
+
+    #[test]
+    fn normalize_env_remove_rejects_invalid_keys() {
+        for key in ["", "BAD=KEY", "BAD\0KEY"] {
+            assert_eq!(
+                normalize_env_remove(vec![key.to_string()]).unwrap_err().0,
+                "invalid_env"
+            );
+        }
     }
 }

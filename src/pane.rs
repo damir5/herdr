@@ -132,6 +132,9 @@ pub(crate) struct PaneLaunchEnv {
     /// override (a primary account on the default config-home, issue #94) while
     /// still needing a conflicting global token cleared.
     clear_vars: Vec<String>,
+    /// Inherited keys an API caller asked to remove; an entry ending in `*` is a
+    /// prefix.
+    env_remove: Vec<String>,
     identity: PaneLaunchIdentity,
 }
 
@@ -152,8 +155,14 @@ impl PaneLaunchEnv {
         Self {
             extra,
             clear_vars: Vec::new(),
+            env_remove: Vec::new(),
             identity: PaneLaunchIdentity::Inherit,
         }
+    }
+
+    pub(crate) fn with_env_remove(mut self, env_remove: Vec<String>) -> Self {
+        self.env_remove = env_remove;
+        self
     }
 
     /// Build from a resolved account selection, keeping the "set these" and
@@ -162,6 +171,7 @@ impl PaneLaunchEnv {
         Self {
             extra: account_env.vars,
             clear_vars: account_env.clear_vars,
+            env_remove: Vec::new(),
             identity: PaneLaunchIdentity::Inherit,
         }
     }
@@ -199,6 +209,24 @@ fn apply_pane_launch_env(cmd: &mut CommandBuilder, launch_env: &PaneLaunchEnv) {
         "CLAUDE_CODE_SESSION_ID",
         "CLAUDE_CODE_MESSAGING_TOKEN",
     ] {
+        cmd.env_remove(key);
+    }
+    // Runs before `extra`, so a key this launch sets explicitly is still set.
+    let inherited: Vec<String> = cmd
+        .iter_full_env_as_str()
+        .map(|(key, _)| key)
+        .filter(|key| {
+            launch_env
+                .env_remove
+                .iter()
+                .any(|pattern| match pattern.strip_suffix('*') {
+                    Some(prefix) => key.starts_with(prefix),
+                    None => key == pattern,
+                })
+        })
+        .map(str::to_owned)
+        .collect();
+    for key in inherited {
         cmd.env_remove(key);
     }
     for (key, value) in &launch_env.extra {
@@ -4407,6 +4435,48 @@ mod tests {
             Some("/home/tester/.claude"),
             "a default-config-home account must not gain an injected override (issue #94)"
         );
+    }
+
+    /// A server that inherited an agent's variables must not pass them to a pane
+    /// whose launch asked to remove them, by exact name or by `*` prefix, while
+    /// unrelated variables and keys the launch sets explicitly survive.
+    #[test]
+    fn requested_env_remove_drops_inherited_keys_by_name_and_prefix() {
+        let mut cmd = CommandBuilder::new("shell");
+        for key in [
+            "AGENT_HUB_IDENTITY",
+            "CODEX_SANDBOX",
+            "CODEX_HOME",
+            "CLAUDECODE",
+            "CLAUDECODE_OTHER",
+            "DROVER_KEEP",
+        ] {
+            cmd.env(key, "inherited");
+        }
+
+        let launch_env =
+            PaneLaunchEnv::from_extra(vec![("CODEX_HOME".to_string(), "/explicit".to_string())])
+                .with_env_remove(vec![
+                    "AGENT_HUB_*".to_string(),
+                    "CODEX_*".to_string(),
+                    "CLAUDECODE".to_string(),
+                ]);
+        apply_pane_launch_env(&mut cmd, &launch_env);
+
+        for key in ["AGENT_HUB_IDENTITY", "CODEX_SANDBOX", "CLAUDECODE"] {
+            assert!(cmd.get_env(key).is_none(), "{key} must be removed");
+        }
+        for (key, value) in [
+            ("CLAUDECODE_OTHER", "inherited"),
+            ("DROVER_KEEP", "inherited"),
+            ("CODEX_HOME", "/explicit"),
+        ] {
+            assert_eq!(
+                cmd.get_env(key).and_then(std::ffi::OsStr::to_str),
+                Some(value),
+                "{key} must survive"
+            );
+        }
     }
 
     #[test]

@@ -51,6 +51,7 @@ impl App {
             focus,
             label,
             env,
+            env_remove,
         } = params;
         let ws_idx = if let Some(workspace_id) = workspace_id {
             let Some(ws_idx) = self.parse_workspace_id(&workspace_id) else {
@@ -74,6 +75,12 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
+        let env_remove = match super::env::normalize_env_remove(env_remove) {
+            Ok(keys) => keys,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
+        let launch_env =
+            crate::pane::PaneLaunchEnv::from_extra(extra_env).with_env_remove(env_remove);
         let result = self
             .state
             .workspaces
@@ -88,7 +95,7 @@ impl App {
                     host_terminal_theme,
                     host_terminal_appearance,
                     crate::pane::PaneShellConfig::new(&default_shell, self.state.shell_mode),
-                    extra_env,
+                    launch_env,
                 )
             });
         match result {
@@ -459,6 +466,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
         );
 

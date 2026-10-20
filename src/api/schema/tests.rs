@@ -152,11 +152,32 @@ fn request_uses_dot_method_names() {
             focus: true,
             label: Some("api".into()),
             env: Default::default(),
+            env_remove: Vec::new(),
         }),
     };
 
     let json = serde_json::to_value(&request).unwrap();
     assert_eq!(json["method"], "workspace.create");
+}
+
+// External clients send `env_remove` by this wire name; it stays out of the
+// frozen client-shell schema, so only decoding proves it is accepted.
+#[test]
+fn workspace_and_tab_create_decode_env_remove() {
+    for method in ["workspace.create", "tab.create"] {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "id": "create",
+            "method": method,
+            "params": { "env_remove": ["CODEX_*", "CLAUDECODE"] }
+        }))
+        .unwrap();
+        let env_remove = match request.method {
+            Method::WorkspaceCreate(params) => params.env_remove,
+            Method::TabCreate(params) => params.env_remove,
+            other => panic!("unexpected method {other:?}"),
+        };
+        assert_eq!(env_remove, vec!["CODEX_*", "CLAUDECODE"]);
+    }
 }
 
 #[test]
@@ -1131,6 +1152,7 @@ fn success_response_round_trips() {
                 ssh_agent_registration: false,
                 agent_forget: false,
                 api_bridge_multi: false,
+                launch_env_remove: false,
             }),
         },
     };

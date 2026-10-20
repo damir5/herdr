@@ -949,6 +949,7 @@ fn navigation_highlight_ends_for_noop_focus_and_focused_creation() {
                     focus,
                     label: None,
                     env: Default::default(),
+                    env_remove: Vec::new(),
                 },
             ),
             crate::api::schema::Method::TabCreate(crate::api::schema::TabCreateParams {
@@ -957,6 +958,7 @@ fn navigation_highlight_ends_for_noop_focus_and_focused_creation() {
                 focus,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             }),
         ] {
             let mut state = local_navigation_state(false);

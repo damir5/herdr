@@ -296,7 +296,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             None,
-            Vec::new(),
+            PaneLaunchEnv::default(),
         )
     }
 
@@ -312,9 +312,9 @@ impl Workspace {
         events: mpsc::Sender<AppEvent>,
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
-        extra_env: Vec<(String, String)>,
+        launch_env: PaneLaunchEnv,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
-        if extra_env.is_empty() {
+        if launch_env == PaneLaunchEnv::default() {
             return Self::new(
                 initial_cwd,
                 rows,
@@ -340,7 +340,7 @@ impl Workspace {
             render_notify,
             render_dirty,
             None,
-            extra_env,
+            launch_env,
         )
     }
 
@@ -357,10 +357,10 @@ impl Workspace {
         render_notify: Arc<Notify>,
         render_dirty: Arc<RenderSignal>,
         argv: Option<&[String]>,
-        extra_env: Vec<(String, String)>,
+        launch_env: PaneLaunchEnv,
     ) -> std::io::Result<(Self, TerminalState, TerminalRuntime)> {
         let id = generate_workspace_id();
-        let launch_env = PaneLaunchEnv::from_extra(extra_env).with_identity(
+        let launch_env = launch_env.with_identity(
             id.clone(),
             public_tab_id_for_number(&id, 1),
             public_pane_id_for_number(&id, 1),
@@ -468,7 +468,7 @@ impl Workspace {
         host_terminal_theme: crate::terminal_theme::TerminalTheme,
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
-        extra_env: Vec<(String, String)>,
+        launch_env: PaneLaunchEnv,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         self.create_tab_with_runtime(
             rows,
@@ -479,7 +479,7 @@ impl Workspace {
             host_terminal_appearance,
             shell_config,
             None,
-            extra_env,
+            launch_env,
         )
     }
 
@@ -503,7 +503,7 @@ impl Workspace {
             host_terminal_appearance,
             crate::pane::PaneShellConfig::new("", crate::config::ShellModeConfig::NonLogin),
             Some(argv),
-            extra_env,
+            PaneLaunchEnv::from_extra(extra_env),
         )
     }
 
@@ -517,12 +517,12 @@ impl Workspace {
         host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
         shell_config: crate::pane::PaneShellConfig<'_>,
         argv: Option<&[String]>,
-        extra_env: Vec<(String, String)>,
+        launch_env: PaneLaunchEnv,
     ) -> std::io::Result<(usize, TerminalState, TerminalRuntime)> {
         let number = self.next_public_tab_number;
         self.next_public_tab_number += 1;
         let pane_number = self.next_public_pane_number;
-        let launch_env = self.launch_env_for_new_pane(number, pane_number, extra_env);
+        let launch_env = self.launch_env_for_new_pane(number, pane_number, launch_env);
         let events = self
             .active_tab()
             .map(|tab| tab.events.clone())
@@ -636,7 +636,11 @@ impl Workspace {
             .active_tab()
             .map(|tab| tab.number)
             .expect("workspace must always have at least one tab");
-        let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
+        let launch_env = self.launch_env_for_new_pane(
+            tab_number,
+            pane_number,
+            PaneLaunchEnv::from_extra(extra_env),
+        );
         let new_pane = self
             .active_tab_mut()
             .expect("workspace must always have at least one tab")
@@ -806,7 +810,11 @@ impl Workspace {
         let tab_idx = self.find_tab_index_for_pane(pane_id)?;
         let pane_number = self.next_public_pane_number;
         let tab_number = self.tabs[tab_idx].number;
-        let launch_env = self.launch_env_for_new_pane(tab_number, pane_number, extra_env);
+        let launch_env = self.launch_env_for_new_pane(
+            tab_number,
+            pane_number,
+            PaneLaunchEnv::from_extra(extra_env),
+        );
         let tab = &mut self.tabs[tab_idx];
         let new_pane = match if let Some(argv) = argv {
             tab.split_pane_argv(
@@ -980,9 +988,9 @@ impl Workspace {
         &self,
         tab_number: usize,
         pane_number: usize,
-        extra_env: Vec<(String, String)>,
+        launch_env: PaneLaunchEnv,
     ) -> PaneLaunchEnv {
-        PaneLaunchEnv::from_extra(extra_env).with_identity(
+        launch_env.with_identity(
             self.id.clone(),
             public_tab_id_for_number(&self.id, tab_number),
             public_pane_id_for_number(&self.id, pane_number),

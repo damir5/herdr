@@ -76,7 +76,13 @@ impl App {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
+        let env_remove = match super::env::normalize_env_remove(params.env_remove) {
+            Ok(keys) => keys,
+            Err((code, message)) => return encode_error(id, &code, message),
+        };
+        let launch_env =
+            crate::pane::PaneLaunchEnv::from_extra(extra_env).with_env_remove(env_remove);
+        match self.create_workspace_with_launch_env(cwd, params.focus, launch_env) {
             Ok(index) => {
                 if let Some(label) = params.label {
                     if let Some(workspace) = self.state.workspaces.get_mut(index) {
@@ -426,6 +432,7 @@ mod tests {
                 focus: true,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
         );
         let _: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -456,6 +463,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
         );
 
@@ -475,6 +483,102 @@ mod tests {
         );
         shutdown_test_runtimes(&mut app);
         let _ = std::fs::remove_dir_all(&focused_cwd);
+    }
+
+    // A client whose server inherited variables it must not pass on (Drover's agent
+    // variables) needs the initial shell of a new workspace or tab to start without
+    // them; replacing the shell afterwards is too late, because it already ran.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn workspace_and_tab_create_start_the_initial_shell_without_removed_inherited_env() {
+        use super::super::test_support::shutdown_test_runtimes;
+        use crate::config::ShellModeConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!(
+            "herdr-env-remove-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shell = dir.join("dump-env");
+        std::fs::write(
+            &shell,
+            "#!/bin/sh\n/usr/bin/env > \"$OUT.tmp\" && /bin/mv \"$OUT.tmp\" \"$OUT\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&shell, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // PATH is the one variable every test process inherits.
+        assert!(std::env::var_os("PATH").is_some());
+
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        app.state.default_shell = shell.display().to_string();
+        app.state.shell_mode = ShellModeConfig::NonLogin;
+        app.state.workspaces = vec![Workspace::test_new("spaces")];
+        app.state.active = Some(0);
+        app.state.selected = 0;
+        app.state.ensure_test_terminals();
+
+        let workspace_out = dir.join("workspace.env");
+        let response = app.handle_workspace_create(
+            "ws".into(),
+            WorkspaceCreateParams {
+                source_workspace_id: None,
+                cwd: Some(dir.display().to_string()),
+                focus: false,
+                label: None,
+                env: std::collections::HashMap::from([(
+                    "OUT".into(),
+                    workspace_out.display().to_string(),
+                )]),
+                env_remove: vec!["PATH".into()],
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+        let tab_out = dir.join("tab.env");
+        let response = app.handle_tab_create(
+            "tab".into(),
+            crate::api::schema::TabCreateParams {
+                workspace_id: None,
+                cwd: Some(dir.display().to_string()),
+                focus: false,
+                label: None,
+                env: std::collections::HashMap::from([(
+                    "OUT".into(),
+                    tab_out.display().to_string(),
+                )]),
+                // A prefix entry, as a client uses when it cannot know the
+                // server's inherited names.
+                env_remove: vec!["PAT*".into()],
+            },
+        );
+        let _: SuccessResponse = serde_json::from_str(&response).unwrap();
+
+        for out in [&workspace_out, &tab_out] {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !out.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let env = std::fs::read_to_string(out).unwrap();
+            assert!(
+                !env.lines().any(|line| line.starts_with("PATH=")),
+                "{} still inherited PATH",
+                out.display()
+            );
+            assert!(env.lines().any(|line| line.starts_with("OUT=")));
+        }
+        shutdown_test_runtimes(&mut app);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -517,6 +621,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
         );
         let success: SuccessResponse = serde_json::from_str(&response).unwrap();
@@ -537,6 +642,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
         );
         let error: ErrorResponse = serde_json::from_str(&invalid).unwrap();
@@ -550,6 +656,7 @@ mod tests {
                 focus: false,
                 label: None,
                 env: Default::default(),
+                env_remove: Vec::new(),
             },
         );
         let success: SuccessResponse = serde_json::from_str(&captured).unwrap();

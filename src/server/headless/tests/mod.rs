@@ -2580,6 +2580,7 @@ async fn public_background_tab_create_preserves_client_locations() {
                 focus: false,
                 label: Some("background".into()),
                 env: std::collections::HashMap::new(),
+                env_remove: Vec::new(),
             }),
         },
         respond_to,

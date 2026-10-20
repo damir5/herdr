@@ -16,6 +16,15 @@ pub struct TabCreateParams {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub env: HashMap<String, String>,
+    /// Inherited environment keys to remove before the initial pane's shell
+    /// starts. An entry ending in `*` removes every key with that prefix. Keys
+    /// in `env` are still set. Servers that support it report
+    /// `capabilities.launch_env_remove`; older servers ignore it.
+    // Kept out of the schema so this frozen client-shell method keeps its
+    // generation-1 shape; the capability gates it instead.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(skip)]
+    pub env_remove: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema, Default)]

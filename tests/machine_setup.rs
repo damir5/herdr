@@ -124,9 +124,9 @@ fn setup_options(
             .as_nanos()
     ));
     let app = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     fs::create_dir_all(root.join("bin")).unwrap();
     fs::create_dir_all(root.join("config").join(app)).unwrap();
@@ -287,9 +287,9 @@ fn machine_add_accepts_help_argument_order() {
     ));
     fs::create_dir(&root).unwrap();
     let app = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     fs::create_dir_all(root.join("config").join(app)).unwrap();
     fs::write(

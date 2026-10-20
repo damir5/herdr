@@ -146,6 +146,7 @@ fn spawn_server_with_relay(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
     if let Some(socket) = relay_socket {
         cmd.env("HERDR_GRAM_REVERSE_SOCKET", socket);
     } else {
@@ -355,11 +356,11 @@ fn gram_file_round_trip_upload_download_delete() {
     assert_eq!(bytes, b"hello world");
 
     // The bytes live on disk under the message id. A debug build namespaces the
-    // config dir as `herdr-dev`, matching the spawned binary.
+    // config dir as `herdr-drover-dev`, matching the spawned binary.
     let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     let file_dir = config_home.join(format!("{app_dir}/gram-files/{message_id}"));
     assert!(
@@ -735,6 +736,7 @@ fn duplicate_server_start_fails_gracefully() {
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
 
     let mut child2 = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child2.process_id());

@@ -113,6 +113,7 @@ fn spawn_server(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -157,6 +158,7 @@ fn spawn_herdr_auto(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -249,9 +251,9 @@ fn session_attach_without_terminal_leaves_no_session() {
     register_runtime_dir(&runtime_dir);
     let name = "no-tty";
     let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     let session_dir = config_home.join(app_dir).join("sessions").join(name);
     let run = |args: &[&str]| {
@@ -573,9 +575,9 @@ fn auto_detect_default_socket_path_from_config_dir() {
     // Don't set HERDR_SOCKET_PATH or HERDR_CLIENT_SOCKET_PATH.
     // The default paths should come from the app config directory, not XDG_RUNTIME_DIR.
     let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     let api_socket = config_home.join(app_dir_name).join("herdr.sock");
     let client_socket = config_home.join(app_dir_name).join("herdr-client.sock");
@@ -605,6 +607,7 @@ fn auto_detect_default_socket_path_from_config_dir() {
     cmd.env("XDG_RUNTIME_DIR", &runtime_dir);
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
     // Explicitly remove socket overrides to test default path resolution.
     cmd.env_remove("HERDR_SOCKET_PATH");
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
@@ -652,9 +655,9 @@ fn auto_detect_writes_client_and_server_logs_to_separate_files() {
     wait_for_socket(&client_socket, Duration::from_secs(10));
 
     let app_dir_name = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     let log_dir = config_home.join(app_dir_name);
     let client_log = log_dir.join("herdr-client.log");

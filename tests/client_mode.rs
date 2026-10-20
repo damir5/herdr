@@ -134,6 +134,7 @@ fn spawn_client_process_with_args_and_env(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
     for (key, value) in extra_env {
         cmd.env(key, value);
     }
@@ -192,6 +193,7 @@ fn spawn_server_with_config(
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -246,9 +248,9 @@ fn first_pane_id_in_workspace(socket_path: &PathBuf, workspace_id: &str) -> Stri
 
 fn app_dir_name() -> &'static str {
     if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     }
 }
 
@@ -412,9 +414,9 @@ fn client_sees_headless_startup_config_diagnostic() {
     let client_socket = runtime_dir.join("herdr-client.sock");
 
     let app_dir = if cfg!(debug_assertions) {
-        "herdr-dev"
+        "herdr-drover-dev"
     } else {
-        "herdr"
+        "herdr-drover"
     };
     fs::create_dir_all(config_home.join(app_dir)).unwrap();
     fs::write(
@@ -442,6 +444,7 @@ fn client_sees_headless_startup_config_diagnostic() {
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());
@@ -504,6 +507,7 @@ fn server_unreachable_shows_clear_error() {
         .env("HERDR_SOCKET_PATH", &api_socket)
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_DROVER_ENV")
+        .env_remove("HERDR_SESSION")
         .output()
         .expect("client command should run");
 
@@ -2075,6 +2079,7 @@ fn client_receives_notify_on_agent_state_change() {
     cmd.env_remove("HERDR_CLIENT_SOCKET_PATH");
     cmd.env("SHELL", "/bin/sh");
     cmd.env_remove("HERDR_DROVER_ENV");
+    cmd.env_remove("HERDR_SESSION");
 
     let child = pair.slave.spawn_command(cmd).unwrap();
     register_spawned_herdr_pid(child.process_id());

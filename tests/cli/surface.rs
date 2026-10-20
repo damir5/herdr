@@ -281,6 +281,7 @@ fn root_and_command_group_help_point_agents_to_plain_text_docs() {
             .env_remove("HERDR_SOCKET_PATH")
             .env_remove("HERDR_CLIENT_SOCKET_PATH")
             .env_remove("HERDR_DROVER_ENV")
+            .env_remove("HERDR_SESSION")
             .output()
             .unwrap();
         assert!(output.status.success(), "herdr {} failed", args.join(" "));
@@ -378,6 +379,7 @@ fn completion_command_prints_zsh_script_without_session_startup() {
         .env_remove("HERDR_SOCKET_PATH")
         .env_remove("HERDR_CLIENT_SOCKET_PATH")
         .env_remove("HERDR_DROVER_ENV")
+        .env_remove("HERDR_SESSION")
         .output()
         .unwrap();
 

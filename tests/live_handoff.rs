@@ -424,6 +424,9 @@ fn wait_for_pid_marker(path: &Path, timeout: Duration) -> u32 {
 
 #[test]
 fn pid_marker_waits_for_complete_line() {
+    // The expected panics below run the support panic hook, which kills every
+    // registered herdr server. Hold the lock so no other test's server is live.
+    let _lock = test_lock();
     let base = unique_test_dir();
     fs::create_dir_all(&base).unwrap();
     let marker = base.join("child.pid");

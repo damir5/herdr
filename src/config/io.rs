@@ -66,6 +66,12 @@ fn platform_config_dir() -> PathBuf {
 
 #[cfg(not(windows))]
 fn platform_config_dir() -> PathBuf {
+    // Unit tests clear and restore XDG_CONFIG_HOME concurrently, and some delete
+    // what this returns. A release-mode test build shares the installed
+    // server's folder name, so never fall back to the real ~/.config here.
+    if cfg!(test) {
+        return unit_test_fallback_dir("config");
+    }
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(format!(".config/{}", app_dir_name()))
     } else {
@@ -92,11 +98,25 @@ fn platform_state_dir() -> PathBuf {
 
 #[cfg(not(windows))]
 fn platform_state_dir() -> PathBuf {
+    if cfg!(test) {
+        return unit_test_fallback_dir("state");
+    }
     if let Ok(home) = std::env::var("HOME") {
         PathBuf::from(home).join(format!(".local/state/{}", app_dir_name()))
     } else {
         std::env::temp_dir().join(format!("{}-state", app_dir_name()))
     }
+}
+
+#[cfg(not(windows))]
+fn unit_test_fallback_dir(kind: &str) -> PathBuf {
+    std::env::temp_dir()
+        .join(format!(
+            "{}-unit-test-{}",
+            app_dir_name(),
+            std::process::id()
+        ))
+        .join(kind)
 }
 
 /// Normalize UTF-8 byte-order marks in config text.
@@ -871,6 +891,34 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unit_tests_never_resolve_the_home_config_or_state_dir() {
+        let _guard = crate::config::test_config_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"];
+        let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+        let home = std::env::temp_dir().join("herdr-fake-home");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("XDG_CONFIG_HOME");
+        std::env::remove_var("XDG_STATE_HOME");
+
+        let config = config_dir();
+        let state = state_dir();
+
+        for (key, value) in keys.iter().zip(previous) {
+            match value {
+                Some(value) => std::env::set_var(key, value),
+                None => std::env::remove_var(key),
+            }
+        }
+        // A test that clears XDG_CONFIG_HOME and then deletes config_dir() must
+        // not reach the installed server's sessions under ~/.config.
+        assert!(!config.starts_with(&home), "{}", config.display());
+        assert!(!state.starts_with(&home), "{}", state.display());
+    }
 
     #[test]
     fn append_accounts_block_is_append_only_escapes_and_reparses() {

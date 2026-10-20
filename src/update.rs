@@ -2226,11 +2226,11 @@ fn platform_target() -> (&'static str, &'static str) {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::sync::Mutex;
     use std::sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
     };
-    use std::sync::{Mutex, OnceLock};
     use std::thread;
 
     fn saved_machine(
@@ -2330,9 +2330,10 @@ mod tests {
         );
     }
 
+    // Shared with every test that changes XDG_CONFIG_HOME, so none of them
+    // clears it while another resolves config_dir().
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::config::test_config_env_lock()
     }
 
     fn unique_test_socket_path(name: &str) -> std::path::PathBuf {

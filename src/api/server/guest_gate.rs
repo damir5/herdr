@@ -2521,6 +2521,34 @@ mod tests {
                 _lock: lock,
             }
         }
+
+        fn guest_dir(&self) -> TempDir {
+            TempDir(self.dir.join(crate::config::app_dir_name()).join("guest"))
+        }
+    }
+
+    #[test]
+    fn relay_guest_cleanup_preserves_sessions_after_config_env_changes() {
+        let config = ConfigHome::new("cleanup-owner");
+        let other = TempDir::new("cleanup-unrelated");
+        let other_config_home = other.0.parent().unwrap();
+        let session = other_config_home
+            .join(crate::config::app_dir_name())
+            .join("sessions/main/session.json");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(&session, "keep this session").unwrap();
+
+        // Reproduce another test changing XDG_CONFIG_HOME before the relay takes its path.
+        std::env::set_var("XDG_CONFIG_HOME", other_config_home);
+        let guest_dir = config.guest_dir();
+        std::fs::create_dir_all(&guest_dir.0).unwrap();
+        drop(guest_dir);
+        std::env::set_var("XDG_CONFIG_HOME", &config.dir);
+
+        assert_eq!(
+            std::fs::read_to_string(session).unwrap(),
+            "keep this session"
+        );
     }
 
     impl Drop for ConfigHome {
@@ -3658,7 +3686,7 @@ mod tests {
     fn relay_remote(tag: &str) -> (ConfigHome, Harness, Coordinator) {
         let config = ConfigHome::new(tag);
         let mut harness = start(tag);
-        harness.dir = TempDir(crate::guest::store::guest_dir());
+        harness.dir = config.guest_dir();
         let coordinator = Coordinator::start(&harness);
         (config, harness, coordinator)
     }

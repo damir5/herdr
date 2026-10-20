@@ -414,11 +414,12 @@ mod tests {
     use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixListener;
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::Mutex;
 
+    // Shared with every test that changes XDG_CONFIG_HOME, so none of them
+    // clears it while another resolves config_dir().
     fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
+        crate::config::test_config_env_lock()
     }
 
     fn unique_test_dir(name: &str) -> std::path::PathBuf {

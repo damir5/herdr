@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -111,9 +112,13 @@ fn setup_options(
     strict_host_key_failure: bool,
     options: SetupOptions<'_>,
 ) -> SetupResult {
+    // Parallel tests can pass the same arguments within one clock tick (macOS
+    // reports microseconds), so a counter keeps each root separate.
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
     let root = std::path::PathBuf::from(format!(
-        "/var/tmp/herdr-machine-setup-{}-{}-{}-{}-{}-{}",
+        "/var/tmp/herdr-machine-setup-{}-{}-{}-{}-{}-{}-{}",
         std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed),
         installed,
         answer.trim().is_empty(),
         handoff,

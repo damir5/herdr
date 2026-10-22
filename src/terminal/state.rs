@@ -1159,7 +1159,13 @@ impl TerminalState {
         {
             return None;
         }
-        let owner_conflicts = self.current_session_owner_conflicts(&source, &agent_label);
+        // An identity-only native integration (herdr:claude) owns the session
+        // but never reports state, so another reporter's state for the same
+        // agent is accepted. It must not take over or clear that session.
+        let keeps_native_session_owner =
+            self.native_session_owner_shares_agent(&source, &agent_label);
+        let owner_conflicts = !keeps_native_session_owner
+            && self.current_session_owner_conflicts(&source, &agent_label);
         let foreground_takeover_allowed = owner_conflicts
             && self.foreground_agent_confirms_hook_authority_takeover(
                 &source,
@@ -1169,6 +1175,7 @@ impl TerminalState {
         if owner_conflicts && !foreground_takeover_allowed {
             return None;
         }
+        let session_ref = session_ref.filter(|_| !keeps_native_session_owner);
         let session_ref = session_ref.map(|session_ref| {
             if self.lifecycle_hook_report_replaces_persisted_session(
                 &source,
@@ -1222,7 +1229,9 @@ impl TerminalState {
                 }
             }
         }
-        self.persisted_agent_session = None;
+        if !keeps_native_session_owner {
+            self.persisted_agent_session = None;
+        }
         self.hook_authority = Some(HookAuthority {
             source,
             agent_label,
@@ -1756,6 +1765,21 @@ impl TerminalState {
                 session.session_ref.value.clone(),
             )
         })
+    }
+
+    fn native_session_owner_shares_agent(&self, source: &str, agent_label: &str) -> bool {
+        self.current_session_identity_for_persistence().is_some_and(
+            |(current_source, current_agent, _, _)| {
+                current_source != source
+                    && crate::agent_resume::is_reserved_native_state_source(
+                        &current_source,
+                        &current_agent,
+                    )
+                    && crate::detect::parse_agent_label(&current_agent).is_some()
+                    && crate::detect::parse_agent_label(&current_agent)
+                        == crate::detect::parse_agent_label(agent_label)
+            },
+        )
     }
 
     fn current_session_owner_conflicts(&self, source: &str, agent_label: &str) -> bool {
@@ -6213,6 +6237,57 @@ mod tests {
                 session.session_ref.value.as_str()
             )),
             Some(("herdr:codex", "codex", "codex-session"))
+        );
+    }
+
+    #[test]
+    fn custom_state_report_for_native_session_owner_agent_is_accepted_and_keeps_session() {
+        let mut terminal = test_terminal();
+        terminal.set_detected_state(Some(Agent::Claude), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:claude".into(),
+                "claude".into(),
+                crate::agent_resume::AgentSessionRef::id("claude-session"),
+                Some(20),
+                Some("startup".into()),
+            )
+            .expect("herdr:claude session should be accepted");
+        let owner_session = Some((
+            "herdr:claude".to_string(),
+            "claude".to_string(),
+            crate::agent_resume::AgentSessionRefKind::Id,
+            "claude-session".to_string(),
+        ));
+
+        let mutation = terminal.set_hook_authority_with_session_ref(
+            "custom:claude-statusline:claude".into(),
+            "claude".into(),
+            AgentState::Working,
+            Some("1 background task".into()),
+            None,
+            None,
+        );
+
+        assert!(
+            mutation.is_some(),
+            "background-work report should be accepted"
+        );
+        assert_eq!(terminal.state, AgentState::Working);
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            owner_session
+        );
+
+        terminal
+            .release_agent_with_mutation("custom:claude-statusline:claude", "claude", None)
+            .expect("release from the same source should be accepted");
+
+        assert_ne!(terminal.state, AgentState::Working);
+        assert!(terminal.hook_authority.is_none());
+        assert_eq!(
+            terminal.current_session_identity_for_persistence(),
+            owner_session
         );
     }
 

@@ -1944,8 +1944,9 @@ impl GhosttyPaneTerminal {
             cursor.x.saturating_add(1),
             if cursor.visible { 'h' } else { 'l' },
         ));
-        let history = (history_lines > 0)
-            .then(|| ghostty_scrollback_ansi(&core.terminal, history_lines, true).unwrap_or_default());
+        let history = (history_lines > 0).then(|| {
+            ghostty_scrollback_ansi(&core.terminal, history_lines, true).unwrap_or_default()
+        });
         let (cursor, resize_id, cols, rows) = ring.capture_offsets();
         Some(super::output_ring::OutputSnapshot {
             ansi,
@@ -3033,7 +3034,10 @@ fn ghostty_visible_text(core: &mut GhosttyPaneCore) -> Result<String, crate::gho
     Ok(lines_to_text(lines))
 }
 
-fn ghostty_visible_ansi(core: &GhosttyPaneCore, unwrap: bool) -> Result<String, crate::ghostty::Error> {
+fn ghostty_visible_ansi(
+    core: &GhosttyPaneCore,
+    unwrap: bool,
+) -> Result<String, crate::ghostty::Error> {
     let rows = core.terminal.rows()?;
     let cols = core.terminal.cols()?;
     if rows == 0 || cols == 0 {
@@ -5440,7 +5444,11 @@ mod tests {
             super::super::output_ring::OutputRing::new(1, 1024, 10, 4, std::sync::Weak::new());
 
         let seed = pane.output_snapshot(&ring, 100).unwrap();
-        assert!(seed.ansi.contains("screen-abcdefghijklmn"), "{:?}", seed.ansi);
+        assert!(
+            seed.ansi.contains("screen-abcdefghijklmn"),
+            "{:?}",
+            seed.ansi
+        );
         let history = seed.history.unwrap();
         assert!(history.contains("history-abcdefghijklmn"), "{history:?}");
         // pane.read keeps the row-per-line form its callers expect.

@@ -399,6 +399,12 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
         return effective.to_string();
     }
 
+    if normalized_agent_lookup_name(path_basename(effective)) == "ah" {
+        if let Some(wrapped_agent) = ah_run_agent_name(process.argv.as_deref()) {
+            return wrapped_agent;
+        }
+    }
+
     if let Some(runtime) = process.argv.as_deref().and_then(|argv| argv.first()) {
         let runtime_name = normalized_agent_lookup_name(path_basename(runtime));
         if matches!(runtime_name.as_str(), "node" | "bun") {
@@ -422,6 +428,32 @@ fn normalized_process_name(process: &crate::platform::ForegroundProcess) -> Stri
     }
 
     effective.to_string()
+}
+
+/// Agent Hub's `ah run [flags] -- <command>` runs the harness on a PTY of its
+/// own, so the agent never joins the pane's foreground process group and only
+/// `ah` is visible here. The agent is named by `--harness`, else by the command.
+fn ah_run_agent_name(argv: Option<&[String]>) -> Option<String> {
+    let argv = argv?;
+    if argv.get(1).map(String::as_str) != Some("run") {
+        return None;
+    }
+    let mut args = argv[2..].iter();
+    while let Some(arg) = args.next() {
+        let harness = match arg.as_str() {
+            "--" => {
+                return args
+                    .next()
+                    .and_then(|command| agent_name_from_path_token(command));
+            }
+            "--harness" => args.next().map(String::as_str),
+            other => other.strip_prefix("--harness="),
+        };
+        if let Some(agent) = harness.and_then(identify_agent) {
+            return Some(agent_label(agent).to_string());
+        }
+    }
+    None
 }
 
 fn wrapped_agent_name_from_runtime_argv(runtime: &str, argv: Option<&[String]>) -> Option<String> {
@@ -1451,6 +1483,56 @@ mod tests {
             identify_agent_in_job(&job),
             Some((Agent::Pi, "pi".to_string()))
         );
+    }
+
+    // `ah drover session new` starts the agent as `ah run ... -- <agent>` on
+    // an inner PTY, so the pane's foreground job holds only the shell and ah.
+    #[test]
+    fn identify_agent_in_job_detects_agent_behind_ah_run() {
+        let job = crate::platform::ForegroundJob {
+            process_group_id: 90596,
+            processes: vec![
+                foreground_process(
+                    90596,
+                    "bash",
+                    &["sh", "-c", "eval \"$(printf %s YWg= | base64 -d)\""],
+                ),
+                foreground_process(
+                    90600,
+                    "ah",
+                    &[
+                        "ah",
+                        "run",
+                        "--owner-ref",
+                        "herdr:pi-qa2:w1:p2",
+                        "--harness",
+                        "pi",
+                        "--",
+                        "pi",
+                        "Run it\n",
+                    ],
+                ),
+            ],
+        };
+        assert_eq!(
+            identify_agent_in_job(&job),
+            Some((Agent::Pi, "pi".to_string()))
+        );
+
+        let by_command = foreground_process(
+            1,
+            "ah",
+            &["ah", "run", "--owner-ref", "x", "--", "/Users/me/bin/codex"],
+        );
+        assert_eq!(normalized_process_name(&by_command), "codex");
+        let by_flag = foreground_process(
+            1,
+            "ah",
+            &["/usr/local/bin/ah", "run", "--harness=claude", "--", "c"],
+        );
+        assert_eq!(normalized_process_name(&by_flag), "claude");
+        let not_run = foreground_process(1, "ah", &["ah", "drover", "ls", "--harness", "pi"]);
+        assert_eq!(normalized_process_name(&not_run), "ah");
     }
 
     #[test]

@@ -105,6 +105,8 @@ impl HeadlessServer {
         );
 
         let now = std::time::Instant::now();
+        let replay_bytes_per_pane =
+            crate::server::handoff::replay_bytes_per_pane(pane_by_terminal.len());
         let mut handoff_entries = Vec::new();
         for (terminal_id, runtime) in self.app.terminal_runtimes.iter() {
             let Some(pane_id) = pane_by_terminal.get(terminal_id).copied() else {
@@ -123,15 +125,10 @@ impl HeadlessServer {
                 .terminals
                 .get(terminal_id)
                 .map(|terminal| terminal.handoff_metadata(now));
-            let has_agent_session = self
-                .app
-                .state
-                .terminals
-                .get(terminal_id)
-                .is_some_and(|terminal| terminal.persisted_agent_session.is_some());
-            if !has_agent_session {
-                handoff_runtime.initial_history_ansi = runtime.handoff_history_ansi();
-            }
+            // The agent keeps running across a live handoff and does not print
+            // its history again, so agent panes carry their history too.
+            handoff_runtime.initial_history_ansi =
+                runtime.handoff_history_ansi(replay_bytes_per_pane);
             handoff_entries.push((terminal_id.clone(), handoff_runtime));
         }
 

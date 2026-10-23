@@ -28,7 +28,14 @@ const OWNED_ACK_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(unix)]
 const FDS_PER_MESSAGE: usize = 64;
 #[cfg(unix)]
-pub(crate) const MAX_REPLAY_BYTES_PER_PANE: usize = 8 * 1024;
+const MAX_LINE_BYTES: usize = 16 * 1024 * 1024;
+// Pane history rides in the manifest line, which receivers cap at
+// MAX_LINE_BYTES, so all panes share half of it. JSON escaping of ANSI
+// sequences fills part of the other half.
+#[cfg(unix)]
+const MAX_REPLAY_BYTES_TOTAL: usize = MAX_LINE_BYTES / 2;
+#[cfg(unix)]
+const MAX_REPLAY_BYTES_PER_PANE: usize = 1024 * 1024;
 #[cfg(unix)]
 pub(crate) const COMMIT_TIMEOUT: Duration = READY_TIMEOUT;
 
@@ -304,6 +311,12 @@ pub(crate) fn report_owned(stream: &mut UnixStream) -> io::Result<()> {
     stream.flush()
 }
 
+/// History bytes each pane may carry when `panes` panes are handed off.
+#[cfg(unix)]
+pub(crate) fn replay_bytes_per_pane(panes: usize) -> usize {
+    (MAX_REPLAY_BYTES_TOTAL / panes.max(1)).min(MAX_REPLAY_BYTES_PER_PANE)
+}
+
 #[cfg(unix)]
 pub(crate) fn manifest_for(
     snapshot: crate::persist::SessionSnapshot,
@@ -362,22 +375,43 @@ fn accept_with_timeout(
 
 #[cfg(unix)]
 fn read_line_unbuffered(stream: &mut UnixStream) -> io::Result<String> {
+    // Peek, then consume only up to the newline: descriptors that follow the
+    // line must stay queued for recv_fds, and a manifest carrying pane history
+    // is megabytes long, too slow to read one byte per call.
     let mut bytes = Vec::new();
-    let mut byte = [0u8; 1];
+    let mut chunk = vec![0u8; 64 * 1024];
     loop {
-        let read = stream.read(&mut byte)?;
-        if read == 0 {
+        let peeked = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                chunk.as_mut_ptr().cast(),
+                chunk.len(),
+                libc::MSG_PEEK,
+            )
+        };
+        if peeked < 0 {
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(err);
+        }
+        let peeked = peeked as usize;
+        if peeked == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "handoff stream closed while reading line",
             ));
         }
-        bytes.push(byte[0]);
-        if byte[0] == b'\n' {
+        let newline = chunk[..peeked].iter().position(|&byte| byte == b'\n');
+        let take = newline.map_or(peeked, |index| index + 1);
+        stream.read_exact(&mut chunk[..take])?;
+        bytes.extend_from_slice(&chunk[..take]);
+        if newline.is_some() {
             return String::from_utf8(bytes)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err));
         }
-        if bytes.len() > 16 * 1024 * 1024 {
+        if bytes.len() > MAX_LINE_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "handoff line exceeded maximum size",
@@ -537,6 +571,34 @@ pub(crate) fn log_import_result(panes: usize) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replay_history_of_all_panes_fits_a_receivers_manifest_line() {
+        assert_eq!(replay_bytes_per_pane(1), MAX_REPLAY_BYTES_PER_PANE);
+        for panes in [8, 30, 200] {
+            assert!(replay_bytes_per_pane(panes) * panes <= MAX_LINE_BYTES / 2);
+        }
+    }
+
+    #[test]
+    fn a_long_line_is_read_whole_and_the_descriptors_after_it_still_arrive() {
+        let (mut sender, mut receiver) = UnixStream::pair().unwrap();
+        let line = format!("{}\n", "x".repeat(300 * 1024));
+        let (pipe_read, pipe_write) = std::io::pipe().unwrap();
+        let sent = line.clone();
+        let writer = std::thread::spawn(move || {
+            sender.write_all(sent.as_bytes()).unwrap();
+            send_fds(&sender, &[pipe_write.as_raw_fd()]).unwrap();
+            drop(pipe_read);
+        });
+
+        assert_eq!(read_line_unbuffered(&mut receiver).unwrap(), line);
+        let fds = recv_fds(&receiver, 1).unwrap();
+        writer.join().unwrap();
+
+        assert_eq!(fds.len(), 1);
+        unsafe { libc::close(fds[0]) };
+    }
 
     fn empty_snapshot() -> crate::persist::SessionSnapshot {
         crate::persist::SessionSnapshot {

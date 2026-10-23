@@ -1609,6 +1609,129 @@ fn live_handoff_keeps_unmanaged_agent_name_bound_to_saved_session() {
 }
 
 #[test]
+fn live_handoff_keeps_history_of_a_pane_with_an_agent_session() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _lock = test_lock();
+    let base = unique_test_dir();
+    let config_home = base.join("config");
+    let runtime_dir = base.join("runtime");
+    let api_socket = runtime_dir.join("herdr.sock");
+    let started_marker = base.join("agent-started");
+    let fake_pi = base.join("pi");
+    fs::create_dir_all(&base).unwrap();
+    // The agent keeps running across the handoff and never prints these lines
+    // again, so only the handoff can keep them in the pane's history.
+    fs::write(
+        &fake_pi,
+        format!(
+            "#!/bin/sh\nexport HERDR_AGENT=pi\nfor i in $(seq 1 300); do printf 'history-line-%03d\\n' $i; done\necho started > {}\n/bin/sleep 30\n:\n",
+            started_marker.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&fake_pi, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let spawned = spawn_server(&config_home, &runtime_dir, &api_socket);
+    wait_for_socket(&api_socket, Duration::from_secs(10));
+    register_runtime_dir(&runtime_dir);
+    let created = request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:workspace:create",
+            "method": "workspace.create",
+            "params": {"cwd": "/tmp", "focus": true}
+        }),
+    );
+    let pane_id = created["result"]["root_pane"]["pane_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:pane:start-agent",
+            "method": "pane.send_input",
+            "params": {"pane_id": pane_id, "text": fake_pi, "keys": ["Enter"]}
+        }),
+    ));
+    support::wait_for_file(&started_marker, Duration::from_secs(5));
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({
+            "id": "test:agent:session",
+            "method": "pane.report_agent_session",
+            "params": {
+                "pane_id": pane_id,
+                "source": "herdr:pi",
+                "agent": "pi",
+                "seq": 1,
+                "agent_session_path": base.join("session.jsonl"),
+                "session_start_source": "startup"
+            }
+        }),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let pane = request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:pane:get",
+                "method": "pane.get",
+                "params": {"pane_id": pane_id}
+            }),
+        );
+        if pane["result"]["pane"]["agent_session"].is_object() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "pane never got its agent session: {pane}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+    let read_history = || {
+        request(
+            &api_socket,
+            serde_json::json!({
+                "id": "test:pane:read-history",
+                "method": "pane.read",
+                "params": {
+                    "pane_id": pane_id,
+                    "source": "recent",
+                    "lines": 1000,
+                    "format": "text",
+                    "strip_ansi": true
+                }
+            }),
+        )["result"]["read"]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert!(read_history().contains("history-line-001"));
+
+    assert_ok(request(
+        &api_socket,
+        serde_json::json!({"id":"test:handoff","method":"server.live_handoff","params":{}}),
+    ));
+    drop(spawned);
+    wait_for_api(&api_socket, Duration::from_secs(10));
+
+    let history = read_history();
+    assert!(
+        history.contains("history-line-001"),
+        "history after handoff: {history:?}"
+    );
+
+    let _ = request(
+        &api_socket,
+        serde_json::json!({"id":"test:stop","method":"server.stop","params":{}}),
+    );
+    cleanup_test_base(&base);
+}
+
+#[test]
 fn live_handoff_keeps_agent_started_pane_after_agent_exits() {
     use std::os::unix::fs::PermissionsExt;
 

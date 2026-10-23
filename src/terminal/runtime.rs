@@ -59,8 +59,8 @@ impl TerminalRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
-        self.0.handoff_history_ansi()
+    pub fn handoff_history_ansi(&self, max_bytes: usize) -> Option<String> {
+        self.0.handoff_history_ansi(max_bytes)
     }
 
     #[cfg(unix)]

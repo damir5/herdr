@@ -2382,13 +2382,12 @@ impl PaneRuntime {
     }
 
     #[cfg(unix)]
-    pub fn handoff_history_ansi(&self) -> Option<String> {
+    pub fn handoff_history_ansi(&self, max_bytes: usize) -> Option<String> {
         if self.terminal.alternate_screen_active() {
             return None;
         }
-        self.snapshot_history().map(|history| {
-            truncate_handoff_history(history, crate::server::handoff::MAX_REPLAY_BYTES_PER_PANE)
-        })
+        self.snapshot_history()
+            .map(|history| truncate_handoff_history(history, max_bytes))
     }
 
     pub fn apply_host_terminal_theme(&self, theme: crate::terminal_theme::TerminalTheme) {
@@ -5315,7 +5314,7 @@ mod tests {
         let runtime =
             PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"handoff-primary-history\r\n");
 
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime.handoff_history_ansi(4096).unwrap();
 
         assert!(history.contains("handoff-primary-history"));
     }
@@ -5330,7 +5329,7 @@ mod tests {
             b"primary\r\n\x1b[?1049halt-screen",
         );
 
-        assert!(runtime.handoff_history_ansi().is_none());
+        assert!(runtime.handoff_history_ansi(4096).is_none());
     }
 
     #[cfg(unix)]
@@ -5345,13 +5344,13 @@ mod tests {
 
         let before = runtime.input_state().unwrap();
         assert!(before.alternate_screen);
-        assert!(runtime.handoff_history_ansi().is_none());
+        assert!(runtime.handoff_history_ansi(4096).is_none());
 
         assert!(runtime.normalize_alternate_screen_on_exit());
 
         let after = runtime.input_state().unwrap();
         assert!(!after.alternate_screen);
-        let history = runtime.handoff_history_ansi().unwrap();
+        let history = runtime.handoff_history_ansi(4096).unwrap();
         assert!(history.contains("primary-line-1"));
 
         let primary = PaneRuntime::test_with_scrollback_bytes(40, 5, 4096, b"primary-only\r\n");

@@ -1232,24 +1232,62 @@ mod tests {
     }
 
     #[test]
+    fn submission_delay_starts_at_completed_prompt_write() {
+        let (mut runner, _peer) = actor_runner_for_unit_test();
+        let (reply, _completion) = std_mpsc::channel();
+        let delay = Duration::from_secs(60);
+        runner.handle_data_command(PtyIoDataCommand::SubmitUserInput {
+            text: Bytes::from_static(b"prompt"),
+            enter: Bytes::from_static(b"\r"),
+            delay,
+            guard: None,
+            reply,
+        });
+        runner.schedule_submission_enter();
+        assert!(matches!(
+            runner.active_submission.as_ref().unwrap().phase,
+            SubmissionPhase::WritingText
+        ));
+
+        let boundary = runner.flush_pending_writes_once().unwrap().unwrap();
+        assert_eq!(boundary, SubmissionBoundary::Text);
+        let before = Instant::now();
+        runner.complete_submission_boundary(boundary);
+        let after = Instant::now();
+        let SubmissionPhase::WaitingUntil(deadline) =
+            runner.active_submission.as_ref().unwrap().phase
+        else {
+            panic!("completed prompt must start the submission delay");
+        };
+        assert!(deadline >= before + delay);
+        assert!(deadline <= after + delay);
+        runner.schedule_submission_enter();
+        assert!(
+            runner.pending_writes.is_empty(),
+            "Enter must remain delayed"
+        );
+    }
+
+    #[test]
     fn actor_delays_enter_from_completed_prompt_write() {
         let (handle, mut peer, _read_rx) = actor_with_socket_pair(false);
+        // A concurrent process spawn can retain a peer descriptor until exec.
+        let _inherited_peer = peer.try_clone().expect("retain peer descriptor");
         let text = Bytes::from(vec![b'x'; 4 * 1024 * 1024]);
         let text_len = text.len();
         let delay = Duration::from_millis(200);
         let reader = std::thread::spawn(move || {
-            std::thread::sleep(delay);
             let mut received = vec![0; text_len];
             peer.read_exact(&mut received)
                 .expect("peer receives prompt");
-            let prompt_completed = Instant::now();
             let mut enter = [0; 1];
             peer.read_exact(&mut enter).expect("peer receives enter");
-            let enter_received = Instant::now();
             let mut user = [0; 4];
             peer.read_exact(&mut user)
                 .expect("peer receives queued input");
-            (prompt_completed, enter_received, enter, user)
+            peer.shutdown(std::net::Shutdown::Both)
+                .expect("peer shuts down all retained descriptors");
+            (enter, user)
         });
 
         let completion = handle
@@ -1259,14 +1297,13 @@ mod tests {
             .try_write_user_input(Bytes::from_static(b"user"))
             .expect("ordinary input queues behind submission");
         completion
-            .recv()
+            .recv_timeout(Duration::from_secs(5))
             .expect("actor reports submission")
             .expect("submission completes");
-        let (prompt_completed, enter_received, enter, user) = reader.join().expect("reader joins");
+        let (enter, user) = reader.join().expect("reader joins");
 
         assert_eq!(enter, *b"\r");
         assert_eq!(user, *b"user");
-        assert!(enter_received.duration_since(prompt_completed) >= delay / 2);
 
         let err = match handle.queue_user_input_submission(
             Bytes::from_static(b"prompt"),

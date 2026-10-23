@@ -409,8 +409,11 @@ fn plugin_install_usage_errors_include_options_without_installing() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains("usage: herdr plugin install"), "{stderr}");
         assert!(stderr.contains("[--ref REF] [--yes|-y]"), "{stderr}");
-        assert!(!config_home.join("herdr-drover-dev/plugins").exists());
-        assert!(!config_home.join("herdr-drover-dev/plugins.json").exists());
+        assert!(!config_home.join(app_dir_name()).join("plugins").exists());
+        assert!(!config_home
+            .join(app_dir_name())
+            .join("plugins.json")
+            .exists());
         assert!(!state_home.exists());
     }
 
@@ -875,7 +878,7 @@ command = ["sh", "-c", "echo new"]
     fs::create_dir_all(&config_home).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     let managed_checkout = config_home
-        .join("herdr-drover-dev")
+        .join(app_dir_name())
         .join("plugins")
         .join("github")
         .join(WORKTREE_BOOTSTRAP_MANAGED_COMPONENT);
@@ -1001,7 +1004,7 @@ command = ["sh", "-c", "echo install"]
     fs::create_dir_all(&config_home).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     let managed_checkout = config_home
-        .join("herdr-drover-dev")
+        .join(app_dir_name())
         .join("plugins")
         .join("github")
         .join(WORKTREE_BOOTSTRAP_MANAGED_COMPONENT);
@@ -1129,7 +1132,7 @@ command = ["sh", "-c", "echo install"]
     fs::create_dir_all(&config_home).unwrap();
     fs::create_dir_all(&runtime_dir).unwrap();
     let managed_checkout = config_home
-        .join("herdr-drover-dev")
+        .join(app_dir_name())
         .join("plugins")
         .join("github")
         .join(WORKTREE_BOOTSTRAP_MANAGED_COMPONENT);

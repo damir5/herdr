@@ -2,7 +2,7 @@
 // managed by herdr; reinstalling or updating the integration overwrites this file.
 // add custom hooks/plugins beside this file instead of editing it.
 // HERDR_INTEGRATION_ID=pi
-// HERDR_INTEGRATION_VERSION=9
+// HERDR_INTEGRATION_VERSION=10
 // @ts-nocheck
 
 import net from "node:net";
@@ -14,9 +14,10 @@ const socketEndpoint =
   process.platform === "win32" && socketPath ? `\\\\.\\pipe\\${socketPath}` : socketPath;
 const paneId = process.env.HERDR_PANE_ID;
 const source = "herdr:pi";
+let externalReporter = false;
 
 function enabled() {
-  return HERDR_DROVER_ENV === "1" && !!socketPath && !!paneId;
+  return !externalReporter && HERDR_DROVER_ENV === "1" && !!socketPath && !!paneId;
 }
 
 function sendRequestAttempt(request: unknown, timeoutMs: number): Promise<boolean> {
@@ -181,6 +182,13 @@ export default function (pi) {
     return;
   }
 
+  pi.events.on("herdr:state-reporter", (data) => {
+    if (data?.owner === "drover-agents") {
+      externalReporter = true;
+      queuedState = undefined;
+    }
+  });
+
   let agentActive = false;
   let blockedCount = 0;
   let blockedMessage: string | undefined;
@@ -199,6 +207,7 @@ export default function (pi) {
   }
 
   function publishState(force = false) {
+    if (!enabled()) return;
     const next = desiredState();
     if (!force && next.state === lastState && next.message === lastMessage) {
       return;
@@ -232,6 +241,8 @@ export default function (pi) {
     if (ctx?.mode !== "tui") {
       return;
     }
+    pi.events.emit("herdr:state-reporter-query");
+    if (!enabled()) return;
     rootSession = true;
     updateSessionRef(ctx);
     await reportSession(event?.reason);

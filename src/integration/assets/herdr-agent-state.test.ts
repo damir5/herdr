@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
+import { EventEmitter } from "node:events";
 import { rm } from "node:fs/promises";
 import net, { createServer, type Server } from "node:net";
 import { tmpdir } from "node:os";
@@ -78,6 +79,9 @@ function createExtensionHarness() {
         handlers.set(event, handler);
       },
       events: {
+        emit(event: string, data?: unknown) {
+          eventHandlers.get(event)?.(data, undefined);
+        },
         on(event: string, handler: Handler) {
           eventHandlers.set(event, handler);
           return () => {};
@@ -722,3 +726,40 @@ function requestSessionPath(request: unknown): unknown {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
+
+for (const ownerFirst of [false, true]) {
+  test(`Pi yields state reporting to drover-agents (${ownerFirst ? "owner" : "asset"} installs first)`, async () => {
+    const requests = await startRecordingServer(`pi-owner-${ownerFirst}`);
+    const harness = createExtensionHarness();
+    const events = new EventEmitter();
+    harness.pi.events = events as any;
+    const registerOwner = () => events.on("herdr:state-reporter-query", () => {
+      events.emit("herdr:state-reporter", { owner: "drover-agents" });
+    });
+    if (ownerFirst) registerOwner();
+    const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+    install(harness.pi);
+    if (!ownerFirst) registerOwner();
+    const ctx = piContext(() => true);
+    await harness.handlers.get("session_start")?.({ reason: "startup" }, ctx);
+    await harness.handlers.get("agent_start")?.({}, ctx);
+    await harness.handlers.get("agent_settled")?.({}, ctx);
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect(requests).toEqual([]);
+  });
+}
+
+test("Pi stops lifecycle reports after drover-agents takes ownership", async () => {
+  const requests = await startRecordingServer("pi-owner-late");
+  const { handlers, eventHandlers, pi } = createExtensionHarness();
+  const { default: install } = await importFresh("./pi/herdr-agent-state.ts");
+  install(pi);
+  const ctx = piContext(() => true);
+  await handlers.get("session_start")?.({ reason: "startup" }, ctx);
+  await waitFor(() => requests.length === 1);
+  eventHandlers.get("herdr:state-reporter")?.({ owner: "drover-agents" }, undefined);
+  await handlers.get("agent_start")?.({}, ctx);
+  await handlers.get("agent_settled")?.({}, ctx);
+  await new Promise(resolve => setTimeout(resolve, 30));
+  expect(requests).toHaveLength(1);
+});

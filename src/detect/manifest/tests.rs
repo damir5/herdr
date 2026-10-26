@@ -1319,3 +1319,64 @@ contains = ["active"]
 "#;
     assert!(parse_manifest(manifest).is_err());
 }
+
+#[test]
+fn codex_capacity_failure_blocks_until_work_resumes() {
+    with_manifest_dirs("codex-capacity", || {
+        let error = "■ Selected model is at capacity. Please try a different model.";
+        let completed =
+            "\n\n• Completed `/root/crash_qa_design`\n\n• Completed `/root/conservative_core`";
+        let prompt = "\n\n› Ask Codex to do anything\n\nGPT-6.1-Sol low · Context 40% left · Main [default]\n? for shortcuts";
+        for suffix in ["", completed] {
+            let screen = format!("{error}{suffix}{prompt}");
+            for screen in [
+                screen.clone(),
+                screen.replace("different model.", "different\n  model."),
+            ] {
+                for title in [
+                    "Design cross-device sync app",
+                    "⠋ Design cross-device sync app",
+                ] {
+                    let result = explain_with_input(
+                        Agent::Codex,
+                        DetectionInput {
+                            screen: &screen,
+                            osc_title: title,
+                            osc_progress: "",
+                        },
+                    );
+                    assert_eq!(result.state, AgentState::Blocked, "{screen}");
+                    assert!(result.visible_blocker);
+                }
+            }
+        }
+        for resumed in [
+            "\n\n• The model is available again. The checks passed.",
+            "\n\nWorking (3s • esc to interrupt)",
+            "\n\n› continue\n\nWorking (3s • esc to interrupt)",
+        ] {
+            let screen = format!("{error}{completed}{resumed}{prompt}");
+            let result = explain_with_input(
+                Agent::Codex,
+                DetectionInput {
+                    screen: &screen,
+                    osc_title: "⠋ Design cross-device sync app",
+                    osc_progress: "",
+                },
+            );
+            assert_ne!(result.state, AgentState::Blocked, "{screen}");
+        }
+    });
+}
+
+#[test]
+fn codex_capacity_manifest_preserves_modern_startup_picker() {
+    with_manifest_dirs("codex-capacity-update", || {
+        let result = explain(
+            Agent::Codex,
+            "Update available · 0.163.0\nUpdate now\nenter continue · esc skip",
+        );
+        assert_eq!(result.state, AgentState::Blocked);
+        assert_eq!(result.matched_rule.unwrap().id, "startup_update");
+    });
+}

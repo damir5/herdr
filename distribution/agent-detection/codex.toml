@@ -1,7 +1,7 @@
 id = "codex"
-version = "2026.10.01.1"
+version = "2026.10.26.1"
 min_engine_version = 3
-updated_at = "2026-10-01T00:00:00Z"
+updated_at = "2026-10-26T00:00:00Z"
 
 [[rules]]
 id = "osc_title_blocked"
@@ -10,6 +10,15 @@ priority = 1100
 region = "osc_title"
 visible_blocker = true
 contains = ["Action Required"]
+
+[[rules]]
+id = "capacity_failure"
+state = "blocked"
+priority = 1075
+region = "before_current_prompt_marker"
+visible_blocker = true
+# Child completion notices can arrive after the failed root turn.
+regex = ['(?m)^[ \t]*■ Selected\s+model\s+is\s+at\s+capacity\.\s+Please\s+try\s+a\s+different\s+model\.(?:\r?\n[ \t]*)*(?:• Completed `[^\r\n]+`(?:\r?\n[ \t]*)*)*\z']
 
 [[rules]]
 id = "osc_title_working"
@@ -60,8 +69,19 @@ state = "blocked"
 priority = 950
 region = "bottom_non_empty_lines(20)"
 visible_blocker = true
-contains = ["Update available!", "Update now"]
-regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z']
+# Keep the legacy dialog; the shared picker (0.159+) has a different heading
+# and footer. Choices can scroll out of a short viewport, but both gates must
+# remain visible. The passive update history notice has neither picker footer.
+any = [
+  { all = [
+    { contains = ["Update available!", "Update now"] },
+    { regex = ['Skip\s+until\s+next\s+version', 'Press enter to continue\s*\z'] },
+  ] },
+  { all = [
+    { regex = ['(?m)^\s*Update\s+available\s+·'] },
+    { regex = ['enter\s+continue\s+·\s+esc\s+skip\s*\z'] },
+  ] },
+]
 
 [[rules]]
 id = "live_strong_blocker"

@@ -255,3 +255,8 @@ release $version $preview:
 # Print default config
 default-config:
     cargo run --release --locked -- --default-config
+
+# Validate the Zig version guard without building the workspace.
+[unix]
+zig-toolchain-test:
+    {{python}} scripts/test-zig-version.py

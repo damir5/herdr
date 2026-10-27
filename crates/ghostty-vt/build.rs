@@ -70,6 +70,16 @@ fn main() {
     let zig_prefix = out_dir.join("zig-out");
 
     let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
+    let version = Command::new(&zig)
+        .arg("version")
+        .output()
+        .unwrap_or_else(|err| panic!("Herdr requires Zig 0.16; cannot run {zig:?}: {err}"));
+    let version_text = String::from_utf8_lossy(&version.stdout);
+    assert!(
+        version.status.success() && version_text.trim().starts_with("0.16."),
+        "Herdr requires Zig 0.16; found {:?} at {zig:?}. Set ZIG to a Zig 0.16 executable.",
+        version_text.trim()
+    );
     let mut command = Command::new(&zig);
     command
         .arg("build")

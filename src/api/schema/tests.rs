@@ -1141,6 +1141,7 @@ fn success_response_round_trips() {
                 surface_interest: true,
                 health_check: true,
                 pane_input_stream: false,
+                pane_stream_binary: false,
                 gram_upload_stream: true,
                 agent_session_transfer: true,
                 agent_session_transfer_harnesses: vec![

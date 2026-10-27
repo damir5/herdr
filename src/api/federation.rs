@@ -143,7 +143,9 @@ pub(crate) fn federation_method_policy(method_wire_name: &str) -> FederationMeth
         // `workspace.get`/`tab.get`/`tab.list` route an `<alias>/…` workspace or
         // tab id to its owning peer; a bare `tab.list` stays local.
         "agent.get" | "agent.read" | "agent.explain" | "pane.read" | "pane.turns"
-        | "pane.stream" | "workspace.get" | "tab.list" | "tab.get" => (AllowedAt(Observe), true),
+        | "pane.stream" | "pane.stream.binary" | "workspace.get" | "tab.list" | "tab.get" => {
+            (AllowedAt(Observe), true)
+        }
         // Other read-only inspection stays local when called at the home.
         "ping"
         | "agent.list"

@@ -1744,7 +1744,7 @@ impl App {
             }
             Method::PaneRename(params) => return self.handle_pane_rename(request.id, params),
             Method::PaneRead(params) => return self.handle_pane_read(request.id, params),
-            Method::PaneStream(_) => {
+            Method::PaneStream(_) | Method::PaneStreamBinary(_) => {
                 return responses::encode_error(
                     request.id,
                     "stream_transport_required",

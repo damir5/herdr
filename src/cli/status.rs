@@ -424,6 +424,7 @@ mod tests {
                 live_handoff: true,
                 detached_server_daemon: true,
                 pane_input_stream: false,
+                pane_stream_binary: false,
                 gram_upload_stream: false,
                 agent_session_transfer: false,
                 agent_session_transfer_harnesses: Vec::new(),

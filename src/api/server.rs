@@ -51,6 +51,7 @@ mod guest_gate;
 mod guest_owner;
 #[cfg(unix)]
 pub(crate) use guest_gate::serve_guest_stream;
+mod pane_binary;
 mod pane_input_stream;
 mod pane_output_stream;
 #[cfg(all(test, unix))]
@@ -197,6 +198,7 @@ pub(crate) fn default_capabilities() -> Option<ServerCapabilities> {
         surface_interest: true,
         health_check: true,
         pane_input_stream: true,
+        pane_stream_binary: true,
         gram_upload_stream: true,
         agent_session_transfer: true,
         agent_session_transfer_harnesses: vec![
@@ -1644,7 +1646,8 @@ fn handle_principal_connection(
             }
             Ok(())
         }
-        Method::PaneStream(mut params) => {
+        Method::PaneStream(mut params) | Method::PaneStreamBinary(mut params) => {
+            let binary = method == "pane.stream.binary";
             // W5: a `pane.stream` whose target is `<alias>/<remote-pane-id>` names a
             // configured federation peer's agent, so proxy it to that peer and pipe
             // its live-terminal frames back on THIS connection thread — never the
@@ -1674,10 +1677,18 @@ fn handle_principal_connection(
                         params,
                         peer_target,
                         running,
+                        binary,
                     )
                 }
             } else {
-                pane_output_stream::serve(stream, request_id.clone(), params, api_tx, running)
+                pane_output_stream::serve(
+                    stream,
+                    request_id.clone(),
+                    params,
+                    api_tx,
+                    running,
+                    binary,
+                )
             };
             match &result {
                 Ok(()) => crate::logging::api_request_completed(
@@ -2134,6 +2145,7 @@ fn proxy_federated_pane_stream(
     params: PaneStreamParams,
     peer_route: PeerRoute,
     running: &Arc<AtomicBool>,
+    binary: bool,
 ) -> std::io::Result<()> {
     let stamp = peer_route.stamp();
     let client = ApiClient::for_target(peer_route.target().clone());
@@ -2240,7 +2252,7 @@ fn proxy_federated_pane_stream(
         }
         if !peer_route.is_current(&stamp) {
             let response = stale_peer_generation_response(request_id.clone(), &stamp);
-            let _ = write_text_line_allow_disconnect(&mut client_stream, &response);
+            let _ = pane_binary::write_control(&mut client_stream, &response, binary);
             break;
         }
         match peer_stream.next_frame(
@@ -2249,15 +2261,15 @@ fn proxy_federated_pane_stream(
             running,
         ) {
             Ok(Some(frame)) => {
-                match peer_route
-                    .with_current(&stamp, || emit_line_to_client(&mut client_stream, &frame))
-                {
+                match peer_route.with_current(&stamp, || {
+                    pane_binary::forward_json(&mut client_stream, &frame, binary)
+                }) {
                     Some(Ok(true)) => {}
                     Some(Ok(false)) => break,
                     Some(Err(error)) => return Err(error),
                     None => {
                         let response = stale_peer_generation_response(request_id.clone(), &stamp);
-                        let _ = write_text_line_allow_disconnect(&mut client_stream, &response);
+                        let _ = pane_binary::write_control(&mut client_stream, &response, binary);
                         break;
                     }
                 }
@@ -2508,6 +2520,7 @@ pub(crate) fn api_method_name(method: &Method) -> &'static str {
         Method::PaneSendInput(_) => "pane.send_input",
         Method::PaneRead(_) => "pane.read",
         Method::PaneStream(_) => "pane.stream",
+        Method::PaneStreamBinary(_) => "pane.stream.binary",
         Method::PaneStreamOpen(_) => "pane.stream.open",
         Method::PaneStreamClose(_) => "pane.stream.close",
         #[cfg(unix)]
@@ -3450,6 +3463,7 @@ mod tests {
                 surface_interest: true,
                 health_check: true,
                 pane_input_stream: false,
+                pane_stream_binary: false,
                 gram_upload_stream: false,
                 agent_session_transfer: true,
                 agent_session_transfer_harnesses: vec![
@@ -7605,6 +7619,48 @@ mod federation_tests {
             "a proxied pane.stream reached the local app dispatch path"
         );
         assert_eq!(peer.seen.lock().expect("seen lock").len(), 1);
+    }
+
+    #[test]
+    fn binary_stream_transcodes_old_peer_frames_without_changing_peer_protocol() {
+        let peer = start_proxy_peer(move |request, mut socket| {
+            let request: serde_json::Value = serde_json::from_str(request).unwrap();
+            assert_eq!(request["method"], "pane.stream");
+            assert_eq!(request["params"]["pane_id"], "screen");
+            writeln!(socket, "{}", serde_json::json!({"id":"binary","result":{"type":"stream_started","pane_id":"screen","epoch":2,"cols":80,"rows":24,"base_seq":1,"resync":true}})).unwrap();
+            writeln!(socket, "{}", serde_json::json!({"stream":"pane.bytes","frame":"reset","seq":1,"epoch":2,"cols":80,"rows":24,"data_b64":"AP8K","history_b64":"b2xk"})).unwrap();
+            writeln!(
+                socket,
+                "{}",
+                serde_json::json!({"stream":"pane.bytes","frame":"exited","seq":4,"epoch":2})
+            )
+            .unwrap();
+        });
+        let registry = HashMap::from([(
+            "remote".to_owned(),
+            ConnectionTarget::Tcp {
+                addr: peer.addr,
+                token: Some("tok".into()),
+            },
+        )]);
+        let mut home = drive_home(registry);
+        let mut reader = home_stream_reader(
+            &mut home,
+            serde_json::json!({"id":"binary","method":"pane.stream.binary","params":{"pane_id":"remote/screen"}}),
+        );
+        let ack: serde_json::Value =
+            serde_json::from_str(&next_stream_line(&mut reader).unwrap()).unwrap();
+        assert_eq!(ack["result"]["pane_id"], "remote/screen");
+        let (reset, data, history) = pane_binary::read_frame_for_test(&mut reader);
+        assert_eq!(reset["frame"], "reset");
+        assert!(reset.get("data_b64").is_none());
+        assert_eq!(data, b"\0\xff\n");
+        assert_eq!(history, b"old");
+        let (exited, data, history) = pane_binary::read_frame_for_test(&mut reader);
+        assert_eq!(exited["frame"], "exited");
+        assert!(data.is_empty() && history.is_empty());
+        assert!(next_stream_line(&mut reader).is_none());
+        assert!(home.api_rx.try_recv().is_err());
     }
 
     #[test]

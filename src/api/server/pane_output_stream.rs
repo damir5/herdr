@@ -139,8 +139,9 @@ pub(super) fn serve(
     params: PaneStreamParams,
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
+    binary: bool,
 ) -> std::io::Result<()> {
-    serve_watched(stream, request_id, params, api_tx, running, None)
+    serve_watched(stream, request_id, params, api_tx, running, None, binary)
 }
 
 /// Called before every frame, on idle ticks, and with `closed = true` when the
@@ -159,6 +160,7 @@ pub(super) fn serve_watched(
     api_tx: &ApiRequestSender,
     running: &Arc<AtomicBool>,
     watch: Option<StreamWatch<'_>>,
+    binary: bool,
 ) -> std::io::Result<()> {
     let pane_id = params.pane_id.clone();
     // Capture the viewer id from the OPEN params before they are moved into the
@@ -195,6 +197,7 @@ pub(super) fn serve_watched(
             history_lines,
             running,
             watch,
+            binary,
         )
     } else {
         write_text_line_allow_disconnect(&mut stream, &open_response)
@@ -211,6 +214,7 @@ fn serve_attached(
     history_lines: usize,
     running: &Arc<AtomicBool>,
     mut watch: Option<StreamWatch<'_>>,
+    binary: bool,
 ) -> std::io::Result<()> {
     let Some(ring) = output_registry::lookup(pane_id) else {
         // The ring vanished between attach and lookup (pane closed). Report it
@@ -231,7 +235,20 @@ fn serve_attached(
     let epoch = ring.epoch();
     let Some(seed) = ring.snapshot(history_lines) else {
         // The runtime is already gone; tell the client and close.
-        return finish_exited(stream, &mut watch, 0, epoch);
+        if binary {
+            return write_json_line(
+                stream,
+                &ErrorResponse {
+                    id: request_id.to_string(),
+                    error: ErrorBody {
+                        code: "pane_not_found".into(),
+                        message: format!("pane {pane_id} has no live output stream"),
+                    },
+                },
+            )
+            .or_else(swallow_disconnect);
+        }
+        return finish_exited(stream, &mut watch, 0, epoch, binary);
     };
 
     // stream_started ack carries the geometry the client lacks today.
@@ -249,17 +266,14 @@ fn serve_attached(
                 resync: true,
             },
         },
+        false,
     )? {
         return Ok(());
     }
 
     // reset seed: base64 full-screen ANSI at exactly `base_seq`, with the
     // requested scrollback captured in the same critical section.
-    if !emit_watched(
-        stream,
-        &mut watch,
-        &StreamFrameLine::reset(seed.cursor, epoch, &seed, false),
-    )? {
+    if !emit_reset(stream, &mut watch, &seed, epoch, false, binary)? {
         return Ok(());
     }
 
@@ -278,7 +292,7 @@ fn serve_attached(
         }
         match ring.wait_for_activity(cursor, resize_id, wait) {
             OutputWait::Closed => {
-                return finish_exited(stream, &mut watch, cursor, epoch);
+                return finish_exited(stream, &mut watch, cursor, epoch, binary);
             }
             OutputWait::Idle => {
                 // On the idle tick, reap a dead peer before heartbeating.
@@ -287,11 +301,16 @@ fn serve_attached(
                 }
                 // An idle watched stream still closes promptly on pause or revoke.
                 if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
-                    return write_text_line_allow_disconnect(stream, &line);
+                    return super::pane_binary::write_control(stream, &line, binary);
                 }
                 if watch.is_none() || last_ping.elapsed() >= PING_INTERVAL {
                     last_ping = std::time::Instant::now();
-                    if !emit_watched(stream, &mut watch, &StreamFrameLine::ping(cursor, epoch))? {
+                    if !emit_watched(
+                        stream,
+                        &mut watch,
+                        &StreamFrameLine::ping(cursor, epoch),
+                        binary,
+                    )? {
                         return Ok(());
                     }
                 }
@@ -303,13 +322,9 @@ fn serve_attached(
                     // It carries history too: the bytes dropped from the backlog
                     // may have scrolled into it.
                     let Some(seed) = ring.snapshot(history_lines) else {
-                        return finish_exited(stream, &mut watch, cursor, epoch);
+                        return finish_exited(stream, &mut watch, cursor, epoch, binary);
                     };
-                    if !emit_watched(
-                        stream,
-                        &mut watch,
-                        &StreamFrameLine::reset(seed.cursor, epoch, &seed, true),
-                    )? {
+                    if !emit_reset(stream, &mut watch, &seed, epoch, true, binary)? {
                         return Ok(());
                     }
                     cursor = seed.cursor;
@@ -324,6 +339,7 @@ fn serve_attached(
                         stream,
                         &mut watch,
                         &StreamFrameLine::resize(cursor, epoch, cols, rows),
+                        binary,
                     )? {
                         return Ok(());
                     }
@@ -341,10 +357,18 @@ fn serve_attached(
                     for chunk in &chunks {
                         payload.extend_from_slice(chunk);
                     }
-                    if !emit_watched(
+                    let frame = if binary {
+                        StreamFrameLine::base("data", cursor, epoch)
+                    } else {
+                        StreamFrameLine::data(cursor, epoch, encode_bytes(&payload))
+                    };
+                    if !emit_payload_watched(
                         stream,
                         &mut watch,
-                        &StreamFrameLine::data(cursor, epoch, encode_bytes(&payload)),
+                        &frame,
+                        binary,
+                        if binary { &payload } else { &[] },
+                        &[],
                     )? {
                         return Ok(());
                     }
@@ -363,11 +387,18 @@ fn finish_exited(
     watch: &mut Option<StreamWatch<'_>>,
     cursor: u64,
     epoch: u64,
+    binary: bool,
 ) -> std::io::Result<()> {
     if let Some(line) = watch.as_mut().and_then(|watch| watch(true)) {
-        return write_text_line_allow_disconnect(stream, &line);
+        return super::pane_binary::write_control(stream, &line, binary);
     }
-    emit(stream, &StreamFrameLine::exited(cursor, epoch)).map(|_| ())
+    emit_watched(
+        stream,
+        &mut None,
+        &StreamFrameLine::exited(cursor, epoch),
+        binary,
+    )
+    .map(|_| ())
 }
 
 /// [`emit`] after asking the watch whether the stream may still send. Every
@@ -377,12 +408,64 @@ fn emit_watched<T: serde::Serialize>(
     stream: &mut ApiStream,
     watch: &mut Option<StreamWatch<'_>>,
     value: &T,
+    binary: bool,
+) -> std::io::Result<bool> {
+    emit_payload_watched(stream, watch, value, binary, &[], &[])
+}
+
+fn emit_payload_watched<T: serde::Serialize>(
+    stream: &mut ApiStream,
+    watch: &mut Option<StreamWatch<'_>>,
+    value: &T,
+    binary: bool,
+    data: &[u8],
+    history: &[u8],
 ) -> std::io::Result<bool> {
     if let Some(line) = watch.as_mut().and_then(|watch| watch(false)) {
-        write_text_line_allow_disconnect(stream, &line)?;
+        super::pane_binary::write_control(stream, &line, binary)?;
         return Ok(false);
     }
-    emit(stream, value)
+    if binary {
+        match super::pane_binary::write_frame(stream, value, data, history) {
+            Ok(()) => Ok(true),
+            Err(error) if is_connection_closed_error(&error) => Ok(false),
+            Err(error) => Err(error),
+        }
+    } else {
+        emit(stream, value)
+    }
+}
+
+fn emit_reset(
+    stream: &mut ApiStream,
+    watch: &mut Option<StreamWatch<'_>>,
+    seed: &OutputSnapshot,
+    epoch: u64,
+    lagged: bool,
+    binary: bool,
+) -> std::io::Result<bool> {
+    if !binary {
+        return emit_watched(
+            stream,
+            watch,
+            &StreamFrameLine::reset(seed.cursor, epoch, seed, lagged),
+            false,
+        );
+    }
+    let frame = StreamFrameLine {
+        cols: Some(seed.cols),
+        rows: Some(seed.rows),
+        lagged,
+        ..StreamFrameLine::base("reset", seed.cursor, epoch)
+    };
+    emit_payload_watched(
+        stream,
+        watch,
+        &frame,
+        true,
+        seed.ansi.as_bytes(),
+        seed.history.as_deref().unwrap_or_default().as_bytes(),
+    )
 }
 
 /// Write one frame/response line, reporting `false` when the peer has closed so
@@ -428,6 +511,47 @@ fn dispatch_close(pane_id: &str, viewer_id: Option<String>, api_tx: &ApiRequestS
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn binary_closed_before_ack_returns_json_error() {
+        use std::io::BufRead;
+        use std::net::{TcpListener, TcpStream};
+        let runtime = crate::pane::PaneRuntime::test_with_screen_bytes(80, 24, b"seed");
+        let ring = runtime.attach_output_stream(4096);
+        let pane_id = "binary-closed-before-ack";
+        output_registry::register(pane_id, &ring);
+        drop(runtime);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ring.snapshot(0).is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped runtime releases its terminal");
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut reader =
+            std::io::BufReader::new(TcpStream::connect(listener.local_addr().unwrap()).unwrap());
+        let mut stream = ApiStream::Tcp(listener.accept().unwrap().0);
+        serve_attached(
+            &mut stream,
+            "opening",
+            pane_id,
+            4096,
+            0,
+            &Arc::new(AtomicBool::new(true)),
+            None,
+            true,
+        )
+        .unwrap();
+        output_registry::unregister(pane_id);
+        drop(stream);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let error: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(error["id"], "opening");
+        assert_eq!(error["error"]["code"], "pane_not_found");
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+    }
+
     fn seed(history: Option<&str>) -> OutputSnapshot {
         OutputSnapshot {
             ansi: "seed".into(),
@@ -437,6 +561,54 @@ mod tests {
             cols: 80,
             rows: 24,
         }
+    }
+
+    #[test]
+    fn binary_reset_resize_and_watch_errors_preserve_stream_semantics() {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut reader = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let mut stream = ApiStream::Tcp(listener.accept().unwrap().0);
+        assert!(emit_reset(&mut stream, &mut None, &seed(Some("old")), 7, true, true).unwrap());
+        let (reset, data, history) = super::super::pane_binary::read_frame_for_test(&mut reader);
+        assert_eq!(reset["frame"], "reset");
+        assert_eq!(reset["seq"], 918_273);
+        assert_eq!(reset["epoch"], 7);
+        assert_eq!(reset["lagged"], true);
+        assert_eq!(
+            (reset["cols"].as_u64(), reset["rows"].as_u64()),
+            (Some(80), Some(24))
+        );
+        assert!(reset.get("data_b64").is_none());
+        assert_eq!(data, b"seed");
+        assert_eq!(history, b"old");
+        assert!(emit_watched(
+            &mut stream,
+            &mut None,
+            &StreamFrameLine::resize(8, 7, 100, 30),
+            true
+        )
+        .unwrap());
+        let (resize, data, history) = super::super::pane_binary::read_frame_for_test(&mut reader);
+        assert_eq!(resize["frame"], "resize");
+        assert_eq!(
+            (resize["cols"].as_u64(), resize["rows"].as_u64()),
+            (Some(100), Some(30))
+        );
+        assert!(data.is_empty() && history.is_empty());
+        let mut watch = |_: bool| {
+            Some(r#"{"id":"s","error":{"code":"guest_revoked","message":"revoked"}}"#.to_owned())
+        };
+        assert!(!emit_watched(
+            &mut stream,
+            &mut Some(&mut watch),
+            &StreamFrameLine::ping(8, 7),
+            true
+        )
+        .unwrap());
+        let (error, data, history) = super::super::pane_binary::read_frame_for_test(&mut reader);
+        assert_eq!(error["error"]["code"], "guest_revoked");
+        assert!(data.is_empty() && history.is_empty());
     }
 
     #[test]

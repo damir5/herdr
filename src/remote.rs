@@ -35,6 +35,7 @@ pub(crate) const API_BRIDGE_MULTI_MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 pub(crate) const API_BRIDGE_MULTI_STREAMING_METHODS: &[&str] = &[
     "events.subscribe",
     "pane.stream",
+    "pane.stream.binary",
     "pane.input.stream",
     "gram.upload.stream",
     "server.ssh_agent.register",

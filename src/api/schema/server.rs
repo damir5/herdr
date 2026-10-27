@@ -38,6 +38,9 @@ pub struct ServerCapabilities {
     /// fall back to per-call `pane.send_text` / `pane.send_input`.
     #[serde(default)]
     pub pane_input_stream: bool,
+    /// Supports `pane.stream.binary` with bounded metadata and raw terminal bytes.
+    #[serde(default)]
+    pub pane_stream_binary: bool,
     /// The daemon serves `gram.upload.stream`, uploading a whole file over one
     /// connection instead of one connection per chunk. Clients feature-detect this
     /// and otherwise fall back to per-chunk `gram.upload_chunk`.

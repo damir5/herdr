@@ -299,6 +299,9 @@ pub enum Method {
     #[serde(rename = "pane.stream")]
     #[schemars(skip)]
     PaneStream(PaneStreamParams),
+    #[serde(rename = "pane.stream.binary")]
+    #[schemars(skip)]
+    PaneStreamBinary(PaneStreamParams),
     #[serde(skip)]
     #[schemars(skip)]
     PaneStreamOpen(PaneStreamParams),

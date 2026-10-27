@@ -582,7 +582,8 @@ pub(super) fn serve_request(
                 &guest_reply(&id, &response, project_pty_size),
             )
         }
-        Method::PaneStream(mut params) => {
+        Method::PaneStream(mut params) | Method::PaneStreamBinary(mut params) => {
+            let binary = method == "pane.stream.binary";
             let state = grant_state(guest, api_tx);
             if !names_grant(&params.pane_id, guest, state.pane_id()) {
                 return forbidden(&mut stream);
@@ -618,6 +619,7 @@ pub(super) fn serve_request(
                 api_tx,
                 running,
                 Some(&mut watch),
+                binary,
             )
         }
         Method::AgentPrompt(mut params) => {
@@ -1979,6 +1981,34 @@ mod tests {
         handle.join().unwrap();
         let audit = crate::guest::audit::read(&guest.dir, Some(&guest.guest_id), None, 5).unwrap();
         assert_eq!(audit[0].event, GuestAuditEvent::Paused);
+    }
+
+    #[test]
+    fn revoke_closes_a_live_binary_stream_with_framed_error() {
+        let harness = start("binary-revoke");
+        let guest = harness.admit();
+        let (mut reader, handle) = harness.open(&guest, json!({"id":"binary","method":"pane.stream.binary","params":{"pane_id":guest.grant.terminal_id}}));
+        let mut ack = String::new();
+        reader.read_line(&mut ack).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&ack).unwrap()["result"]["type"],
+            "stream_started"
+        );
+        let (reset, _, _) = super::super::pane_binary::read_frame_for_test(&mut reader);
+        assert_eq!(reset["frame"], "reset");
+        crate::guest::revoke_at(harness.dir.0.clone(), RevokeTarget::Guest(&guest.guest_id))
+            .unwrap();
+        loop {
+            let (metadata, data, history) =
+                super::super::pane_binary::read_frame_for_test(&mut reader);
+            if metadata.get("error").is_some() {
+                assert_eq!(metadata["error"]["code"], "guest_revoked");
+                assert!(data.is_empty() && history.is_empty());
+                break;
+            }
+        }
+        assert_eq!(reader.read_line(&mut String::new()).unwrap(), 0);
+        handle.join().unwrap();
     }
 
     #[test]

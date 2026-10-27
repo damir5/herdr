@@ -119,6 +119,27 @@ fn send_and_stream<W: Write>(
         return emit_transport_error(out, request_line, &err);
     }
 
+    if serde_json::from_str::<serde_json::Value>(request_line)
+        .ok()
+        .and_then(|request| request["method"].as_str().map(str::to_owned))
+        .as_deref()
+        == Some("pane.stream.binary")
+    {
+        let mut buffer = [0; 16 * 1024];
+        loop {
+            let count = match conn.read(&mut buffer) {
+                Ok(count) => count,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            if count == 0 {
+                return Ok(());
+            }
+            out.write_all(&buffer[..count])?;
+            out.flush()?;
+        }
+    }
+
     for reply in io::BufReader::new(conn).lines() {
         match reply {
             Ok(line) => {
@@ -724,11 +745,40 @@ mod tests {
     }
 
     #[test]
+    fn binary_bridge_preserves_non_utf8_and_newlines_after_json_ack() {
+        let (connection, mut peer) = UnixStream::pair().unwrap();
+        let wire = b"{\"id\":\"raw\",\"result\":{\"type\":\"stream_started\"}}\n\0\xff\n\rpayload";
+        let server = thread::spawn(move || {
+            let mut line = String::new();
+            io::BufReader::new(peer.try_clone().unwrap())
+                .read_line(&mut line)
+                .unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap()["method"],
+                "pane.stream.binary"
+            );
+            for part in wire.chunks(3) {
+                peer.write_all(part).unwrap();
+            }
+        });
+        let mut output = Vec::new();
+        send_and_stream(
+            connection,
+            &request("raw", "pane.stream.binary", 0),
+            &mut output,
+        )
+        .unwrap();
+        server.join().unwrap();
+        assert_eq!(output, wire);
+    }
+
+    #[test]
     fn multi_rejects_streaming_methods_and_keeps_running() {
         let server = FakeApiServer::start("stream");
         let input: String = [
             request("sub", "events.subscribe", 0),
             request("pane", "pane.stream", 0),
+            request("binary", "pane.stream.binary", 0),
             request("upload", "gram.upload.stream", 0),
             request("input", "pane.input.stream", 0),
             request("agent", "server.ssh_agent.register", 0),
@@ -742,6 +792,7 @@ mod tests {
         for (id, method) in [
             ("sub", "events.subscribe"),
             ("pane", "pane.stream"),
+            ("binary", "pane.stream.binary"),
             ("upload", "gram.upload.stream"),
             ("input", "pane.input.stream"),
             ("agent", "server.ssh_agent.register"),

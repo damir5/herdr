@@ -98,6 +98,17 @@ fn main() {
                 PathBuf::from(&libc_file).display()
             );
             command.arg("--libc").arg(libc_file);
+            #[cfg(target_os = "macos")]
+            {
+                // Windows libc paths also reach native Zig helpers; keep their Apple SDK explicit.
+                let sdk = Command::new("xcrun")
+                    .args(["--sdk", "macosx", "--show-sdk-path"])
+                    .output()
+                    .expect("xcrun must locate the macOS SDK for native Zig helpers");
+                assert!(sdk.status.success(), "xcrun could not locate the macOS SDK");
+                let sdk = String::from_utf8(sdk.stdout).expect("macOS SDK path must be UTF-8");
+                command.arg("--sysroot").arg(sdk.trim());
+            }
         }
     }
     if let Ok(system_dir) = env::var("LIBGHOSTTY_VT_ZIG_SYSTEM_DIR") {

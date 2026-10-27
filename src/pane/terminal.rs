@@ -153,6 +153,7 @@ pub struct InputState {
     pub color_scheme_reporting: bool,
 }
 
+#[cfg(any(unix, test))]
 impl InputState {
     /// DEC private input modes that are on, so an API client attaching mid-session can restore them.
     pub fn decset_modes(self) -> Vec<u16> {

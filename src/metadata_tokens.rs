@@ -104,6 +104,7 @@ impl MetadataTokens {
 
     /// Live tokens with their remaining lifetime; an `Instant` means nothing in
     /// another process.
+    #[cfg(unix)]
     pub(crate) fn handoff(&self, now: Instant) -> Vec<HandoffToken> {
         self.entries
             .iter()
@@ -118,6 +119,7 @@ impl MetadataTokens {
             .collect()
     }
 
+    #[cfg(unix)]
     pub(crate) fn from_handoff(tokens: Vec<HandoffToken>, now: Instant) -> Self {
         let entries = tokens
             .into_iter()
@@ -138,6 +140,7 @@ impl MetadataTokens {
     }
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandoffToken {
     key: String,
@@ -146,6 +149,7 @@ pub(crate) struct HandoffToken {
 }
 
 /// Workspace tokens carried across a live handoff, keyed by workspace id.
+#[cfg(unix)]
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandoffWorkspaceMetadata {
     pub tokens: Vec<HandoffToken>,

@@ -899,7 +899,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let keys = ["HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"];
-        let previous: Vec<_> = keys.iter().map(|key| std::env::var_os(key)).collect();
+        let previous: Vec<_> = keys.iter().map(std::env::var_os).collect();
         let home = std::env::temp_dir().join("herdr-fake-home");
         std::env::set_var("HOME", &home);
         std::env::remove_var("XDG_CONFIG_HOME");

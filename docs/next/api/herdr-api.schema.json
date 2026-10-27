@@ -17370,6 +17370,11 @@
               "description": "The daemon serves the persistent `pane.input.stream` write channel\n(issue #62). Clients feature-detect this before using it and otherwise\nfall back to per-call `pane.send_text` / `pane.send_input`.",
               "type": "boolean"
             },
+            "pane_stream_binary": {
+              "default": false,
+              "description": "Supports `pane.stream.binary` with bounded metadata and raw terminal bytes.",
+              "type": "boolean"
+            },
             "ssh_agent_registration": {
               "default": false,
               "description": "Supports connection-scoped `server.ssh_agent.register` on the local JSON API.",

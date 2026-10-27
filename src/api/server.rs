@@ -4894,6 +4894,7 @@ mod federation_tests {
             ("pane.read", AllowedAt(Observe)),
             ("pane.clear", Denied),
             ("pane.stream", AllowedAt(Observe)),
+            ("pane.stream.binary", AllowedAt(Observe)),
             ("pane.stream.open", Denied),
             ("pane.stream.close", Denied),
             ("pane.pty_lease.release", Denied),

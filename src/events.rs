@@ -110,6 +110,13 @@ pub enum AppEvent {
         process_exited: bool,
         observed_at: Instant,
     },
+    /// Root interactive shell reported command start or completion.
+    ShellCommandStateChanged {
+        pane_id: PaneId,
+        runtime_epoch: Option<u64>,
+        working: bool,
+        observed_at: Instant,
+    },
     /// Orthogonal live input-prompt presence changed in a pane.
     InputStateChanged {
         pane_id: PaneId,
@@ -280,6 +287,11 @@ impl AppEvent {
                 ..
             }
             | Self::StateChanged {
+                pane_id,
+                runtime_epoch,
+                ..
+            }
+            | Self::ShellCommandStateChanged {
                 pane_id,
                 runtime_epoch,
                 ..

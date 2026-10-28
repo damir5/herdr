@@ -1509,6 +1509,9 @@ impl AppState {
                 ..
             } => self
                 .update_terminal_state(pane_id, |terminal| {
+                    if agent.is_none() && terminal.shell_command_running {
+                        return None;
+                    }
                     Some(terminal.set_detected_state_with_screen_signals_at(
                         agent,
                         state,
@@ -1519,6 +1522,15 @@ impl AppState {
                         observed_at,
                     ))
                 })
+                .into_iter()
+                .collect(),
+            AppEvent::ShellCommandStateChanged {
+                pane_id,
+                working,
+                observed_at,
+                ..
+            } => self
+                .update_shell_command_state(pane_id, working, observed_at)
                 .into_iter()
                 .collect(),
             AppEvent::InputStateChanged { pane_id, kind, .. } => self
@@ -1778,6 +1790,7 @@ impl AppState {
             previous_input_prompt_kind,
             suppress_acquisition_completion,
             completion_reset,
+            shell_to_agent,
         ) = {
             let terminal = self.terminals.get_mut(&terminal_id)?;
             let previous_turn_context = terminal.turn_completion_context();
@@ -1786,7 +1799,12 @@ impl AppState {
             let previous_input_prompt_kind = terminal.input_prompt_kind;
             let had_completion = terminal.last_agent_completion_seq.is_some() || !previous_seen;
             let resume_revision = terminal.reported_resume_revision();
+            let was_shell_command = terminal.shell_command_running;
             let mutation = update(terminal);
+            let shell_to_agent = was_shell_command && terminal.is_agent_terminal();
+            if shell_to_agent {
+                terminal.shell_command_running = false;
+            }
             terminal.reconcile_reported_resume();
             // Resume-only changes return no mutation but must still be saved.
             if terminal.reported_resume_revision() != resume_revision {
@@ -1818,6 +1836,7 @@ impl AppState {
                 previous_input_prompt_kind,
                 suppress_acquisition_completion,
                 completion_reset,
+                shell_to_agent,
             )
         };
         if completion_reset {
@@ -1831,6 +1850,7 @@ impl AppState {
         let change = mutation.effective_state_change.or(unchanged_change)?;
         let mut completed_turn = None;
         let suppress_completion = force_suppress_completion
+            || shell_to_agent
             || (change.state == AgentState::Idle && suppress_acquisition_completion);
         if change.previous_state != change.state {
             self.next_agent_state_change_seq += 1;
@@ -1841,6 +1861,7 @@ impl AppState {
                 // previous_state != state guard, so a same-status refresh never resets it.
                 terminal.agent_status_since_unix_ms = Some(current_unix_ms());
                 if is_background_completion_transition(change.previous_state, change.state)
+                    && !shell_to_agent
                     && (change.previous_agent_label.is_some() || change.agent_label.is_some())
                 {
                     completed_turn = Some(terminal.record_completed_turn_at(
@@ -1894,6 +1915,65 @@ impl AppState {
             turn_epoch,
             suppress_completion,
         };
+        Some(update)
+    }
+
+    fn update_shell_command_state(
+        &mut self,
+        pane_id: PaneId,
+        working: bool,
+        observed_at: Instant,
+    ) -> Option<PaneStateUpdate> {
+        let mut update = self.update_terminal_state(pane_id, |terminal| {
+            if terminal
+                .agent_ownership_since
+                .is_some_and(|since| observed_at < since)
+            {
+                return None;
+            }
+            if !working && terminal.is_agent_terminal() || terminal.managed_agent_launch_pending() {
+                return None;
+            }
+            // A root-shell preexec proves control returned, even before process polling notices.
+            if working && terminal.is_agent_terminal() {
+                let agent = terminal.effective_known_agent().or(terminal.detected_agent);
+                terminal.set_detected_state_with_screen_signals_at(
+                    agent,
+                    AgentState::Unknown,
+                    false,
+                    false,
+                    false,
+                    true,
+                    observed_at,
+                );
+            }
+            terminal.shell_command_running = working;
+            Some(terminal.set_detected_state_with_screen_signals_at(
+                None,
+                if working {
+                    AgentState::Working
+                } else {
+                    AgentState::Idle
+                },
+                false,
+                false,
+                false,
+                false,
+                observed_at,
+            ))
+        })?;
+        if !working && update.previous_state == AgentState::Working {
+            let terminal_id = self.workspaces[update.ws_idx]
+                .pane_state(pane_id)?
+                .attached_terminal_id
+                .clone();
+            let terminal = self.terminals.get_mut(&terminal_id)?;
+            let context = terminal.turn_completion_context();
+            update.completed_turn =
+                Some(terminal.record_completed_turn_at(current_unix_ms(), context, observed_at));
+            update.turn = Some(terminal.turn);
+            update.turn_epoch = Some(terminal.turn_epoch);
+        }
         Some(update)
     }
 
@@ -3144,6 +3224,291 @@ mod tests {
         assert_eq!(state.workspaces.len(), 1);
         state.assert_invariants_for_test();
     }
+    #[test]
+    fn fish_shell_command_records_completion_without_becoming_an_agent() {
+        let mut state = app_with_workspaces(&["shell", "elsewhere"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.active = Some(1);
+        for command in 1..=2 {
+            for shell_state in [AgentState::Working, AgentState::Idle] {
+                state.handle_app_event(AppEvent::ShellCommandStateChanged {
+                    pane_id,
+                    runtime_epoch: None,
+                    working: shell_state == AgentState::Working,
+                    observed_at: Instant::now(),
+                });
+            }
+            let terminal = &state.terminals[&terminal_id];
+            assert!(!terminal.is_agent_terminal());
+            assert_eq!(
+                terminal.last_completed_turn().map(|turn| turn.turn),
+                Some(command)
+            );
+            assert!(!state.workspaces[0].panes[&pane_id].seen);
+        }
+    }
+
+    #[test]
+    fn fish_shell_postexec_keeps_agent_status_and_next_preexec_takes_control() {
+        let mut state = app_with_workspaces(&["agent"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            runtime_epoch: None,
+            agent: Some(Agent::Codex),
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        assert!(state
+            .handle_app_event(AppEvent::ShellCommandStateChanged {
+                pane_id,
+                runtime_epoch: None,
+                working: false,
+                observed_at: Instant::now(),
+            })
+            .is_empty());
+        assert_eq!(
+            state.terminals[&terminal_id].detected_agent,
+            Some(Agent::Codex)
+        );
+        assert!(state.terminals[&terminal_id]
+            .last_completed_turn()
+            .is_none());
+        state.handle_app_event(AppEvent::ShellCommandStateChanged {
+            pane_id,
+            runtime_epoch: None,
+            working: true,
+            observed_at: Instant::now(),
+        });
+        assert!(!state.terminals[&terminal_id].is_agent_terminal());
+        // A delayed process-poll observation must not idle a silent command.
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            runtime_epoch: None,
+            agent: None,
+            state: AgentState::Unknown,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        assert_eq!(state.terminals[&terminal_id].state, AgentState::Working);
+        state.handle_app_event(AppEvent::ShellCommandStateChanged {
+            pane_id,
+            runtime_epoch: None,
+            working: false,
+            observed_at: Instant::now(),
+        });
+        assert_eq!(
+            state.terminals[&terminal_id]
+                .last_completed_turn()
+                .map(|turn| turn.turn),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn fish_shell_delayed_preexec_preserves_newer_detected_agent() {
+        for process_only in [false, true] {
+            let mut state = app_with_workspaces(&["agent"]);
+            let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+            let terminal_id = state.workspaces[0].panes[&pane_id]
+                .attached_terminal_id
+                .clone();
+            let shell_at = Instant::now();
+            let agent_at = shell_at + std::time::Duration::from_millis(1);
+            let event = if process_only {
+                AppEvent::AgentProcessDetected {
+                    pane_id,
+                    runtime_epoch: None,
+                    agent: Agent::Codex,
+                    observed_at: agent_at,
+                }
+            } else {
+                AppEvent::StateChanged {
+                    pane_id,
+                    runtime_epoch: None,
+                    agent: Some(Agent::Codex),
+                    state: AgentState::Working,
+                    visible_blocker: false,
+                    visible_working: false,
+                    process_exited: false,
+                    observed_at: agent_at,
+                }
+            };
+            state.handle_app_event(event);
+            assert!(state
+                .handle_app_event(AppEvent::ShellCommandStateChanged {
+                    pane_id,
+                    runtime_epoch: None,
+                    working: true,
+                    observed_at: shell_at
+                })
+                .is_empty());
+            assert_eq!(
+                state.terminals[&terminal_id].detected_agent,
+                Some(Agent::Codex)
+            );
+            assert!(!state.terminals[&terminal_id].shell_command_running);
+            assert!(state.terminals[&terminal_id]
+                .last_completed_turn()
+                .is_none());
+            state.handle_app_event(AppEvent::ShellCommandStateChanged {
+                pane_id,
+                runtime_epoch: None,
+                working: true,
+                observed_at: agent_at + std::time::Duration::from_millis(1),
+            });
+            assert!(!state.terminals[&terminal_id].is_agent_terminal());
+            assert!(state.terminals[&terminal_id].shell_command_running);
+        }
+    }
+
+    #[test]
+    fn fish_shell_delayed_preexec_preserves_newer_reported_agent() {
+        let mut state = app_with_workspaces(&["agent"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let shell_at = Instant::now();
+        state.handle_app_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "herdr:codex".into(),
+            agent_label: "codex".into(),
+            state: AgentState::Working,
+            message: None,
+            seq: None,
+            session_ref: None,
+            session_cursor: None,
+            process_pid: None,
+        });
+        assert!(state
+            .handle_app_event(AppEvent::ShellCommandStateChanged {
+                pane_id,
+                runtime_epoch: None,
+                working: true,
+                observed_at: shell_at
+            })
+            .is_empty());
+        assert!(state.terminals[&terminal_id].is_agent_terminal());
+        assert!(!state.terminals[&terminal_id].shell_command_running);
+        state.handle_app_event(AppEvent::ShellCommandStateChanged {
+            pane_id,
+            runtime_epoch: None,
+            working: true,
+            observed_at: Instant::now(),
+        });
+        assert!(!state.terminals[&terminal_id].is_agent_terminal());
+        assert!(state.terminals[&terminal_id].shell_command_running);
+    }
+
+    #[test]
+    fn fish_shell_preexec_reclaims_agent_despite_later_status_refresh() {
+        let mut state = app_with_workspaces(&["agent"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        let acquired_at = Instant::now();
+        for observed_at in [
+            acquired_at,
+            acquired_at + std::time::Duration::from_millis(2),
+        ] {
+            state.handle_app_event(AppEvent::StateChanged {
+                pane_id,
+                runtime_epoch: None,
+                agent: Some(Agent::Codex),
+                state: AgentState::Working,
+                visible_blocker: false,
+                visible_working: false,
+                process_exited: false,
+                observed_at,
+            });
+        }
+        state.handle_app_event(AppEvent::ShellCommandStateChanged {
+            pane_id,
+            runtime_epoch: None,
+            working: true,
+            observed_at: acquired_at + std::time::Duration::from_millis(1),
+        });
+        assert!(!state.terminals[&terminal_id].is_agent_terminal());
+        assert!(state.terminals[&terminal_id].shell_command_running);
+    }
+
+    #[test]
+    fn fish_shell_completion_after_reader_handoff_records_only_once() {
+        let mut state = app_with_workspaces(&["shell"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        // Runtime replacement can restore Working without an in-memory shell marker.
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            runtime_epoch: None,
+            agent: None,
+            state: AgentState::Working,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        for _ in 0..2 {
+            state.handle_app_event(AppEvent::ShellCommandStateChanged {
+                pane_id,
+                runtime_epoch: None,
+                working: false,
+                observed_at: Instant::now(),
+            });
+        }
+        assert_eq!(
+            state.terminals[&terminal_id]
+                .last_completed_turn()
+                .map(|turn| turn.turn),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn fish_shell_launching_idle_agent_does_not_complete_a_turn() {
+        let mut state = app_with_workspaces(&["launch"]);
+        let pane_id = *state.workspaces[0].panes.keys().next().unwrap();
+        let terminal_id = state.workspaces[0].panes[&pane_id]
+            .attached_terminal_id
+            .clone();
+        state.handle_app_event(AppEvent::ShellCommandStateChanged {
+            pane_id,
+            runtime_epoch: None,
+            working: true,
+            observed_at: Instant::now(),
+        });
+        state.handle_app_event(AppEvent::StateChanged {
+            pane_id,
+            runtime_epoch: None,
+            agent: Some(Agent::Codex),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: false,
+            observed_at: Instant::now(),
+        });
+        assert!(state.terminals[&terminal_id]
+            .last_completed_turn()
+            .is_none());
+        assert!(state.workspaces[0].panes[&pane_id].seen);
+        assert!(!state.terminals[&terminal_id].shell_command_running);
+    }
+
     #[test]
     fn state_changed_updates_pane() {
         let mut state = app_with_workspaces(&["test"]);

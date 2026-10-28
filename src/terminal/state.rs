@@ -284,6 +284,8 @@ pub struct TerminalState {
     metadata_report_sequences: HashMap<String, u64>,
     metadata_report_agents: HashMap<String, Agent>,
     metadata_token_sequence_sources: std::collections::HashSet<String>,
+    pub(crate) shell_command_running: bool,
+    pub(crate) agent_ownership_since: Option<Instant>,
     pub state: AgentState,
     pub input_pending: bool,
     pub input_prompt_kind: Option<crate::detect::InputPromptKind>,
@@ -390,6 +392,8 @@ impl TerminalState {
             metadata_report_sequences: HashMap::new(),
             metadata_report_agents: HashMap::new(),
             metadata_token_sequence_sources: std::collections::HashSet::new(),
+            shell_command_running: false,
+            agent_ownership_since: None,
             state: AgentState::Unknown,
             input_pending: false,
             input_prompt_kind: None,
@@ -3034,6 +3038,9 @@ impl TerminalState {
         };
         let agent_label = self.effective_agent_label().map(str::to_string);
         let known_agent = self.effective_known_agent();
+        if previous_agent_label != agent_label {
+            self.agent_ownership_since = agent_label.as_ref().map(|_| now);
+        }
 
         let presentation = self.effective_presentation_for_state_at(state, now);
         self.clear_expiry_pending_for_hidden_metadata();

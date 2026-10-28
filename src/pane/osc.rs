@@ -349,7 +349,7 @@ pub(super) fn parse_reported_cwd(value: &[u8]) -> Option<PathBuf> {
 /// Collects complete OSC bodies from a raw byte stream. Consumers receive only
 /// bodies, keeping the framing state machine independent from OSC commands.
 #[derive(Debug, Default)]
-struct OscStreamCollector {
+pub(super) struct OscStreamCollector {
     state: OscStreamState,
     body: Vec<u8>,
 }
@@ -370,7 +370,7 @@ enum OscStreamState {
 impl OscStreamCollector {
     const MAX_BODY_BYTES: usize = 4096;
 
-    fn observe(&mut self, bytes: &[u8], mut receive: impl FnMut(&[u8])) {
+    pub(super) fn observe(&mut self, bytes: &[u8], mut receive: impl FnMut(&[u8])) {
         let mut cursor = 0;
         while cursor < bytes.len() {
             if matches!(

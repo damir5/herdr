@@ -30,6 +30,7 @@ mod input;
 mod kitty_keyboard;
 mod osc;
 mod output_ring;
+mod shell_activity;
 mod state;
 mod terminal;
 mod xtgettcap;
@@ -2191,6 +2192,18 @@ fn pane_shell_command_builder_for_target(
     target: ShellLaunchTarget,
 ) -> io::Result<CommandBuilder> {
     let shell = pane_shell(shell_config.default_shell);
+    if shell
+        .rsplit(['/', '\\'])
+        .next()
+        .is_some_and(|name| name == "fish" || name == "fish.exe")
+    {
+        let mut cmd = CommandBuilder::new(&shell);
+        if shell_mode_uses_login_shell(shell_config.mode, target) {
+            cmd.arg("-l");
+        }
+        cmd.args(["--init-command", shell_activity::FISH_INIT_COMMAND]);
+        return Ok(cmd);
+    }
     // Unix login shells go through portable-pty's default-program builder so
     // they receive the login argv0 convention. Windows has no such convention
     // and the default-program builder would launch cmd.exe, so Windows login
@@ -2646,6 +2659,9 @@ impl PaneRuntime {
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
             let delay_rt = rt.clone();
+            let mut shell_activity = shell_activity::ShellActivityTracker::default();
+            let shell_events =
+                shell_activity::shell_activity_channel(pane_id, epoch, events.clone());
             let on_read = Box::new(move |bytes: &[u8]| {
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
@@ -2653,6 +2669,9 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
+                shell_activity.observe(bytes, shell_pid, |working| {
+                    let _ = shell_events.send((working, std::time::Instant::now()));
+                });
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
@@ -2853,6 +2872,9 @@ impl PaneRuntime {
             let reported_cwd = reported_cwd.clone();
             let compression_wake = compression.notifier();
             let rt = tokio::runtime::Handle::current();
+            let mut shell_activity = shell_activity::ShellActivityTracker::default();
+            let shell_events =
+                shell_activity::shell_activity_channel(pane_id, epoch, events.clone());
             let on_read = Box::new(move |bytes: &[u8]| {
                 let _content_write_guard = match content_write_lock.lock() {
                     Ok(guard) => guard,
@@ -2860,6 +2882,9 @@ impl PaneRuntime {
                 };
                 content_seq.fetch_add(1, Ordering::AcqRel);
                 let shell_pid = child_pid.load(Ordering::Acquire);
+                shell_activity.observe(bytes, shell_pid, |working| {
+                    let _ = shell_events.send((working, std::time::Instant::now()));
+                });
                 let result =
                     terminal.process_pty_bytes(pane_id, shell_pid, bytes, &response_writer);
                 content_seq.fetch_add(1, Ordering::Release);
@@ -6352,6 +6377,116 @@ mod tests {
         )
         .await
         .expect("re-entering active authority should notify detection reset");
+    }
+
+    #[test]
+    fn fish_shell_builder_adds_hooks_and_preserves_login_mode() {
+        for (target, mode, login) in [
+            (
+                ShellLaunchTarget::Macos,
+                crate::config::ShellModeConfig::Auto,
+                true,
+            ),
+            (
+                ShellLaunchTarget::OtherUnix,
+                crate::config::ShellModeConfig::NonLogin,
+                false,
+            ),
+        ] {
+            let command =
+                pane_shell_command_builder_for_target(PaneShellConfig::new("fish", mode), target)
+                    .unwrap();
+            let args = command.get_argv();
+            assert_eq!(args[0], "fish");
+            assert_eq!(args.iter().any(|arg| arg == "-l"), login);
+            assert_eq!(args[args.len() - 2], "--init-command");
+            assert_eq!(args[args.len() - 1], shell_activity::FISH_INIT_COMMAND);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fish_shell_real_hooks_report_silent_commands_without_child_shell_work() {
+        if std::process::Command::new("fish")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            eprintln!("fish not installed; skipping real Fish hook test");
+            return;
+        }
+        let (events, mut event_rx) = mpsc::channel(128);
+        let runtime = PaneRuntime::spawn_argv_command(
+            PaneId::from_raw(42),
+            24,
+            80,
+            std::env::temp_dir(),
+            &[
+                "fish".into(),
+                "--no-config".into(),
+                "-i".into(),
+                "--init-command".into(),
+                shell_activity::FISH_INIT_COMMAND.into(),
+            ],
+            &PaneLaunchEnv::default(),
+            AgentDetection::Disabled,
+            0,
+            crate::terminal_theme::TerminalTheme::default(),
+            None,
+            events,
+            Arc::new(Notify::new()),
+            Arc::new(RenderSignal::new()),
+        )
+        .unwrap();
+        runtime
+            .try_send_bytes(Bytes::from_static(
+                b"true\rfalse\rprintf '__STATUS__%s__PIPE__%s\\n' $status $pipestatus\rfish --no-config -c true\r",
+            ))
+            .unwrap();
+        let observations = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut observations = Vec::new();
+            while observations.len() < 8 {
+                if let Some(AppEvent::ShellCommandStateChanged { working, .. }) =
+                    event_rx.recv().await
+                {
+                    observations.push(working);
+                }
+            }
+            observations
+        })
+        .await;
+        let interrupt = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            runtime
+                .try_send_bytes(Bytes::from_static(b"sleep 30\r"))
+                .unwrap();
+            while !matches!(
+                event_rx.recv().await,
+                Some(AppEvent::ShellCommandStateChanged { working: true, .. })
+            ) {}
+            let root_pid = runtime.child_pid.load(Ordering::Acquire);
+            while !crate::detect::foreground_job(root_pid)
+                .is_some_and(|job| job.processes.iter().any(|process| process.name == "sleep"))
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            runtime.try_send_bytes(Bytes::from_static(b"\x03")).unwrap();
+            while !matches!(
+                event_rx.recv().await,
+                Some(AppEvent::ShellCommandStateChanged { working: false, .. })
+            ) {}
+        })
+        .await;
+        let text = runtime.terminal.detection_text();
+        runtime.shutdown();
+        interrupt.expect("an interrupted silent command should complete");
+        assert_eq!(
+            observations.expect("Fish should report all four commands"),
+            [true, false, true, false, true, false, true, false]
+        );
+        assert!(
+            text.contains("__STATUS__1__PIPE__1"),
+            "Fish preserves a failed command's status: {text}"
+        );
     }
 
     #[cfg(unix)]

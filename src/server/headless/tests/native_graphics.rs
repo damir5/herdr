@@ -941,7 +941,6 @@ async fn native_file_render_scale_profile() {
     const IMAGE_HEIGHT: u32 = 480;
     for count in [1, 15] {
         for (native, file_input) in [(false, false), (true, false), (true, true)] {
-            let expect_retained_source = file_input && cfg!(target_os = "linux");
             let (mut server, _control, _render, root) =
                 retained_test_server_with_control(b"populated root terminal\r\n");
             if file_input {
@@ -1010,6 +1009,69 @@ async fn native_file_render_scale_profile() {
             let producer_store = crate::pane_graphics_files::FileStore::native_sources();
             let producer =
                 file_input.then(|| producer_store.export(&rgba).expect("private producer file"));
+            let expect_retained_source = producer.as_ref().is_some_and(|producer| {
+                let probe = producer_store.export(&[]).expect("private empty probe file");
+                let path = probe.path().to_owned();
+                #[cfg(target_os = "linux")]
+                let result = {
+                    use std::os::fd::AsRawFd;
+                    #[repr(C)]
+                    struct CloneRange {
+                        source_fd: i64,
+                        source_offset: u64,
+                        source_length: u64,
+                        destination_offset: u64,
+                    }
+                    let source = std::fs::File::open(producer.path()).unwrap();
+                    let destination = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(&path)
+                        .unwrap();
+                    let range = CloneRange {
+                        source_fd: i64::from(source.as_raw_fd()),
+                        source_offset: 0,
+                        source_length: rgba.len() as u64,
+                        destination_offset: 0,
+                    };
+                    // Probe the kernel independently so product snapshot regressions still fail.
+                    // SAFETY: both descriptors and the repr(C) range remain live for the call.
+                    if unsafe { libc::ioctl(destination.as_raw_fd(), libc::FICLONERANGE, &range) } == 0 {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                };
+                #[cfg(not(target_os = "linux"))]
+                let result: std::io::Result<()> = Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "native source cloning requires Linux",
+                ));
+                let supported = match result {
+                    Ok(()) => {
+                        assert_eq!(std::fs::read(&path).unwrap(), rgba);
+                        true
+                    }
+                    Err(error) => {
+                        assert!(
+                            error.kind() == std::io::ErrorKind::Unsupported
+                                || matches!(
+                                    error.raw_os_error(),
+                                    Some(libc::EOPNOTSUPP | libc::ENOTTY | libc::EXDEV | libc::EINVAL | libc::ENOSYS)
+                                ),
+                            "unexpected snapshot probe failure: {error}"
+                        );
+                        eprintln!(
+                            "native_file_render_scale snapshot unsupported os={} producer={} error={error}; verifying decoded file-input fallback",
+                            std::env::consts::OS,
+                            producer.path().display()
+                        );
+                        false
+                    }
+                };
+                drop(probe);
+                assert!(!path.exists(), "probe snapshot is released before timing");
+                supported
+            });
             let mut previous_source_path: Option<PathBuf> = None;
             let mut times = Vec::with_capacity(SAMPLES);
             for sample in 0..WARMUP + SAMPLES {
@@ -1060,7 +1122,7 @@ async fn native_file_render_scale_profile() {
                     let placements =
                         runtime.kitty_image_placements_with_data_filter(|descriptor| {
                             assert_eq!(descriptor.source_file, expect_retained_source,
-                                "Linux retains CoW sources; unsupported platforms must decode file input");
+                                "snapshot support probe determines retained source versus exact decoded fallback");
                             !expect_retained_source
                         });
                     assert_eq!(placements.len(), 1);

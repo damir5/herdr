@@ -940,10 +940,11 @@ async fn native_file_render_scale_profile() {
     const IMAGE_WIDTH: u32 = 800;
     const IMAGE_HEIGHT: u32 = 480;
     for count in [1, 15] {
-        for (native, source_retention) in [(false, false), (true, false), (true, true)] {
+        for (native, file_input) in [(false, false), (true, false), (true, true)] {
+            let expect_retained_source = file_input && cfg!(target_os = "linux");
             let (mut server, _control, _render, root) =
                 retained_test_server_with_control(b"populated root terminal\r\n");
-            if source_retention {
+            if file_input {
                 // Test runtimes normally leave file transmission disabled. Enable
                 // it and the snapshot callback only for this source-producing pane.
                 server
@@ -1007,8 +1008,8 @@ async fn native_file_render_scale_profile() {
             // Private /var/tmp native-store generation owns the producer path:
             // bounded to one image and removed even if an assertion unwinds.
             let producer_store = crate::pane_graphics_files::FileStore::native_sources();
-            let producer = source_retention
-                .then(|| producer_store.export(&rgba).expect("private producer file"));
+            let producer =
+                file_input.then(|| producer_store.export(&rgba).expect("private producer file"));
             let mut previous_source_path: Option<PathBuf> = None;
             let mut times = Vec::with_capacity(SAMPLES);
             for sample in 0..WARMUP + SAMPLES {
@@ -1050,7 +1051,7 @@ async fn native_file_render_scale_profile() {
                     );
                 }
                 write_shared_test_pane(&mut server, root, &payload);
-                let retained_source_path = if source_retention {
+                let retained_source_path = if file_input {
                     let runtime = server
                         .app
                         .state
@@ -1058,19 +1059,25 @@ async fn native_file_render_scale_profile() {
                         .unwrap();
                     let placements =
                         runtime.kitty_image_placements_with_data_filter(|descriptor| {
-                            assert!(descriptor.source_file,
-                            "source profile requires working CoW retention, not decoded fallback");
-                            false
+                            assert_eq!(descriptor.source_file, expect_retained_source,
+                                "Linux retains CoW sources; unsupported platforms must decode file input");
+                            !expect_retained_source
                         });
                     assert_eq!(placements.len(), 1);
-                    assert!(placements[0].data.is_empty());
-                    let source = placements[0].source_file.as_ref().expect("retained source");
-                    let path = source.path().to_owned();
-                    if let Some(previous) = previous_source_path.take() {
-                        assert_ne!(previous, path);
-                        assert!(!previous.exists(), "replacement releases previous source");
+                    if expect_retained_source {
+                        assert!(placements[0].data.is_empty());
+                        let source = placements[0].source_file.as_ref().expect("retained source");
+                        let path = source.path().to_owned();
+                        if let Some(previous) = previous_source_path.take() {
+                            assert_ne!(previous, path);
+                            assert!(!previous.exists(), "replacement releases previous source");
+                        }
+                        Some(path)
+                    } else {
+                        assert!(placements[0].source_file.is_none());
+                        assert_eq!(placements[0].data, rgba);
+                        None
                     }
-                    Some(path)
                 } else {
                     None
                 };
@@ -1124,7 +1131,7 @@ async fn native_file_render_scale_profile() {
                     assert_ne!(token & NATIVE_TRANSFER_BIT, 0);
                     native_started(&mut server, 1, token, image);
                     native_result(&mut server, 1, token, image, true);
-                    if source_retention {
+                    if expect_retained_source {
                         assert_eq!(
                             retained_source_path.as_deref(),
                             Some(std::path::Path::new(path))
@@ -1147,7 +1154,7 @@ async fn native_file_render_scale_profile() {
             }
             times.sort_unstable();
             println!(
-                "native_file_render_scale retained=true native_files={native} source_retention={source_retention} viewport=160x48 populated_panes={count} changing_images=1 image=800x480 warmup={WARMUP} samples={SAMPLES} median_us={} p95_us={}",
+                "native_file_render_scale retained=true native_files={native} file_input={file_input} source_retention={expect_retained_source} viewport=160x48 populated_panes={count} changing_images=1 image=800x480 warmup={WARMUP} samples={SAMPLES} median_us={} p95_us={}",
                 times[SAMPLES / 2].as_micros(), times[SAMPLES * 95 / 100].as_micros(),
             );
             shutdown_test_runtimes(&mut server);
